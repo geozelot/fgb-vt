@@ -1,0 +1,9 @@
+node_modules/
+dist/
+docs/
+*.tsbuildinfo
+.DS_Store
+
+# Example data — allow only small fixtures
+examples/**/data/*.fgb
+!examples/**/data/us_counties.fgb

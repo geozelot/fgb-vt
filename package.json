@@ -1,0 +1,78 @@
+{
+  "name": "@geozelot/fgb-vt",
+  "version": "1.0.3",
+  "description": "High-performance FlatGeobuf to Mapbox Vector Tiles",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "browser": {
+        "types": "./dist/browser.d.ts",
+        "default": "./dist/browser.js"
+      },
+      "default": "./dist/index.js"
+    }
+  },
+  "unpkg": "./dist/fgb-vt.umd.min.js",
+  "jsdelivr": "./dist/fgb-vt.umd.min.js",
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "npm run build:node && npm run build:browser",
+    "build:node": "tsc",
+    "build:browser": "node scripts/bundle.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "bench": "tsx bench/index.ts",
+    "docs": "typedoc",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/geozelot/fgb-vt.git"
+  },
+  "homepage": "https://github.com/geozelot/fgb-vt#readme",
+  "bugs": {
+    "url": "https://github.com/geozelot/fgb-vt/issues"
+  },
+  "keywords": [
+    "flatgeobuf",
+    "mvt",
+    "mapbox",
+    "tiles",
+    "geospatial",
+    "gis",
+    "vector-tiles",
+    "tile-server",
+    "geojson-vt",
+    "vector-tile-server",
+    "vt-pbf"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "peerDependencies": {
+    "@aws-sdk/client-s3": "^3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@aws-sdk/client-s3": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@mapbox/vector-tile": "^2.0.3",
+    "@types/mapbox__vector-tile": "^1.3.4",
+    "@types/node": "^20.11.0",
+    "esbuild": "^0.24.0",
+    "pbf": "^4.0.1",
+    "tsx": "^4.7.0",
+    "typedoc": "^0.28.17",
+    "typescript": "^5.3.0",
+    "vitest": "^2.0.0"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,11 @@
+{
+  "name": "fgb-vt-tile-server-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@geozelot/fgb-vt": "file:../../"
+  }
+}

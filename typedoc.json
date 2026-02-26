@@ -1,0 +1,14 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["./src/index.ts"],
+  "tsconfig": "./tsconfig.json",
+  "out": "./docs",
+  "name": "fgb-vt",
+  "includeVersion": true,
+  "excludeExternals": true,
+  "excludeInternal": true,
+  "excludePrivate": true,
+  "cleanOutputDir": true,
+  "githubPages": true,
+  "sort": ["static-first", "alphabetical"]
+}
