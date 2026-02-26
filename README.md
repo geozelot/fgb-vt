@@ -4,7 +4,7 @@
 [![types](https://img.shields.io/npm/types/@geozelot/fgb-vt)](https://www.npmjs.com/package/@geozelot/fgb-vt)
 [![bundle size](https://img.shields.io/bundlephobia/minzip/@geozelot/fgb-vt)](https://bundlephobia.com/package/@geozelot/fgb-vt)
 
-# fgb-vt - fast _FlatGeobuf_ to _Vector Tiles_, on the fly.
+# fgb-vt
 
 #### [Mapbox Vector Tiles](https://github.com/mapbox/vector-tile-spec) straight from [FlatGeobuf](https://flatgeobuf.org/) - no pre-tiling, no ingestion pipeline, no dependencies.
 
