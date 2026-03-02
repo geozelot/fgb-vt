@@ -287,7 +287,7 @@ describe('TileJSON metadata generation', () => {
 
   // == Server close and reuse =======================================
 
-  it('should allow reinitialization after close', async () => {
+  it('should reject calls after close', async () => {
     addMockFgb('/data/reuse.fgb', {
       bbox: [0, 0, 5, 5],
     });
@@ -295,17 +295,13 @@ describe('TileJSON metadata generation', () => {
     const source: Source = { name: 'reuse', path: '/data/reuse.fgb' };
     const server = new TileServer({ connector, sources: source });
 
-    try {
-      const tj1 = await server.tileJSON();
-      expect(tj1.bounds[2]).toBe(5);
+    const tj1 = await server.tileJSON();
+    expect(tj1.bounds[2]).toBe(5);
 
-      await server.close();
+    await server.close();
 
-      // After close, server should reinitialize on next call
-      const tj2 = await server.tileJSON();
-      expect(tj2.bounds[2]).toBe(5);
-    } finally {
-      await server.close();
-    }
+    // After close, server should reject subsequent calls
+    await expect(server.tileJSON()).rejects.toThrow('TileServer is closed');
+    await expect(server.tile(0, 0, 0)).rejects.toThrow('TileServer is closed');
   });
 });
