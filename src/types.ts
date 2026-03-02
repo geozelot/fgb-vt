@@ -193,6 +193,14 @@ export interface FgbHeader {
   featuresOffset: number;
   /** Total header size in bytes (magic + size prefix + FlatBuffer payload). */
   headerSize: number;
+  /**
+   * Index into the `columns` array identifying the column to use as the MVT
+   * feature ID, or `-1` if no suitable ID column was detected.
+   *
+   * Detection scans for well-known names (`id`, `fid`, `gid`, `ogc_fid`)
+   * case-insensitively and only accepts integer column types.
+   */
+  idColumnIndex: number;
 }
 
 // == MVT Types ==============================================================
