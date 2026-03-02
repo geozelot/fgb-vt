@@ -304,10 +304,14 @@ function clipAxis(
   isPolygon: boolean,
 ): Float64Array[] {
   const results: Float64Array[] = [];
-  let slice: number[] = [];
 
   const n = coords.length;
   if (n < 4) return []; // need at least 2 points
+
+  // Pre-allocate slice buffer: each edge can produce at most 1 original +
+  // 2 intersection points, plus the last point and a potential closing point.
+  const sliceBuf = new Float64Array(2 * n + 4);
+  let sLen = 0;
 
   for (let i = 0; i < n - 2; i += 2) {
     const ax = coords[i], ay = coords[i + 1];
@@ -322,26 +326,26 @@ function clipAxis(
 
     if (aInside) {
       // a is inside
-      slice.push(ax, ay);
+      sliceBuf[sLen++] = ax; sliceBuf[sLen++] = ay;
 
       if (!bInside) {
         // a→b exits: add intersection
         if (b < k1) {
-          addIntersection(slice, ax, ay, bx, by, k1, axis);
+          sLen = addIntersection(sliceBuf, sLen, ax, ay, bx, by, k1, axis);
         } else {
-          addIntersection(slice, ax, ay, bx, by, k2, axis);
+          sLen = addIntersection(sliceBuf, sLen, ax, ay, bx, by, k2, axis);
         }
-        if (!isPolygon && slice.length >= 4) {
-          results.push(new Float64Array(slice));
-          slice = [];
+        if (!isPolygon && sLen >= 4) {
+          results.push(sliceBuf.slice(0, sLen));
+          sLen = 0;
         }
       }
     } else if (bInside) {
       // a is outside, b is inside: add intersection then b will be added next iteration
       if (a < k1) {
-        addIntersection(slice, ax, ay, bx, by, k1, axis);
+        sLen = addIntersection(sliceBuf, sLen, ax, ay, bx, by, k1, axis);
       } else {
-        addIntersection(slice, ax, ay, bx, by, k2, axis);
+        sLen = addIntersection(sliceBuf, sLen, ax, ay, bx, by, k2, axis);
       }
     } else {
       // Both outside: check if they straddle the slab
@@ -349,11 +353,11 @@ function clipAxis(
         // Segment crosses both boundaries
         const enter = a < k1 ? k1 : k2;
         const exit = a < k1 ? k2 : k1;
-        addIntersection(slice, ax, ay, bx, by, enter, axis);
-        addIntersection(slice, ax, ay, bx, by, exit, axis);
-        if (!isPolygon && slice.length >= 4) {
-          results.push(new Float64Array(slice));
-          slice = [];
+        sLen = addIntersection(sliceBuf, sLen, ax, ay, bx, by, enter, axis);
+        sLen = addIntersection(sliceBuf, sLen, ax, ay, bx, by, exit, axis);
+        if (!isPolygon && sLen >= 4) {
+          results.push(sliceBuf.slice(0, sLen));
+          sLen = 0;
         }
       }
       // else both on same outside: skip
@@ -364,54 +368,59 @@ function clipAxis(
   const lastIdx = n - 2;
   const lastA = axis === 0 ? coords[lastIdx] : coords[lastIdx + 1];
   if (lastA >= k1 && lastA <= k2) {
-    slice.push(coords[lastIdx], coords[lastIdx + 1]);
+    sliceBuf[sLen++] = coords[lastIdx]; sliceBuf[sLen++] = coords[lastIdx + 1];
   }
 
   // For polygons, close the ring if needed
-  if (isPolygon && slice.length >= 6) {
-    const fx = slice[0], fy = slice[1];
-    const lx = slice[slice.length - 2], ly = slice[slice.length - 1];
+  if (isPolygon && sLen >= 6) {
+    const fx = sliceBuf[0], fy = sliceBuf[1];
+    const lx = sliceBuf[sLen - 2], ly = sliceBuf[sLen - 1];
     if (fx !== lx || fy !== ly) {
-      slice.push(fx, fy);
+      sliceBuf[sLen++] = fx; sliceBuf[sLen++] = fy;
     }
   }
 
-  if (slice.length >= 4) {
-    results.push(new Float64Array(slice));
+  if (sLen >= 4) {
+    results.push(sliceBuf.slice(0, sLen));
   }
 
   return results;
 }
 
 /**
- * Compute and append a line-segment / axis-boundary intersection point.
+ * Compute a line-segment / axis-boundary intersection point and write it
+ * into the pre-allocated buffer.
  *
  * Given the edge from `(ax, ay)` to `(bx, by)`, computes the point where
- * the edge crosses the axis-aligned boundary at `k` and pushes the
- * resulting `(x, y)` pair onto `out`.
+ * the edge crosses the axis-aligned boundary at `k` and writes the
+ * resulting `(x, y)` pair into `buf` at position `len`.
  *
- * @param out - Accumulator array to push the intersection coordinates into.
+ * @param buf - Pre-allocated output buffer.
+ * @param len - Current write position in the buffer.
  * @param ax - X of the edge start point.
  * @param ay - Y of the edge start point.
  * @param bx - X of the edge end point.
  * @param by - Y of the edge end point.
  * @param k - The axis-aligned boundary value to intersect.
  * @param axis - Which axis the boundary lies on: `0` for X, `1` for Y.
+ * @returns Updated write position after the two coordinates are written.
  */
 function addIntersection(
-  out: number[],
+  buf: Float64Array,
+  len: number,
   ax: number, ay: number,
   bx: number, by: number,
   k: number,
   axis: 0 | 1,
-): void {
+): number {
   if (axis === 0) {
     // Intersect at x = k
     const t = (k - ax) / (bx - ax);
-    out.push(k, ay + (by - ay) * t);
+    buf[len++] = k; buf[len++] = ay + (by - ay) * t;
   } else {
     // Intersect at y = k
     const t = (k - ay) / (by - ay);
-    out.push(ax + (bx - ax) * t, k);
+    buf[len++] = ax + (bx - ax) * t; buf[len++] = k;
   }
+  return len;
 }
