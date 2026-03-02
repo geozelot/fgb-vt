@@ -37,7 +37,7 @@ import type { Source, TileOptions } from './source.js';
 import { resolveOptions } from './source.js';
 import type { FgbHeader, MvtLayer, BBox, RawFeature } from './types.js';
 import { parseHeader, headerByteSize, INITIAL_HEADER_READ_SIZE } from './fgb/header.js';
-import { queryIndex } from './fgb/index.js';
+import { queryIndex, computeLevelBounds } from './fgb/index.js';
 import { decodeFeatures } from './fgb/feature.js';
 import { buildMvtLayer } from './mvt/layer.js';
 import { encodePbf } from './pbf/encode.js';
@@ -56,6 +56,8 @@ export interface FgbCache {
   header: FgbHeader;
   /** Raw bytes of the packed Hilbert R-tree spatial index. */
   indexBytes: Uint8Array;
+  /** Pre-computed R-tree level bounds, cached to avoid recomputing per query. */
+  levelBounds: Array<[number, number]>;
 }
 
 // == Single-source pipeline =================================================
@@ -99,14 +101,17 @@ export async function processSource(
   // Get header (from cache or by reading)
   let header: FgbHeader;
   let indexBytes: Uint8Array;
+  let levelBounds: Array<[number, number]>;
 
   if (cache) {
     header = cache.header;
     indexBytes = cache.indexBytes;
+    levelBounds = cache.levelBounds;
   } else {
     const hdr = await readHeader(connector, source.path);
     header = hdr.header;
     indexBytes = hdr.indexBytes;
+    levelBounds = hdr.levelBounds;
   }
 
   // Query spatial index to find matching feature byte ranges
@@ -120,6 +125,7 @@ export async function processSource(
     header.indexNodeSize,
     header.featuresOffset,
     wgs84BBox,
+    levelBounds,
   );
 
   if (ranges.length === 0) {
@@ -317,14 +323,15 @@ export async function processMultiConnectorTile(
  *
  * @param connector - The connector to read bytes from.
  * @param path - Connector-specific path to the FGB file.
- * @returns Parsed header metadata and raw spatial index bytes.
+ * @returns A complete {@link FgbCache} containing parsed header metadata,
+ *   raw spatial index bytes, and pre-computed R-tree level bounds.
  * @throws {Error} If the file does not contain a valid FlatGeobuf header
  *   (propagated from the header parser).
  */
 export async function readHeader(
   connector: Connector,
   path: string,
-): Promise<{ header: FgbHeader; indexBytes: Uint8Array }> {
+): Promise<FgbCache> {
   // First read: get enough to parse header size
   const initialBytes = await connector.read(path, 0, INITIAL_HEADER_READ_SIZE);
   const hdrSize = headerByteSize(initialBytes);
@@ -347,7 +354,12 @@ export async function readHeader(
     indexBytes = new Uint8Array(0);
   }
 
-  return { header, indexBytes };
+  // Pre-compute R-tree level bounds for reuse across queries
+  const levelBounds = (header.indexNodeSize > 0 && header.featuresCount > 0)
+    ? computeLevelBounds(header.featuresCount, header.indexNodeSize)
+    : [];
+
+  return { header, indexBytes, levelBounds };
 }
 
 // == Helpers ================================================================
