@@ -134,13 +134,24 @@ function decodeSingleFeature(
     ? decodeProperties(fb, fb.indirect(propsFieldOff), header.columns)
     : new Map<string, PropertyValue>();
 
+  // Extract feature ID from a detected ID column (if any)
+  let id: number | null = null;
+  if (header.idColumnIndex >= 0) {
+    const idCol = header.columns[header.idColumnIndex];
+    const rawId = properties.get(idCol.name);
+    if (typeof rawId === 'number') {
+      id = rawId;
+      properties.delete(idCol.name);
+    }
+  }
+
   return {
     type: geom.type,
     xy: geom.xy,
     ends: geom.ends,
     parts: geom.parts,
     properties,
-    id: null, // FGB features don't have a built-in ID field at the feature level
+    id,
   };
 }
 
