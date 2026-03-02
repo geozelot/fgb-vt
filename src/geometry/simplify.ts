@@ -66,14 +66,17 @@ export function simplify(
   dpMark(xy, importance, 0, n / 2 - 1);
 
   // Filter: emit only points with importance > sqTolerance
-  const out: number[] = [];
+  // Pre-allocate at input size (worst case: all points kept), then subarray
+  const out = new Float64Array(n);
+  let outLen = 0;
   for (let i = 0; i < n / 2; i++) {
     if (importance[i] > sqTolerance) {
-      out.push(xy[i * 2], xy[i * 2 + 1]);
+      out[outLen++] = xy[i * 2];
+      out[outLen++] = xy[i * 2 + 1];
     }
   }
 
-  return new Float64Array(out);
+  return out.subarray(0, outLen);
 }
 
 /**
@@ -165,36 +168,44 @@ export function ringTooSmall(xy: Float64Array, start: number, end: number, sqTol
 function dpMark(
   xy: Float64Array,
   importance: Float64Array,
-  first: number,
-  last: number,
+  firstInit: number,
+  lastInit: number,
 ): void {
-  let maxSqDist = 0;
-  let index = -1;
-  const mid = (first + last) >> 1;
-  let minPosToMid = last - first;
+  // Iterative Douglas-Peucker using an explicit stack of (first, last) pairs
+  const stack: number[] = [firstInit, lastInit];
 
-  const ax = xy[first * 2], ay = xy[first * 2 + 1];
-  const bx = xy[last * 2], by = xy[last * 2 + 1];
+  while (stack.length > 0) {
+    const last = stack.pop()!;
+    const first = stack.pop()!;
 
-  for (let i = first + 1; i < last; i++) {
-    const d = sqSegDist(xy[i * 2], xy[i * 2 + 1], ax, ay, bx, by);
-    if (d > maxSqDist) {
-      index = i;
-      maxSqDist = d;
-    } else if (d === maxSqDist) {
-      // Tie-break: prefer the point closest to the midpoint for balanced recursion
-      const posToMid = Math.abs(i - mid);
-      if (posToMid < minPosToMid) {
+    let maxSqDist = 0;
+    let index = -1;
+    const mid = (first + last) >> 1;
+    let minPosToMid = last - first;
+
+    const ax = xy[first * 2], ay = xy[first * 2 + 1];
+    const bx = xy[last * 2], by = xy[last * 2 + 1];
+
+    for (let i = first + 1; i < last; i++) {
+      const d = sqSegDist(xy[i * 2], xy[i * 2 + 1], ax, ay, bx, by);
+      if (d > maxSqDist) {
         index = i;
-        minPosToMid = posToMid;
+        maxSqDist = d;
+      } else if (d === maxSqDist) {
+        // Tie-break: prefer the point closest to the midpoint for balanced recursion
+        const posToMid = Math.abs(i - mid);
+        if (posToMid < minPosToMid) {
+          index = i;
+          minPosToMid = posToMid;
+        }
       }
     }
-  }
 
-  if (index >= 0 && maxSqDist > 0) {
-    importance[index] = maxSqDist;
-    if (index - first > 1) dpMark(xy, importance, first, index);
-    if (last - index > 1) dpMark(xy, importance, index, last);
+    if (index >= 0 && maxSqDist > 0) {
+      importance[index] = maxSqDist;
+      if (index - first > 1) stack.push(first, index);
+      if (last - index > 1) stack.push(index, last);
+    }
   }
 }
 
