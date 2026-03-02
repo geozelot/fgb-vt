@@ -352,80 +352,105 @@ function decodeProperties(
 /**
  * Read a single property value from the binary properties buffer.
  *
+ * Writes the decoded value and bytes consumed into the shared
+ * {@link propResult} object to avoid per-property object allocation.
+ *
  * @param view - DataView over the properties byte vector.
  * @param bytes - Raw `Uint8Array` of the properties byte vector (used for
  *   string and binary slicing).
  * @param offset - Current read position within the properties vector.
  * @param type - Column type determining the encoding.
- * @returns An object containing the decoded `value` and the number of
- *   `bytesRead` so the caller can advance the offset.
  */
 function readPropertyValue(
   view: DataView,
   bytes: Uint8Array,
   offset: number,
   type: ColumnType,
-): { value: PropertyValue; bytesRead: number } {
+): void {
   switch (type) {
     case ColumnType.Bool:
-      return { value: view.getUint8(offset) !== 0, bytesRead: 1 };
+      propResult.value = view.getUint8(offset) !== 0;
+      propResult.bytesRead = 1;
+      return;
 
     case ColumnType.Byte:
-      return { value: view.getInt8(offset), bytesRead: 1 };
+      propResult.value = view.getInt8(offset);
+      propResult.bytesRead = 1;
+      return;
 
     case ColumnType.UByte:
-      return { value: view.getUint8(offset), bytesRead: 1 };
+      propResult.value = view.getUint8(offset);
+      propResult.bytesRead = 1;
+      return;
 
     case ColumnType.Short:
-      return { value: view.getInt16(offset, true), bytesRead: 2 };
+      propResult.value = view.getInt16(offset, true);
+      propResult.bytesRead = 2;
+      return;
 
     case ColumnType.UShort:
-      return { value: view.getUint16(offset, true), bytesRead: 2 };
+      propResult.value = view.getUint16(offset, true);
+      propResult.bytesRead = 2;
+      return;
 
     case ColumnType.Int:
-      return { value: view.getInt32(offset, true), bytesRead: 4 };
+      propResult.value = view.getInt32(offset, true);
+      propResult.bytesRead = 4;
+      return;
 
     case ColumnType.UInt:
-      return { value: view.getUint32(offset, true), bytesRead: 4 };
+      propResult.value = view.getUint32(offset, true);
+      propResult.bytesRead = 4;
+      return;
 
     case ColumnType.Float:
-      return { value: view.getFloat32(offset, true), bytesRead: 4 };
+      propResult.value = view.getFloat32(offset, true);
+      propResult.bytesRead = 4;
+      return;
 
     case ColumnType.Long: {
       const lo = view.getUint32(offset, true);
       const hi = view.getInt32(offset + 4, true);
-      return { value: hi * 0x100000000 + lo, bytesRead: 8 };
+      propResult.value = hi * 0x100000000 + lo;
+      propResult.bytesRead = 8;
+      return;
     }
 
     case ColumnType.ULong: {
       const lo = view.getUint32(offset, true);
       const hi = view.getUint32(offset + 4, true);
-      return { value: hi * 0x100000000 + lo, bytesRead: 8 };
+      propResult.value = hi * 0x100000000 + lo;
+      propResult.bytesRead = 8;
+      return;
     }
 
     case ColumnType.Double:
-      return { value: view.getFloat64(offset, true), bytesRead: 8 };
+      propResult.value = view.getFloat64(offset, true);
+      propResult.bytesRead = 8;
+      return;
 
     case ColumnType.String:
     case ColumnType.Json:
     case ColumnType.DateTime: {
-      if (offset + 4 > bytes.length) return { value: null, bytesRead: 0 };
+      if (offset + 4 > bytes.length) { propResult.value = null; propResult.bytesRead = 0; return; }
       const strLen = view.getUint32(offset, true);
-      if (offset + 4 + strLen > bytes.length) return { value: null, bytesRead: 0 };
-      const strBytes = bytes.subarray(offset + 4, offset + 4 + strLen);
-      const str = textDecoder.decode(strBytes);
-      return { value: str, bytesRead: 4 + strLen };
+      if (offset + 4 + strLen > bytes.length) { propResult.value = null; propResult.bytesRead = 0; return; }
+      propResult.value = textDecoder.decode(bytes.subarray(offset + 4, offset + 4 + strLen));
+      propResult.bytesRead = 4 + strLen;
+      return;
     }
 
     case ColumnType.Binary: {
-      if (offset + 4 > bytes.length) return { value: null, bytesRead: 0 };
+      if (offset + 4 > bytes.length) { propResult.value = null; propResult.bytesRead = 0; return; }
       const binLen = view.getUint32(offset, true);
-      if (offset + 4 + binLen > bytes.length) return { value: null, bytesRead: 0 };
-      const bin = new Uint8Array(bytes.buffer, bytes.byteOffset + offset + 4, binLen);
-      return { value: bin, bytesRead: 4 + binLen };
+      if (offset + 4 + binLen > bytes.length) { propResult.value = null; propResult.bytesRead = 0; return; }
+      propResult.value = new Uint8Array(bytes.buffer, bytes.byteOffset + offset + 4, binLen);
+      propResult.bytesRead = 4 + binLen;
+      return;
     }
 
     default:
-      return { value: null, bytesRead: 0 };
+      propResult.value = null;
+      propResult.bytesRead = 0;
   }
 }
