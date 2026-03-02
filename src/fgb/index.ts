@@ -67,13 +67,14 @@ export function queryIndex(
   nodeSize: number,
   featuresOffset: number,
   bbox: BBox,
+  cachedLevelBounds?: Array<[number, number]>,
 ): ByteRange[] {
   if (featuresCount === 0 || nodeSize === 0) return [];
 
   const view = new DataView(indexBytes.buffer, indexBytes.byteOffset, indexBytes.byteLength);
 
-  // Calculate level bounds (root-first tree layout)
-  const levelBounds = computeLevelBounds(featuresCount, nodeSize);
+  // Use cached level bounds or compute fresh
+  const levelBounds = cachedLevelBounds ?? computeLevelBounds(featuresCount, nodeSize);
   const numLevels = levelBounds.length;
 
   // Leaf level bounds (level 0)
@@ -186,7 +187,7 @@ export function queryIndex(
  * @returns Array of `[startIndex, endIndex)` pairs, one per level.
  *   `result[0]` = leaf bounds, `result[result.length - 1]` = root bounds.
  */
-function computeLevelBounds(
+export function computeLevelBounds(
   featuresCount: number,
   nodeSize: number,
 ): Array<[number, number]> {
