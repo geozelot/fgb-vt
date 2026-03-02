@@ -12,6 +12,9 @@
  * FlatBuffers runtime.
  */
 
+/** Shared {@link TextDecoder} instance for UTF-8 string decoding. */
+const textDecoder = new TextDecoder();
+
 /**
  * Low-level, read-only FlatBuffers decoder backed by a {@link DataView}.
  *
@@ -160,7 +163,7 @@ export class FlatBufferReader {
     // Strings in FlatBuffers: uint32 length prefix, then UTF-8 bytes
     const len = this.view.getUint32(offset, true);
     const start = this.bytes.byteOffset + (this.view.byteOffset - this.bytes.byteOffset) + offset + 4;
-    return new TextDecoder().decode(
+    return textDecoder.decode(
       new Uint8Array(this.bytes.buffer, start, len),
     );
   }
