@@ -56,8 +56,14 @@ export interface FgbCache {
   header: FgbHeader;
   /** Raw bytes of the packed Hilbert R-tree spatial index. */
   indexBytes: Uint8Array;
-  /** Pre-computed R-tree level bounds, cached to avoid recomputing per query. */
-  levelBounds: Array<[number, number]>;
+  /**
+   * Pre-computed R-tree level bounds, cached to avoid recomputing per query.
+   *
+   * Optional — when omitted, level bounds are computed on demand from the
+   * header's `featuresCount` and `indexNodeSize`. Providing this avoids
+   * redundant work on repeated tile requests against the same source.
+   */
+  levelBounds?: Array<[number, number]>;
 }
 
 // == Single-source pipeline =================================================
@@ -106,12 +112,13 @@ export async function processSource(
   if (cache) {
     header = cache.header;
     indexBytes = cache.indexBytes;
-    levelBounds = cache.levelBounds;
+    levelBounds = cache.levelBounds
+      ?? computeLevelBoundsIfNeeded(header);
   } else {
     const hdr = await readHeader(connector, source.path);
     header = hdr.header;
     indexBytes = hdr.indexBytes;
-    levelBounds = hdr.levelBounds;
+    levelBounds = hdr.levelBounds!;
   }
 
   // Query spatial index to find matching feature byte ranges
@@ -363,6 +370,18 @@ export async function readHeader(
 }
 
 // == Helpers ================================================================
+
+/**
+ * Compute R-tree level bounds from the header when not supplied via cache.
+ *
+ * Returns an empty array when the header indicates no spatial index,
+ * matching the behaviour of {@link readHeader}.
+ */
+function computeLevelBoundsIfNeeded(header: FgbHeader): Array<[number, number]> {
+  return (header.indexNodeSize > 0 && header.featuresCount > 0)
+    ? computeLevelBounds(header.featuresCount, header.indexNodeSize)
+    : [];
+}
 
 /**
  * Create an empty MVT layer with no features, keys, or values.
