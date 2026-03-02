@@ -148,8 +148,18 @@ export function queryIndex(
       const nextByteOffset = readUint64AsNumber(view, (nodeIdx + 1) * NODE_ITEM_SIZE + 32);
       featureLength = nextByteOffset - featureByteOffset;
     } else {
-      // Last feature: exact length unknown; use a generous upper bound
-      featureLength = 1024 * 1024;
+      // Last feature: exact length unknown. Estimate from the previous
+      // leaf's size (if available), clamped to a reasonable range.
+      // This avoids the wasteful 1 MB over-fetch for small features while
+      // still covering large features via the 4x multiplier.
+      if (nodeIdx > levelBounds[0][0]) {
+        const prevByteOffset = readUint64AsNumber(view, (nodeIdx - 1) * NODE_ITEM_SIZE + 32);
+        const prevLen = featureByteOffset - prevByteOffset;
+        featureLength = Math.max(256, Math.min(prevLen * 4, 256 * 1024));
+      } else {
+        // Single feature in the file — use a moderate default
+        featureLength = 64 * 1024;
+      }
     }
 
     ranges.push({
