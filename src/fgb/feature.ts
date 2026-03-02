@@ -47,6 +47,12 @@ const MAX_GEOMETRY_DEPTH = 4;
 const textDecoder = new TextDecoder();
 
 /**
+ * Shared mutable result object for {@link readPropertyValue}, avoiding a
+ * fresh `{value, bytesRead}` allocation on every property decode.
+ */
+const propResult: { value: PropertyValue; bytesRead: number } = { value: null, bytesRead: 0 };
+
+/**
  * Decode all features from a contiguous byte buffer that may contain one or
  * more length-prefixed feature FlatBuffers.
  *
@@ -69,14 +75,14 @@ export function decodeFeatures(
   maxFeatures: number = Infinity,
 ): RawFeature[] {
   const features: RawFeature[] = [];
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let offset = 0;
 
   while (offset < bytes.length && features.length < maxFeatures) {
     if (offset + 4 > bytes.length) break;
 
     // Read feature size prefix (uint32 LE)
-    const view = new DataView(bytes.buffer, bytes.byteOffset + offset, 4);
-    const featureSize = view.getUint32(0, true);
+    const featureSize = view.getUint32(offset, true);
     if (featureSize === 0) break;
 
     offset += 4;
@@ -334,10 +340,10 @@ function decodeProperties(
     if (colIdx >= columns.length) break;
     const col = columns[colIdx];
 
-    const { value, bytesRead } = readPropertyValue(view, propsBytes, offset, col.type);
-    offset += bytesRead;
+    readPropertyValue(view, propsBytes, offset, col.type);
+    offset += propResult.bytesRead;
 
-    props.set(col.name, value);
+    props.set(col.name, propResult.value);
   }
 
   return props;
