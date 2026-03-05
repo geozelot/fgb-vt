@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { projectX, projectY, projectToMercator } from '../../src/geometry/project.js';
 
 describe('Projection edge cases', () => {
-  // ─── Antimeridian / date line ────────────────────────────────────────────
+  // == Antimeridian / date line ============================================
 
   it('should handle antimeridian: longitude +180', () => {
     expect(projectX(180)).toBe(1);
@@ -22,7 +22,7 @@ describe('Projection edge cases', () => {
     expect(xNeg179).toBeCloseTo(0, 3);
   });
 
-  // ─── Polar latitudes ─────────────────────────────────────────────────────
+  // == Polar latitudes =====================================================
 
   it('should clamp latitude near +90 (north pole)', () => {
     const y = projectY(89.99);
@@ -55,7 +55,7 @@ describe('Projection edge cases', () => {
     expect(yBelow).toBeLessThanOrEqual(1);
   });
 
-  // ─── Zero / equator / prime meridian ─────────────────────────────────────
+  // == Zero / equator / prime meridian =====================================
 
   it('should project equator to y=0.5', () => {
     expect(projectY(0)).toBe(0.5);
@@ -65,7 +65,7 @@ describe('Projection edge cases', () => {
     expect(projectX(0)).toBe(0.5);
   });
 
-  // ─── Empty / single coordinate ───────────────────────────────────────────
+  // == Empty / single coordinate ===========================================
 
   it('should handle empty coordinate array', () => {
     const xy = new Float64Array(0);
@@ -80,7 +80,7 @@ describe('Projection edge cases', () => {
     expect(xy[1]).toBe(0.5); // equator
   });
 
-  // ─── Large coordinate arrays ─────────────────────────────────────────────
+  // == Large coordinate arrays =============================================
 
   it('should handle very large coordinate arrays without stack overflow', () => {
     const n = 100_000;

@@ -15,7 +15,7 @@ const PORT = 3000;
 const FGB_FILE = './data/us_counties.fgb';
 const FGB_URL  = `http://localhost:${PORT}/data/us_counties.fgb`;
 
-// ── Mock S3 SDK ─────────────────────────────────────────────────────
+// == Mock S3 SDK =====================================================
 //
 // Simulates S3 GetObject with Range headers by reading from the local
 // filesystem. Maps s3://fgb-data/{key} → ./data/{key} so the source
@@ -66,7 +66,7 @@ function createMockS3Connector() {
   return connector;
 }
 
-// ── Sources ─────────────────────────────────────────────────────────
+// == Sources =========================================================
 
 const SOURCES = {
   us_counties_local: { name: 'us_counties', path: FGB_FILE },
@@ -74,7 +74,7 @@ const SOURCES = {
   us_counties_s3:    { name: 'us_counties', path: 's3://fgb-data/us_counties.fgb' },
 };
 
-// ── Tier 1: TileServer (stateful) — one per connector type ─────────
+// == Tier 1: TileServer (stateful) — one per connector type =========
 const tileServers = {
   us_counties_local: new TileServer({
     connector: new LocalConnector(),
@@ -90,21 +90,21 @@ const tileServers = {
   }),
 };
 
-// ── Tier 2: TileClient (semi-stateful) ─────────────────────────────
+// == Tier 2: TileClient (semi-stateful) =============================
 const tileClients = {
   us_counties_local: new TileClient(new LocalConnector()),
   us_counties_http:  new TileClient(new HttpConnector()),
   us_counties_s3:    new TileClient(createMockS3Connector()),
 };
 
-// ── Tier 3: tile() (stateless) ─────────────────────────────────────
+// == Tier 3: tile() (stateless) =====================================
 const statelessConnectors = {
   us_counties_local: new LocalConnector(),
   us_counties_http:  new HttpConnector(),
   us_counties_s3:    createMockS3Connector(),
 };
 
-// ── HTTP server ────────────────────────────────────────────────────
+// == HTTP server ====================================================
 const VALID_DATASETS = new Set(Object.keys(SOURCES));
 
 const server = createServer(async (req, res) => {
@@ -238,7 +238,7 @@ server.listen(PORT, () => {
   console.log('  tiers:    server, client, fn');
 });
 
-// ── Graceful shutdown ──────────────────────────────────────────────
+// == Graceful shutdown ==============================================
 process.on('SIGINT', async () => {
   console.log('\nShutting down…');
   server.close();

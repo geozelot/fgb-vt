@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { tileId, tileBBox, tileClipBounds, TileBoundsCache } from '../../src/tiles.js';
 
 describe('Tile coordinate edge cases', () => {
-  // ─── Zoom 0: single world tile ──────────────────────────────────────
+  // == Zoom 0: single world tile ======================================
 
   it('should produce world-spanning bbox at z=0', () => {
     const bbox = tileBBox(0, 0, 0);
@@ -19,7 +19,7 @@ describe('Tile coordinate edge cases', () => {
     expect(id).toBe(0);
   });
 
-  // ─── High zoom levels ───────────────────────────────────────────────
+  // == High zoom levels ===============================================
 
   it('should produce very small bbox at z=20', () => {
     const bbox = tileBBox(20, 524288, 349526);
@@ -41,7 +41,7 @@ describe('Tile coordinate edge cases', () => {
     expect(id2).not.toBe(id3);
   });
 
-  // ─── Clip bounds with buffer ─────────────────────────────────────────
+  // == Clip bounds with buffer =========================================
 
   it('should extend clip bounds beyond tile boundary with buffer > 0', () => {
     const noBuf = tileClipBounds(5, 16, 16, 0, 4096);
@@ -61,7 +61,7 @@ describe('Tile coordinate edge cases', () => {
     expect(clip.maxY).toBeCloseTo(17 / z2, 10);
   });
 
-  // ─── Edge tiles ──────────────────────────────────────────────────────
+  // == Edge tiles ======================================================
 
   it('should handle tile at x=0 (left edge of the world)', () => {
     const bbox = tileBBox(5, 0, 16);
@@ -85,7 +85,7 @@ describe('Tile coordinate edge cases', () => {
     expect(bbox.minY).toBeLessThan(-80);
   });
 
-  // ─── Clip bounds at world edges with buffer ───────────────────────
+  // == Clip bounds at world edges with buffer =======================
 
   it('should allow negative clip bounds (buffer extends beyond world)', () => {
     // At z=0, the tile is the entire world. Buffer extends beyond.
@@ -95,7 +95,7 @@ describe('Tile coordinate edge cases', () => {
     expect(clip.maxX).toBeGreaterThan(1);
   });
 
-  // ─── TileBoundsCache ──────────────────────────────────────────────────
+  // == TileBoundsCache ==================================================
 
   it('should return identical objects from cache on repeated calls', () => {
     const cache = new TileBoundsCache();

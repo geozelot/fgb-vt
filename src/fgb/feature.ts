@@ -138,7 +138,7 @@ function decodeSingleFeature(
   };
 }
 
-// ─── Geometry decoding ──────────────────────────────────────────────────────
+// == Geometry decoding ======================================================
 
 /** Intermediate representation of a decoded FGB geometry. */
 interface DecodedGeometry {
@@ -284,7 +284,7 @@ function decodeGeometry(
   return { type, xy, ends, parts };
 }
 
-// ─── Properties decoding ────────────────────────────────────────────────────
+// == Properties decoding ====================================================
 
 /**
  * Decode properties from FGB's custom binary encoding.

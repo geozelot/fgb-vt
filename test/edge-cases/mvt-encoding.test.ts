@@ -3,7 +3,7 @@ import { encodeGeometry, zigzag } from '../../src/mvt/geometry.js';
 import { MvtGeomType } from '../../src/types.js';
 
 describe('MVT encoding edge cases', () => {
-  // ─── zigzag edge cases ──────────────────────────────────────────────
+  // == zigzag edge cases ==============================================
 
   it('should handle large positive values', () => {
     expect(zigzag(100000)).toBe(200000);
@@ -15,7 +15,7 @@ describe('MVT encoding edge cases', () => {
 
   // Note: zigzag uses 32-bit shift so max safe range is ±(2^30 - 1)
 
-  // ─── Empty geometry ──────────────────────────────────────────────────
+  // == Empty geometry ==================================================
 
   it('should return empty array for empty point coords', () => {
     const coords = new Int32Array(0);
@@ -32,7 +32,7 @@ describe('MVT encoding edge cases', () => {
     expect(encodeGeometry(coords, null, MvtGeomType.POLYGON)).toEqual([]);
   });
 
-  // ─── Single point at origin ──────────────────────────────────────────
+  // == Single point at origin ==========================================
 
   it('should encode point at (0, 0)', () => {
     const coords = new Int32Array([0, 0]);
@@ -41,7 +41,7 @@ describe('MVT encoding edge cases', () => {
     expect(result).toEqual([9, 0, 0]);
   });
 
-  // ─── Points with negative coords (buffer zone) ──────────────────────
+  // == Points with negative coords (buffer zone) ======================
 
   it('should encode point with negative coordinates', () => {
     const coords = new Int32Array([-100, -50]);
@@ -50,7 +50,7 @@ describe('MVT encoding edge cases', () => {
     expect(result).toEqual([9, 199, 99]);
   });
 
-  // ─── Linestring with 2 points (minimum valid) ──────────────────────
+  // == Linestring with 2 points (minimum valid) ======================
 
   it('should encode a 2-point linestring', () => {
     const coords = new Int32Array([0, 0, 100, 100]);
@@ -59,7 +59,7 @@ describe('MVT encoding edge cases', () => {
     expect(result).toEqual([9, 0, 0, 10, 200, 200]);
   });
 
-  // ─── Single-point linestring (degenerate) ────────────────────────────
+  // == Single-point linestring (degenerate) ============================
 
   it('should return empty for single-point linestring (too few points)', () => {
     const coords = new Int32Array([10, 20]);
@@ -68,7 +68,7 @@ describe('MVT encoding edge cases', () => {
     expect(result).toEqual([]);
   });
 
-  // ─── Polygon with 3 vertices (triangle, closed) ─────────────────────
+  // == Polygon with 3 vertices (triangle, closed) =====================
 
   it('should encode a triangle polygon (minimum ring)', () => {
     const coords = new Int32Array([0, 0, 100, 0, 50, 100, 0, 0]);
@@ -80,7 +80,7 @@ describe('MVT encoding edge cases', () => {
     expect(result[result.length - 1]).toBe(15);
   });
 
-  // ─── Polygon with 2 vertices (degenerate, too few for ring) ────────
+  // == Polygon with 2 vertices (degenerate, too few for ring) ========
 
   it('should skip degenerate polygon ring with fewer than 3 vertices', () => {
     // 2 unique points + closing point = 3 coord pairs, but lineCount would be < 2
@@ -91,7 +91,7 @@ describe('MVT encoding edge cases', () => {
     expect(result).toEqual([]);
   });
 
-  // ─── Multi-ring polygon ─────────────────────────────────────────────
+  // == Multi-ring polygon =============================================
 
   it('should encode multi-ring polygon correctly', () => {
     const coords = new Int32Array([
@@ -107,7 +107,7 @@ describe('MVT encoding edge cases', () => {
     expect(closeCount).toBe(2);
   });
 
-  // ─── Point at extent boundary ────────────────────────────────────────
+  // == Point at extent boundary ========================================
 
   it('should encode point at exact extent (4096)', () => {
     const coords = new Int32Array([4096, 4096]);
@@ -115,7 +115,7 @@ describe('MVT encoding edge cases', () => {
     expect(result).toEqual([9, zigzag(4096), zigzag(4096)]);
   });
 
-  // ─── Large coordinate deltas ─────────────────────────────────────────
+  // == Large coordinate deltas =========================================
 
   it('should handle large coordinate deltas', () => {
     const coords = new Int32Array([0, 0, 4096, 4096]);
@@ -124,7 +124,7 @@ describe('MVT encoding edge cases', () => {
     // Should not crash
   });
 
-  // ─── Zero-delta coordinates (colocated points) ───────────────────────
+  // == Zero-delta coordinates (colocated points) =======================
 
   it('should handle colocated linestring points (zero deltas)', () => {
     const coords = new Int32Array([50, 50, 50, 50, 100, 100]);

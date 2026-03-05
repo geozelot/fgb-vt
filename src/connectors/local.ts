@@ -150,7 +150,7 @@ export class LocalConnector implements Connector {
     await Promise.all(handles.map(h => h.close()));
   }
 
-  // ─── Handle pool ────────────────────────────────────────────────────
+  // == Handle pool ====================================================
 
   /**
    * Retrieve a cached file handle or open a new one.

@@ -58,7 +58,7 @@ export interface FgbCache {
   indexBytes: Uint8Array;
 }
 
-// ─── Single-source pipeline ─────────────────────────────────────────────────
+// == Single-source pipeline =================================================
 
 /**
  * Execute the full pipeline for a single source:
@@ -153,7 +153,7 @@ export async function processSource(
   );
 }
 
-// ─── Multi-source pipeline ──────────────────────────────────────────────────
+// == Multi-source pipeline ==================================================
 
 /**
  * Execute the full pipeline for multiple sources sharing a single
@@ -232,7 +232,7 @@ export async function processTileLayers(
   return Promise.all(layerPromises);
 }
 
-// ─── Multi-connector pipeline ───────────────────────────────────────────────
+// == Multi-connector pipeline ===============================================
 
 /**
  * A pairing of a {@link Connector} with the {@link Source} descriptors it
@@ -298,7 +298,7 @@ export async function processMultiConnectorTile(
   return encodePbf(layers);
 }
 
-// ─── Header reading ─────────────────────────────────────────────────────────
+// == Header reading =========================================================
 
 /**
  * Read and parse an FGB header and spatial index from a {@link Connector}.
@@ -350,7 +350,7 @@ export async function readHeader(
   return { header, indexBytes };
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// == Helpers ================================================================
 
 /**
  * Create an empty MVT layer with no features, keys, or values.

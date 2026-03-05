@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { simplify, sqToleranceForZoom, ringTooSmall } from '../../src/geometry/simplify.js';
 
 describe('Simplification edge cases', () => {
-  // ─── Empty / minimal input ──────────────────────────────────────────
+  // == Empty / minimal input ==========================================
 
   it('should handle 0-length array', () => {
     const result = simplify(new Float64Array(0), 0.01);
@@ -21,7 +21,7 @@ describe('Simplification edge cases', () => {
     expect(result.length).toBe(4);
   });
 
-  // ─── Collinear points ──────────────────────────────────────────────
+  // == Collinear points ==============================================
 
   it('should simplify perfectly collinear points down to 2', () => {
     // 10 points on a straight line from (0,0) to (1,1)
@@ -36,7 +36,7 @@ describe('Simplification edge cases', () => {
     expect(result.length).toBe(4); // 2 points × 2 coords
   });
 
-  // ─── Zero tolerance ────────────────────────────────────────────────
+  // == Zero tolerance ================================================
 
   it('should keep all points with zero tolerance', () => {
     const xy = new Float64Array([0, 0, 0.5, 0.1, 1, 0, 1.5, 0.1, 2, 0]);
@@ -46,7 +46,7 @@ describe('Simplification edge cases', () => {
     expect(result.length).toBe(xy.length);
   });
 
-  // ─── Very large tolerance ─────────────────────────────────────────
+  // == Very large tolerance =========================================
 
   it('should reduce to 2 points with very large tolerance', () => {
     const n = 100;
@@ -60,7 +60,7 @@ describe('Simplification edge cases', () => {
     expect(result.length).toBe(4);
   });
 
-  // ─── Zigzag pattern ────────────────────────────────────────────────
+  // == Zigzag pattern ================================================
 
   it('should simplify a zigzag pattern', () => {
     // Create a zigzag with alternating y
@@ -73,7 +73,7 @@ describe('Simplification edge cases', () => {
     expect(result.length).toBeLessThanOrEqual(xy.length);
   });
 
-  // ─── sqToleranceForZoom edge cases ────────────────────────────────
+  // == sqToleranceForZoom edge cases ================================
 
   it('should produce very small tolerance at high zoom', () => {
     const sqTol = sqToleranceForZoom(3, 22, 4096);
@@ -91,7 +91,7 @@ describe('Simplification edge cases', () => {
     expect(sqToleranceForZoom(0, 5, 4096)).toBe(0);
   });
 
-  // ─── ringTooSmall edge cases ──────────────────────────────────────
+  // == ringTooSmall edge cases ======================================
 
   it('should consider a zero-area ring as too small', () => {
     // A zero-area line (all same point)

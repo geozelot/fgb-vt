@@ -205,7 +205,7 @@ export class HttpConnector implements Connector {
     // No persistent connections to clean up with fetch
   }
 
-  // ─── Internal ──────────────────────────────────────────────────────────
+  // == Internal ==========================================================
 
   /**
    * Execute a `fetch` with timeout and exponential-backoff retry.

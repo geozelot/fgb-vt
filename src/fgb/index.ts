@@ -160,7 +160,7 @@ export function queryIndex(
   return mergeRanges(ranges);
 }
 
-// ─── Internals ──────────────────────────────────────────────────────────────
+// == Internals ==============================================================
 
 /**
  * Compute the node-index boundaries for each level of the packed R-tree.

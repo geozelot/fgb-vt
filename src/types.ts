@@ -16,7 +16,7 @@
  * to minimize allocations and improve cache locality.
  */
 
-// ─── Geometry Types ─────────────────────────────────────────────────────────
+// == Geometry Types =========================================================
 
 /**
  * FlatGeobuf geometry type constants.
@@ -49,7 +49,7 @@ export const enum MvtGeomType {
   POLYGON = 3,
 }
 
-// ─── Bounding Box ───────────────────────────────────────────────────────────
+// == Bounding Box ===========================================================
 
 /**
  * Axis-aligned bounding box.
@@ -68,7 +68,7 @@ export interface BBox {
   maxY: number;
 }
 
-// ─── Raw Feature (FGB decode output) ────────────────────────────────────────
+// == Raw Feature (FGB decode output) ========================================
 
 /**
  * A property value decoded from an FGB feature.
@@ -125,7 +125,7 @@ export interface RawFeature {
   id: number | null;
 }
 
-// ─── FGB Column Schema ──────────────────────────────────────────────────────
+// == FGB Column Schema ======================================================
 
 /**
  * FlatGeobuf column (property) type constants.
@@ -165,7 +165,7 @@ export interface ColumnMeta {
   nullable: boolean;
 }
 
-// ─── FGB Header ─────────────────────────────────────────────────────────────
+// == FGB Header =============================================================
 
 /**
  * Parsed FlatGeobuf file header.
@@ -195,7 +195,7 @@ export interface FgbHeader {
   headerSize: number;
 }
 
-// ─── MVT Types ──────────────────────────────────────────────────────────────
+// == MVT Types ==============================================================
 
 /**
  * A tagged MVT property value.
@@ -244,7 +244,7 @@ export interface MvtLayer {
   values: MvtValue[];
 }
 
-// ─── TileJSON ───────────────────────────────────────────────────────────────
+// == TileJSON ===============================================================
 
 /**
  * TileJSON 3.0.0 metadata descriptor.

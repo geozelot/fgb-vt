@@ -40,7 +40,7 @@ export class FlatBufferReader {
     this.view = new DataView(bytes.buffer, bytes.byteOffset + offset, bytes.byteLength - offset);
   }
 
-  // ─── Scalar reads ─────────────────────────────────────────────────────
+  // == Scalar reads =====================================================
 
   /**
    * Read an unsigned 8-bit integer at the given byte offset.
@@ -144,7 +144,7 @@ export class FlatBufferReader {
     return hi * 0x100000000 + lo;
   }
 
-  // ─── String reads ─────────────────────────────────────────────────────
+  // == String reads =====================================================
 
   /**
    * Read a FlatBuffers-encoded UTF-8 string at the given byte offset.
@@ -165,7 +165,7 @@ export class FlatBufferReader {
     );
   }
 
-  // ─── FlatBuffer Table navigation ──────────────────────────────────────
+  // == FlatBuffer Table navigation ======================================
 
   /**
    * Read the root table offset from position 0 of the buffer.
@@ -254,7 +254,7 @@ export class FlatBufferReader {
     return vectorOffset + 4;
   }
 
-  // ─── Typed array reads ────────────────────────────────────────────────
+  // == Typed array reads ================================================
 
   /**
    * Read a contiguous sequence of `float64` values into a `Float64Array`.

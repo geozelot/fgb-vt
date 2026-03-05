@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { S3Connector } from '../../src/connectors/s3.js';
 
-// ── Mock SDK ────────────────────────────────────────────────────────────────
+// == Mock SDK ================================================================
 //
 // The real S3Connector uses a Function constructor trick to dynamically
 // import @aws-sdk/client-s3 at runtime. Instead of installing the SDK or
@@ -59,7 +59,7 @@ function injectMock(connector: S3Connector, sdk: ReturnType<typeof createMockSdk
   c.client = new sdk.S3Client();
 }
 
-// ── Test data ───────────────────────────────────────────────────────────────
+// == Test data ===============================================================
 
 // 256 sequential bytes: value at index i === i
 const TEST_BYTES = new Uint8Array(256);
@@ -70,7 +70,7 @@ const STORE: ObjectStore = {
   'other-bucket/nested/path/roads.fgb': TEST_BYTES,
 };
 
-// ── Tests ───────────────────────────────────────────────────────────────────
+// == Tests ===================================================================
 
 describe('S3Connector', () => {
   let connector: S3Connector;

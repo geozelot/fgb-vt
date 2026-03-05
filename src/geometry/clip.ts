@@ -140,7 +140,7 @@ export function clipFeatures(
   return result;
 }
 
-// ─── Internals ──────────────────────────────────────────────────────────────
+// == Internals ==============================================================
 
 /**
  * Test whether a geometry type represents a polygon variant.

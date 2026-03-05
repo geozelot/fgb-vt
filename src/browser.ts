@@ -25,17 +25,17 @@
  * ```
  */
 
-// ─── API Tiers ──────────────────────────────────────────────────────────────
+// == API Tiers ==============================================================
 
 export { TileServer } from './server.js';
 export { TileClient } from './client.js';
 export { tile } from './tile.js';
 
-// ─── Browser-compatible Connector ───────────────────────────────────────────
+// == Browser-compatible Connector ===========================================
 
 export { HttpConnector } from './connectors/http.js';
 
-// ─── Types ──────────────────────────────────────────────────────────────────
+// == Types ==================================================================
 
 export type { Connector } from './connectors/connector.js';
 export type { HttpConnectorOptions } from './connectors/http.js';

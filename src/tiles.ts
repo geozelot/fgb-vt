@@ -24,7 +24,7 @@ import type { BBox } from './types.js';
 
 const PI = Math.PI;
 
-// ─── Tile ID ────────────────────────────────────────────────────────────────
+// == Tile ID ================================================================
 
 /**
  * Encode tile coordinates into a unique numeric identifier.
@@ -52,7 +52,7 @@ export function tileId(z: number, x: number, y: number): number {
   return (((1 << z) * y + x) * 32) + z;
 }
 
-// ─── Tile → WGS84 BBox ─────────────────────────────────────────────────────
+// == Tile → WGS84 BBox =====================================================
 
 /**
  * Convert slippy map tile coordinates to a WGS84 bounding box.
@@ -102,7 +102,7 @@ function tileLatDeg(y: number, n: number): number {
   return (latRad * 180) / PI;
 }
 
-// ─── Tile → Mercator Clip Bounds ────────────────────────────────────────────
+// == Tile → Mercator Clip Bounds ============================================
 
 /**
  * Compute buffered clip bounds in Mercator [0, 1] space for a tile.
@@ -148,7 +148,7 @@ export function tileClipBounds(
   };
 }
 
-// ─── Cached Tile Bounds ─────────────────────────────────────────────────────
+// == Cached Tile Bounds =====================================================
 
 /**
  * A lazily-populated, dual-compartment cache for tile bounding boxes.

@@ -36,14 +36,14 @@ function makePolygon(coords: number[], ends: number[], id = 0): RawFeature {
 const clip: BBox = { minX: 0.2, minY: 0.2, maxX: 0.8, maxY: 0.8 };
 
 describe('Clipping edge cases', () => {
-  // ─── Empty input ──────────────────────────────────────────────────────
+  // == Empty input ======================================================
 
   it('should return empty array for empty input', () => {
     const result = clipFeatures([], clip);
     expect(result).toEqual([]);
   });
 
-  // ─── Features entirely outside ──────────────────────────────────────
+  // == Features entirely outside ======================================
 
   it('should discard all features entirely outside bounds', () => {
     const features = [
@@ -56,7 +56,7 @@ describe('Clipping edge cases', () => {
     expect(result.length).toBe(0);
   });
 
-  // ─── Features entirely inside ─────────────────────────────────────────
+  // == Features entirely inside =========================================
 
   it('should pass through features entirely inside (trivial accept)', () => {
     const features = [
@@ -67,7 +67,7 @@ describe('Clipping edge cases', () => {
     expect(result.length).toBe(2);
   });
 
-  // ─── Point on boundary ──────────────────────────────────────────────
+  // == Point on boundary ==============================================
 
   it('should include points exactly on the clip boundary', () => {
     const features = [
@@ -80,7 +80,7 @@ describe('Clipping edge cases', () => {
     expect(result.length).toBe(4);
   });
 
-  // ─── Line crossing boundary ──────────────────────────────────────────
+  // == Line crossing boundary ==========================================
 
   it('should clip a line that crosses from inside to outside', () => {
     const line = makeLine([0.5, 0.5, 0.5, 0.9]);
@@ -105,7 +105,7 @@ describe('Clipping edge cases', () => {
     }
   });
 
-  // ─── Line entirely outside ───────────────────────────────────────────
+  // == Line entirely outside ===========================================
 
   it('should discard a line entirely outside the clip region', () => {
     const line = makeLine([0.0, 0.0, 0.1, 0.1]);
@@ -113,7 +113,7 @@ describe('Clipping edge cases', () => {
     expect(result.length).toBe(0);
   });
 
-  // ─── Degenerate geometries ───────────────────────────────────────────
+  // == Degenerate geometries ===========================================
 
   it('should handle a zero-length line (same start and end)', () => {
     const line = makeLine([0.5, 0.5, 0.5, 0.5]);
@@ -131,7 +131,7 @@ describe('Clipping edge cases', () => {
     expect(result.length).toBe(1);
   });
 
-  // ─── Large polygon straddling clip bounds ─────────────────────────────
+  // == Large polygon straddling clip bounds =============================
 
   it('should clip a large polygon that extends well beyond clip bounds', () => {
     // Polygon from (0,0) to (1,1) — much larger than clip (0.2,0.2)-(0.8,0.8)
@@ -150,7 +150,7 @@ describe('Clipping edge cases', () => {
     }
   });
 
-  // ─── MultiPoint clipping ──────────────────────────────────────────────
+  // == MultiPoint clipping ==============================================
 
   it('should partially clip a MultiPoint (keep only inside points)', () => {
     const mp: RawFeature = {
@@ -170,7 +170,7 @@ describe('Clipping edge cases', () => {
     expect(result[0].xy.length).toBe(4); // 2 inside points × 2 coords
   });
 
-  // ─── Narrow sliver polygon ────────────────────────────────────────────
+  // == Narrow sliver polygon ============================================
 
   it('should handle a very narrow sliver polygon', () => {
     // A nearly-degenerate sliver
@@ -182,7 +182,7 @@ describe('Clipping edge cases', () => {
     expect(() => clipFeatures([poly], clip)).not.toThrow();
   });
 
-  // ─── Mixed geometry batch ──────────────────────────────────────────────
+  // == Mixed geometry batch ==============================================
 
   it('should handle a mixed batch of geometry types', () => {
     const features: RawFeature[] = [
@@ -196,7 +196,7 @@ describe('Clipping edge cases', () => {
     expect(result.length).toBe(3);
   });
 
-  // ─── Full world clip bounds (no clipping) ─────────────────────────────
+  // == Full world clip bounds (no clipping) =============================
 
   it('should pass through everything with world-spanning clip bounds', () => {
     const worldClip: BBox = { minX: 0, minY: 0, maxX: 1, maxY: 1 };

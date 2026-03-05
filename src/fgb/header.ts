@@ -136,6 +136,9 @@ export function parseHeader(bytes: Uint8Array): FgbHeader {
     }
   }
 
+  // Detect an ID column among the parsed columns
+  const idColumnIndex = detectIdColumn(columns);
+
   // Compute spatial index size and offsets
   const indexOffset = totalHeaderSize;
   const indexSize = indexNodeSize > 0 ? calcIndexSize(featuresCount, indexNodeSize) : 0;
@@ -151,6 +154,7 @@ export function parseHeader(bytes: Uint8Array): FgbHeader {
     indexSize,
     featuresOffset,
     headerSize: totalHeaderSize,
+    idColumnIndex,
   };
 }
 
@@ -175,7 +179,48 @@ export function headerByteSize(bytes: Uint8Array): number {
   return HEADER_MAGIC_SIZE + 4 + view.getUint32(0, true);
 }
 
-// ─── Column parsing ─────────────────────────────────────────────────────────
+// == ID column detection =====================================================
+
+/**
+ * Well-known column names that conventionally hold a feature identifier.
+ *
+ * Checked case-insensitively, in priority order: an exact `id` match is
+ * preferred over `fid`, which is preferred over `gid`, etc.
+ */
+const ID_COLUMN_NAMES = ['id', 'fid', 'gid', 'ogc_fid'];
+
+/**
+ * Integer column types eligible as feature ID sources.
+ *
+ * Float and Double are excluded because MVT feature IDs are unsigned
+ * integers, and floating-point values would need lossy truncation.
+ */
+function isIntegerColumnType(type: ColumnType): boolean {
+  return type === ColumnType.Byte || type === ColumnType.UByte ||
+    type === ColumnType.Short || type === ColumnType.UShort ||
+    type === ColumnType.Int || type === ColumnType.UInt ||
+    type === ColumnType.Long || type === ColumnType.ULong;
+}
+
+/**
+ * Scan the column schema for a well-known integer ID column.
+ *
+ * @param columns - Parsed column metadata from the FGB header.
+ * @returns Index into `columns` of the best-matching ID column, or `-1`
+ *   if no suitable column was found.
+ */
+function detectIdColumn(columns: ColumnMeta[]): number {
+  for (const candidateName of ID_COLUMN_NAMES) {
+    for (let i = 0; i < columns.length; i++) {
+      if (columns[i].name.toLowerCase() === candidateName && isIntegerColumnType(columns[i].type)) {
+        return i;
+      }
+    }
+  }
+  return -1;
+}
+
+// == Column parsing =========================================================
 
 /**
  * Parse a single Column table from the header FlatBuffer.
@@ -206,7 +251,7 @@ function parseColumn(fb: FlatBufferReader, tablePos: number): ColumnMeta {
   return { name, type, nullable };
 }
 
-// ─── Index size calculation ─────────────────────────────────────────────────
+// == Index size calculation =================================================
 
 /**
  * Calculate the byte size of a packed Hilbert R-tree index.
@@ -239,9 +284,13 @@ function calcIndexSize(featuresCount: number, nodeSize: number): number {
 }
 
 /**
- * Minimum number of bytes required from the start of an FGB file in order
- * to determine the full header size via {@link headerByteSize}.
+ * Number of bytes to read from the start of an FGB file on the first I/O
+ * operation.
  *
- * Equal to the 8-byte magic signature plus the 4-byte header size prefix.
+ * The absolute minimum to determine the full header size is 12 bytes
+ * (8-byte magic + 4-byte header size prefix), but FGB headers are
+ * typically a few hundred bytes to a few kilobytes. Reading 4096 bytes
+ * up front captures most headers in a single round-trip, avoiding the
+ * latency of a second read on the cold path.
  */
-export const INITIAL_HEADER_READ_SIZE = HEADER_MAGIC_SIZE + 4;
+export const INITIAL_HEADER_READ_SIZE = 4096;

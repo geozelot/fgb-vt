@@ -272,7 +272,7 @@ export class TileServer {
     await Promise.all([...connectors].map(c => c.close()));
   }
 
-  // ─── Internal ──────────────────────────────────────────────────────────
+  // == Internal ==========================================================
 
   /**
    * Guard that triggers lazy initialization on first access.
@@ -323,7 +323,7 @@ export class TileServer {
   }
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// == Helpers ================================================================
 
 /**
  * Map a FlatGeobuf {@link ColumnType} numeric constant to a human-readable

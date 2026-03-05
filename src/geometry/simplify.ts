@@ -140,7 +140,7 @@ export function ringTooSmall(xy: Float64Array, start: number, end: number, sqTol
   return dx * dy < sqTolerance;
 }
 
-// ─── Douglas-Peucker marking ────────────────────────────────────────────────
+// == Douglas-Peucker marking ================================================
 
 /**
  * Recursively mark the importance of each point in a coordinate range using
