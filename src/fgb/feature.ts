@@ -47,6 +47,12 @@ const MAX_GEOMETRY_DEPTH = 4;
 const textDecoder = new TextDecoder();
 
 /**
+ * Shared mutable result object for {@link readPropertyValue}, avoiding a
+ * fresh `{value, bytesRead}` allocation on every property decode.
+ */
+const propResult: { value: PropertyValue; bytesRead: number } = { value: null, bytesRead: 0 };
+
+/**
  * Decode all features from a contiguous byte buffer that may contain one or
  * more length-prefixed feature FlatBuffers.
  *
@@ -69,14 +75,14 @@ export function decodeFeatures(
   maxFeatures: number = Infinity,
 ): RawFeature[] {
   const features: RawFeature[] = [];
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let offset = 0;
 
   while (offset < bytes.length && features.length < maxFeatures) {
     if (offset + 4 > bytes.length) break;
 
     // Read feature size prefix (uint32 LE)
-    const view = new DataView(bytes.buffer, bytes.byteOffset + offset, 4);
-    const featureSize = view.getUint32(0, true);
+    const featureSize = view.getUint32(offset, true);
     if (featureSize === 0) break;
 
     offset += 4;
@@ -128,17 +134,28 @@ function decodeSingleFeature(
     ? decodeProperties(fb, fb.indirect(propsFieldOff), header.columns)
     : new Map<string, PropertyValue>();
 
+  // Extract feature ID from a detected ID column (if any)
+  let id: number | null = null;
+  if (header.idColumnIndex >= 0) {
+    const idCol = header.columns[header.idColumnIndex];
+    const rawId = properties.get(idCol.name);
+    if (typeof rawId === 'number') {
+      id = rawId;
+      properties.delete(idCol.name);
+    }
+  }
+
   return {
     type: geom.type,
     xy: geom.xy,
     ends: geom.ends,
     parts: geom.parts,
     properties,
-    id: null, // FGB features don't have a built-in ID field at the feature level
+    id,
   };
 }
 
-// ─── Geometry decoding ──────────────────────────────────────────────────────
+// == Geometry decoding ======================================================
 
 /** Intermediate representation of a decoded FGB geometry. */
 interface DecodedGeometry {
@@ -284,7 +301,7 @@ function decodeGeometry(
   return { type, xy, ends, parts };
 }
 
-// ─── Properties decoding ────────────────────────────────────────────────────
+// == Properties decoding ====================================================
 
 /**
  * Decode properties from FGB's custom binary encoding.
@@ -334,10 +351,10 @@ function decodeProperties(
     if (colIdx >= columns.length) break;
     const col = columns[colIdx];
 
-    const { value, bytesRead } = readPropertyValue(view, propsBytes, offset, col.type);
-    offset += bytesRead;
+    readPropertyValue(view, propsBytes, offset, col.type);
+    offset += propResult.bytesRead;
 
-    props.set(col.name, value);
+    props.set(col.name, propResult.value);
   }
 
   return props;
@@ -346,80 +363,105 @@ function decodeProperties(
 /**
  * Read a single property value from the binary properties buffer.
  *
+ * Writes the decoded value and bytes consumed into the shared
+ * {@link propResult} object to avoid per-property object allocation.
+ *
  * @param view - DataView over the properties byte vector.
  * @param bytes - Raw `Uint8Array` of the properties byte vector (used for
  *   string and binary slicing).
  * @param offset - Current read position within the properties vector.
  * @param type - Column type determining the encoding.
- * @returns An object containing the decoded `value` and the number of
- *   `bytesRead` so the caller can advance the offset.
  */
 function readPropertyValue(
   view: DataView,
   bytes: Uint8Array,
   offset: number,
   type: ColumnType,
-): { value: PropertyValue; bytesRead: number } {
+): void {
   switch (type) {
     case ColumnType.Bool:
-      return { value: view.getUint8(offset) !== 0, bytesRead: 1 };
+      propResult.value = view.getUint8(offset) !== 0;
+      propResult.bytesRead = 1;
+      return;
 
     case ColumnType.Byte:
-      return { value: view.getInt8(offset), bytesRead: 1 };
+      propResult.value = view.getInt8(offset);
+      propResult.bytesRead = 1;
+      return;
 
     case ColumnType.UByte:
-      return { value: view.getUint8(offset), bytesRead: 1 };
+      propResult.value = view.getUint8(offset);
+      propResult.bytesRead = 1;
+      return;
 
     case ColumnType.Short:
-      return { value: view.getInt16(offset, true), bytesRead: 2 };
+      propResult.value = view.getInt16(offset, true);
+      propResult.bytesRead = 2;
+      return;
 
     case ColumnType.UShort:
-      return { value: view.getUint16(offset, true), bytesRead: 2 };
+      propResult.value = view.getUint16(offset, true);
+      propResult.bytesRead = 2;
+      return;
 
     case ColumnType.Int:
-      return { value: view.getInt32(offset, true), bytesRead: 4 };
+      propResult.value = view.getInt32(offset, true);
+      propResult.bytesRead = 4;
+      return;
 
     case ColumnType.UInt:
-      return { value: view.getUint32(offset, true), bytesRead: 4 };
+      propResult.value = view.getUint32(offset, true);
+      propResult.bytesRead = 4;
+      return;
 
     case ColumnType.Float:
-      return { value: view.getFloat32(offset, true), bytesRead: 4 };
+      propResult.value = view.getFloat32(offset, true);
+      propResult.bytesRead = 4;
+      return;
 
     case ColumnType.Long: {
       const lo = view.getUint32(offset, true);
       const hi = view.getInt32(offset + 4, true);
-      return { value: hi * 0x100000000 + lo, bytesRead: 8 };
+      propResult.value = hi * 0x100000000 + lo;
+      propResult.bytesRead = 8;
+      return;
     }
 
     case ColumnType.ULong: {
       const lo = view.getUint32(offset, true);
       const hi = view.getUint32(offset + 4, true);
-      return { value: hi * 0x100000000 + lo, bytesRead: 8 };
+      propResult.value = hi * 0x100000000 + lo;
+      propResult.bytesRead = 8;
+      return;
     }
 
     case ColumnType.Double:
-      return { value: view.getFloat64(offset, true), bytesRead: 8 };
+      propResult.value = view.getFloat64(offset, true);
+      propResult.bytesRead = 8;
+      return;
 
     case ColumnType.String:
     case ColumnType.Json:
     case ColumnType.DateTime: {
-      if (offset + 4 > bytes.length) return { value: null, bytesRead: 0 };
+      if (offset + 4 > bytes.length) { propResult.value = null; propResult.bytesRead = 0; return; }
       const strLen = view.getUint32(offset, true);
-      if (offset + 4 + strLen > bytes.length) return { value: null, bytesRead: 0 };
-      const strBytes = bytes.subarray(offset + 4, offset + 4 + strLen);
-      const str = textDecoder.decode(strBytes);
-      return { value: str, bytesRead: 4 + strLen };
+      if (offset + 4 + strLen > bytes.length) { propResult.value = null; propResult.bytesRead = 0; return; }
+      propResult.value = textDecoder.decode(bytes.subarray(offset + 4, offset + 4 + strLen));
+      propResult.bytesRead = 4 + strLen;
+      return;
     }
 
     case ColumnType.Binary: {
-      if (offset + 4 > bytes.length) return { value: null, bytesRead: 0 };
+      if (offset + 4 > bytes.length) { propResult.value = null; propResult.bytesRead = 0; return; }
       const binLen = view.getUint32(offset, true);
-      if (offset + 4 + binLen > bytes.length) return { value: null, bytesRead: 0 };
-      const bin = new Uint8Array(bytes.buffer, bytes.byteOffset + offset + 4, binLen);
-      return { value: bin, bytesRead: 4 + binLen };
+      if (offset + 4 + binLen > bytes.length) { propResult.value = null; propResult.bytesRead = 0; return; }
+      propResult.value = new Uint8Array(bytes.buffer, bytes.byteOffset + offset + 4, binLen);
+      propResult.bytesRead = 4 + binLen;
+      return;
     }
 
     default:
-      return { value: null, bytesRead: 0 };
+      propResult.value = null;
+      propResult.bytesRead = 0;
   }
 }

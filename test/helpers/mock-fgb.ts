@@ -27,12 +27,12 @@ export function buildMockFgb(opts: MockFgbOptions = {}): Uint8Array {
   // Track where we'll place things relative to the FB start
   // We build it linearly: [root_offset, vtable, table_data, extra_data...]
 
-  // ─── Pre-compute column tables ──────────────────────────────────────
+  // == Pre-compute column tables ======================================
   // Each column is a sub-table. We need to know their positions relative to
   // the columns vector.
   // Column schema: field 0 = name (string), field 1 = type (uint8)
 
-  // ─── Build the FlatBuffer ──────────────────────────────────────────
+  // == Build the FlatBuffer ==========================================
   // We'll use a simple linear layout:
   //
   // [root_offset: 4]
@@ -73,14 +73,14 @@ export function buildMockFgb(opts: MockFgbOptions = {}): Uint8Array {
   // Extra data starts after table
   let extraOffset = tableEnd;
 
-  // ─── Envelope vector ────────────────────────────────────────────────
+  // == Envelope vector ================================================
   let envVectorOffset = 0; // absolute offset in FB
   if (bbox) {
     envVectorOffset = extraOffset;
     extraOffset += 4 + 4 * 8; // uint32 length + 4 doubles
   }
 
-  // ─── Columns vector + sub-tables ────────────────────────────────────
+  // == Columns vector + sub-tables ====================================
   let colsVectorOffset = 0;
   // For simplicity, build column data inline
   // Each column needs: [vtable(8 bytes)] [table(8 bytes)] [string data]
@@ -140,7 +140,7 @@ export function buildMockFgb(opts: MockFgbOptions = {}): Uint8Array {
 
   const fbSize = extraOffset;
 
-  // ─── Write the FlatBuffer ──────────────────────────────────────────
+  // == Write the FlatBuffer ==========================================
   const fb = new Uint8Array(fbSize);
   const fbView = new DataView(fb.buffer);
 
@@ -197,7 +197,7 @@ export function buildMockFgb(opts: MockFgbOptions = {}): Uint8Array {
     fbView.setUint32(tableStart + 20, colsVectorOffset - (tableStart + 20), true);
   }
 
-  // ─── Envelope vector data ──────────────────────────────────────────
+  // == Envelope vector data ==========================================
   if (bbox && envVectorOffset > 0) {
     fbView.setUint32(envVectorOffset, 4, true); // length = 4 doubles
     fbView.setFloat64(envVectorOffset + 4, bbox[0], true);      // minX
@@ -206,7 +206,7 @@ export function buildMockFgb(opts: MockFgbOptions = {}): Uint8Array {
     fbView.setFloat64(envVectorOffset + 28, bbox[3], true);     // maxY
   }
 
-  // ─── Columns vector + tables ───────────────────────────────────────
+  // == Columns vector + tables =======================================
   if (columns.length > 0 && colsVectorOffset > 0) {
     // Vector header: length
     fbView.setUint32(colsVectorOffset, columns.length, true);
@@ -244,7 +244,7 @@ export function buildMockFgb(opts: MockFgbOptions = {}): Uint8Array {
     }
   }
 
-  // ─── Wrap with FGB magic + size prefix ─────────────────────────────
+  // == Wrap with FGB magic + size prefix =============================
   const magic = new Uint8Array([0x66, 0x67, 0x62, 0x03, 0x66, 0x67, 0x62, 0x00]);
   const sizePrefix = new Uint8Array(4);
   new DataView(sizePrefix.buffer).setUint32(0, fbSize, true);

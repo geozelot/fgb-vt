@@ -37,7 +37,7 @@ import type { Source, TileOptions } from './source.js';
 import { resolveOptions } from './source.js';
 import type { FgbHeader, MvtLayer, BBox, RawFeature } from './types.js';
 import { parseHeader, headerByteSize, INITIAL_HEADER_READ_SIZE } from './fgb/header.js';
-import { queryIndex } from './fgb/index.js';
+import { queryIndex, computeLevelBounds } from './fgb/index.js';
 import { decodeFeatures } from './fgb/feature.js';
 import { buildMvtLayer } from './mvt/layer.js';
 import { encodePbf } from './pbf/encode.js';
@@ -56,9 +56,17 @@ export interface FgbCache {
   header: FgbHeader;
   /** Raw bytes of the packed Hilbert R-tree spatial index. */
   indexBytes: Uint8Array;
+  /**
+   * Pre-computed R-tree level bounds, cached to avoid recomputing per query.
+   *
+   * Optional — when omitted, level bounds are computed on demand from the
+   * header's `featuresCount` and `indexNodeSize`. Providing this avoids
+   * redundant work on repeated tile requests against the same source.
+   */
+  levelBounds?: Array<[number, number]>;
 }
 
-// ─── Single-source pipeline ─────────────────────────────────────────────────
+// == Single-source pipeline =================================================
 
 /**
  * Execute the full pipeline for a single source:
@@ -99,14 +107,18 @@ export async function processSource(
   // Get header (from cache or by reading)
   let header: FgbHeader;
   let indexBytes: Uint8Array;
+  let levelBounds: Array<[number, number]>;
 
   if (cache) {
     header = cache.header;
     indexBytes = cache.indexBytes;
+    levelBounds = cache.levelBounds
+      ?? computeLevelBoundsIfNeeded(header);
   } else {
     const hdr = await readHeader(connector, source.path);
     header = hdr.header;
     indexBytes = hdr.indexBytes;
+    levelBounds = hdr.levelBounds!;
   }
 
   // Query spatial index to find matching feature byte ranges
@@ -120,6 +132,7 @@ export async function processSource(
     header.indexNodeSize,
     header.featuresOffset,
     wgs84BBox,
+    levelBounds,
   );
 
   if (ranges.length === 0) {
@@ -153,7 +166,7 @@ export async function processSource(
   );
 }
 
-// ─── Multi-source pipeline ──────────────────────────────────────────────────
+// == Multi-source pipeline ==================================================
 
 /**
  * Execute the full pipeline for multiple sources sharing a single
@@ -232,7 +245,7 @@ export async function processTileLayers(
   return Promise.all(layerPromises);
 }
 
-// ─── Multi-connector pipeline ───────────────────────────────────────────────
+// == Multi-connector pipeline ===============================================
 
 /**
  * A pairing of a {@link Connector} with the {@link Source} descriptors it
@@ -298,7 +311,7 @@ export async function processMultiConnectorTile(
   return encodePbf(layers);
 }
 
-// ─── Header reading ─────────────────────────────────────────────────────────
+// == Header reading =========================================================
 
 /**
  * Read and parse an FGB header and spatial index from a {@link Connector}.
@@ -317,14 +330,15 @@ export async function processMultiConnectorTile(
  *
  * @param connector - The connector to read bytes from.
  * @param path - Connector-specific path to the FGB file.
- * @returns Parsed header metadata and raw spatial index bytes.
+ * @returns A complete {@link FgbCache} containing parsed header metadata,
+ *   raw spatial index bytes, and pre-computed R-tree level bounds.
  * @throws {Error} If the file does not contain a valid FlatGeobuf header
  *   (propagated from the header parser).
  */
 export async function readHeader(
   connector: Connector,
   path: string,
-): Promise<{ header: FgbHeader; indexBytes: Uint8Array }> {
+): Promise<FgbCache> {
   // First read: get enough to parse header size
   const initialBytes = await connector.read(path, 0, INITIAL_HEADER_READ_SIZE);
   const hdrSize = headerByteSize(initialBytes);
@@ -347,10 +361,27 @@ export async function readHeader(
     indexBytes = new Uint8Array(0);
   }
 
-  return { header, indexBytes };
+  // Pre-compute R-tree level bounds for reuse across queries
+  const levelBounds = (header.indexNodeSize > 0 && header.featuresCount > 0)
+    ? computeLevelBounds(header.featuresCount, header.indexNodeSize)
+    : [];
+
+  return { header, indexBytes, levelBounds };
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// == Helpers ================================================================
+
+/**
+ * Compute R-tree level bounds from the header when not supplied via cache.
+ *
+ * Returns an empty array when the header indicates no spatial index,
+ * matching the behaviour of {@link readHeader}.
+ */
+function computeLevelBoundsIfNeeded(header: FgbHeader): Array<[number, number]> {
+  return (header.indexNodeSize > 0 && header.featuresCount > 0)
+    ? computeLevelBounds(header.featuresCount, header.indexNodeSize)
+    : [];
+}
 
 /**
  * Create an empty MVT layer with no features, keys, or values.

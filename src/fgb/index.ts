@@ -67,13 +67,14 @@ export function queryIndex(
   nodeSize: number,
   featuresOffset: number,
   bbox: BBox,
+  cachedLevelBounds?: Array<[number, number]>,
 ): ByteRange[] {
   if (featuresCount === 0 || nodeSize === 0) return [];
 
   const view = new DataView(indexBytes.buffer, indexBytes.byteOffset, indexBytes.byteLength);
 
-  // Calculate level bounds (root-first tree layout)
-  const levelBounds = computeLevelBounds(featuresCount, nodeSize);
+  // Use cached level bounds or compute fresh
+  const levelBounds = cachedLevelBounds ?? computeLevelBounds(featuresCount, nodeSize);
   const numLevels = levelBounds.length;
 
   // Leaf level bounds (level 0)
@@ -147,8 +148,18 @@ export function queryIndex(
       const nextByteOffset = readUint64AsNumber(view, (nodeIdx + 1) * NODE_ITEM_SIZE + 32);
       featureLength = nextByteOffset - featureByteOffset;
     } else {
-      // Last feature: exact length unknown; use a generous upper bound
-      featureLength = 1024 * 1024;
+      // Last feature: exact length unknown. Estimate from the previous
+      // leaf's size (if available), clamped to a reasonable range.
+      // This avoids the wasteful 1 MB over-fetch for small features while
+      // still covering large features via the 4x multiplier.
+      if (nodeIdx > levelBounds[0][0]) {
+        const prevByteOffset = readUint64AsNumber(view, (nodeIdx - 1) * NODE_ITEM_SIZE + 32);
+        const prevLen = featureByteOffset - prevByteOffset;
+        featureLength = Math.max(256, Math.min(prevLen * 4, 256 * 1024));
+      } else {
+        // Single feature in the file — use a moderate default
+        featureLength = 64 * 1024;
+      }
     }
 
     ranges.push({
@@ -160,7 +171,7 @@ export function queryIndex(
   return mergeRanges(ranges);
 }
 
-// ─── Internals ──────────────────────────────────────────────────────────────
+// == Internals ==============================================================
 
 /**
  * Compute the node-index boundaries for each level of the packed R-tree.
@@ -186,7 +197,7 @@ export function queryIndex(
  * @returns Array of `[startIndex, endIndex)` pairs, one per level.
  *   `result[0]` = leaf bounds, `result[result.length - 1]` = root bounds.
  */
-function computeLevelBounds(
+export function computeLevelBounds(
   featuresCount: number,
   nodeSize: number,
 ): Array<[number, number]> {

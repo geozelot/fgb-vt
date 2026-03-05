@@ -133,6 +133,7 @@ export class TileServer {
   private readonly fgbCaches = new Map<string, FgbCache>();
   private initialized = false;
   private initPromise: Promise<void> | null = null;
+  private closed = false;
 
   /**
    * Create a new tile server with the given layer configuration.
@@ -263,6 +264,7 @@ export class TileServer {
    * @returns Resolves when all connectors have been closed.
    */
   async close(): Promise<void> {
+    this.closed = true;
     this.fgbCaches.clear();
     this.initialized = false;
     this.initPromise = null;
@@ -272,7 +274,7 @@ export class TileServer {
     await Promise.all([...connectors].map(c => c.close()));
   }
 
-  // ─── Internal ──────────────────────────────────────────────────────────
+  // == Internal ==========================================================
 
   /**
    * Guard that triggers lazy initialization on first access.
@@ -283,6 +285,9 @@ export class TileServer {
    * @returns Resolves when all FGB headers have been read and cached.
    */
   private ensureInitialized(): Promise<void> {
+    if (this.closed) {
+      return Promise.reject(new Error('TileServer is closed'));
+    }
     if (this.initialized) return Promise.resolve();
     if (this.initPromise) return this.initPromise;
 
@@ -323,7 +328,7 @@ export class TileServer {
   }
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// == Helpers ================================================================
 
 /**
  * Map a FlatGeobuf {@link ColumnType} numeric constant to a human-readable

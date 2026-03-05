@@ -30,7 +30,7 @@ describe('TileJSON metadata generation', () => {
     connector.addFile(path, fullFile);
   }
 
-  // ─── Basic TileJSON structure ──────────────────────────────────────
+  // == Basic TileJSON structure ======================================
 
   it('should produce valid TileJSON 3.0.0', async () => {
     addMockFgb('/data/points.fgb', {
@@ -55,7 +55,7 @@ describe('TileJSON metadata generation', () => {
     }
   });
 
-  // ─── Bounds from FGB bbox ────────────────────────────────────────
+  // == Bounds from FGB bbox ========================================
 
   it('should use FGB header bbox for bounds', async () => {
     addMockFgb('/data/cities.fgb', {
@@ -77,7 +77,7 @@ describe('TileJSON metadata generation', () => {
     }
   });
 
-  // ─── Default bounds when no bbox ──────────────────────────────────
+  // == Default bounds when no bbox ==================================
 
   it('should use world bounds when no FGB bbox available', async () => {
     addMockFgb('/data/nobbox.fgb', {
@@ -98,7 +98,7 @@ describe('TileJSON metadata generation', () => {
     }
   });
 
-  // ─── Multiple sources / layers ────────────────────────────────────
+  // == Multiple sources / layers ====================================
 
   it('should aggregate multiple sources into vector_layers', async () => {
     addMockFgb('/data/roads.fgb', {
@@ -151,7 +151,7 @@ describe('TileJSON metadata generation', () => {
     }
   });
 
-  // ─── Per-source zoom overrides ──────────────────────────────────────
+  // == Per-source zoom overrides ======================================
 
   it('should respect per-source zoom overrides', async () => {
     addMockFgb('/data/detail.fgb', { bbox: [0, 0, 1, 1] });
@@ -180,7 +180,7 @@ describe('TileJSON metadata generation', () => {
     }
   });
 
-  // ─── Multi-connector layers ──────────────────────────────────────
+  // == Multi-connector layers ======================================
 
   it('should handle multi-connector TileServer layers', async () => {
     const connector2 = new MockConnector();
@@ -218,7 +218,7 @@ describe('TileJSON metadata generation', () => {
     }
   });
 
-  // ─── Column type mapping ──────────────────────────────────────────
+  // == Column type mapping ==========================================
 
   it('should map all column types correctly', async () => {
     addMockFgb('/data/typed.fgb', {
@@ -262,7 +262,7 @@ describe('TileJSON metadata generation', () => {
     }
   });
 
-  // ─── Lazy initialization ──────────────────────────────────────────
+  // == Lazy initialization ==========================================
 
   it('should lazily initialize on first tileJSON call', async () => {
     addMockFgb('/data/lazy.fgb', {
@@ -285,9 +285,9 @@ describe('TileJSON metadata generation', () => {
     }
   });
 
-  // ─── Server close and reuse ───────────────────────────────────────
+  // == Server close and reuse =======================================
 
-  it('should allow reinitialization after close', async () => {
+  it('should reject calls after close', async () => {
     addMockFgb('/data/reuse.fgb', {
       bbox: [0, 0, 5, 5],
     });
@@ -295,17 +295,13 @@ describe('TileJSON metadata generation', () => {
     const source: Source = { name: 'reuse', path: '/data/reuse.fgb' };
     const server = new TileServer({ connector, sources: source });
 
-    try {
-      const tj1 = await server.tileJSON();
-      expect(tj1.bounds[2]).toBe(5);
+    const tj1 = await server.tileJSON();
+    expect(tj1.bounds[2]).toBe(5);
 
-      await server.close();
+    await server.close();
 
-      // After close, server should reinitialize on next call
-      const tj2 = await server.tileJSON();
-      expect(tj2.bounds[2]).toBe(5);
-    } finally {
-      await server.close();
-    }
+    // After close, server should reject subsequent calls
+    await expect(server.tileJSON()).rejects.toThrow('TileServer is closed');
+    await expect(server.tile(0, 0, 0)).rejects.toThrow('TileServer is closed');
   });
 });

@@ -3,7 +3,7 @@ import { transformToTile, correctWinding, signedArea } from '../../src/geometry/
 import { GeomType } from '../../src/types.js';
 
 describe('Transform edge cases', () => {
-  // ─── Empty / single point ──────────────────────────────────────────
+  // == Empty / single point ==========================================
 
   it('should handle empty coordinate array', () => {
     const xy = new Float64Array(0);
@@ -19,7 +19,7 @@ describe('Transform edge cases', () => {
     expect(result[1]).toBe(2048);
   });
 
-  // ─── Points in buffer zone (negative tile coords) ─────────────────
+  // == Points in buffer zone (negative tile coords) =================
 
   it('should produce negative coordinates for points in buffer zone', () => {
     // z=1, x=1: tile covers [0.5, 1.0] in mercator
@@ -37,7 +37,7 @@ describe('Transform edge cases', () => {
     expect(result[0]).toBeGreaterThan(4096);
   });
 
-  // ─── High zoom level ──────────────────────────────────────────────
+  // == High zoom level ==============================================
 
   it('should produce correct tile coords at high zoom', () => {
     const z = 18;
@@ -54,7 +54,7 @@ describe('Transform edge cases', () => {
     expect(result[1]).toBeCloseTo(2048, 0);
   });
 
-  // ─── Zoom 0 ───────────────────────────────────────────────────────
+  // == Zoom 0 =======================================================
 
   it('should map [0,0] to tile origin at z=0', () => {
     const xy = new Float64Array([0, 0]);
@@ -70,7 +70,7 @@ describe('Transform edge cases', () => {
     expect(result[1]).toBe(4096);
   });
 
-  // ─── Different extents ─────────────────────────────────────────────
+  // == Different extents =============================================
 
   it('should work with extent=512', () => {
     const xy = new Float64Array([0.5, 0.5]);

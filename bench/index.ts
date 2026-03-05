@@ -17,7 +17,7 @@ import { tileClipBounds, tileBBox } from '../src/tiles.js';
 import type { RawFeature, BBox } from '../src/types.js';
 import { GeomType } from '../src/types.js';
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// == Helpers ================================================================
 
 function bench(name: string, fn: () => void, iterations: number): void {
   // Warmup
@@ -39,7 +39,7 @@ function fmt(n: number, decimals: number): string {
   return n.toLocaleString('en-US', { maximumFractionDigits: decimals });
 }
 
-// ─── Synthetic data generators ──────────────────────────────────────────────
+// == Synthetic data generators ==============================================
 
 function generatePoints(count: number, bbox: BBox): RawFeature[] {
   const features: RawFeature[] = [];
@@ -134,10 +134,10 @@ function cloneFeatures(features: RawFeature[]): RawFeature[] {
   }));
 }
 
-// ─── Benchmark suites ───────────────────────────────────────────────────────
+// == Benchmark suites =======================================================
 
 function benchProjection() {
-  console.log('\n── Projection (WGS84 → Mercator) ──');
+  console.log('\n== Projection (WGS84 → Mercator) ==');
 
   const coords100 = new Float64Array(200);
   const coords1000 = new Float64Array(2000);
@@ -166,7 +166,7 @@ function benchProjection() {
 }
 
 function benchClipping() {
-  console.log('\n── Clipping (Sutherland-Hodgman) ──');
+  console.log('\n== Clipping (Sutherland-Hodgman) ==');
 
   const z = 12, x = 2048, y = 1360;
   const wgs84 = tileBBox(z, x, y);
@@ -187,7 +187,7 @@ function benchClipping() {
 }
 
 function benchSimplification() {
-  console.log('\n── Simplification (Douglas-Peucker) ──');
+  console.log('\n== Simplification (Douglas-Peucker) ==');
 
   const sqTol = sqToleranceForZoom(3, 12, 4096);
 
@@ -203,7 +203,7 @@ function benchSimplification() {
 }
 
 function benchMvtEncoding() {
-  console.log('\n── MVT Geometry Encoding ──');
+  console.log('\n== MVT Geometry Encoding ==');
 
   for (const n of [10, 100, 500]) {
     const coords = new Int32Array(n * 2);
@@ -218,7 +218,7 @@ function benchMvtEncoding() {
 }
 
 function benchPbfEncoding() {
-  console.log('\n── PBF Encoding ──');
+  console.log('\n== PBF Encoding ==');
 
   const z = 12, x = 2048, y = 1360;
   const wgs84 = tileBBox(z, x, y);
@@ -235,7 +235,7 @@ function benchPbfEncoding() {
 }
 
 function benchFullPipeline() {
-  console.log('\n── Full Pipeline (features → PBF) ──');
+  console.log('\n== Full Pipeline (features → PBF) ==');
 
   const z = 12, x = 2048, y = 1360;
   const wgs84 = tileBBox(z, x, y);
@@ -260,7 +260,7 @@ function benchFullPipeline() {
 }
 
 function benchMultiLayer() {
-  console.log('\n── Multi-Layer Tile ──');
+  console.log('\n== Multi-Layer Tile ==');
 
   const z = 12, x = 2048, y = 1360;
   const wgs84 = tileBBox(z, x, y);
@@ -278,7 +278,7 @@ function benchMultiLayer() {
   }
 }
 
-// ─── Main ───────────────────────────────────────────────────────────────────
+// == Main ===================================================================
 
 console.log('╔══════════════════════════════════════════════════════════════════════╗');
 console.log('║  fgb-vt Performance Benchmarks                                     ║');

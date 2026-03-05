@@ -12,6 +12,9 @@
  * FlatBuffers runtime.
  */
 
+/** Shared {@link TextDecoder} instance for UTF-8 string decoding. */
+const textDecoder = new TextDecoder();
+
 /**
  * Low-level, read-only FlatBuffers decoder backed by a {@link DataView}.
  *
@@ -40,7 +43,7 @@ export class FlatBufferReader {
     this.view = new DataView(bytes.buffer, bytes.byteOffset + offset, bytes.byteLength - offset);
   }
 
-  // ─── Scalar reads ─────────────────────────────────────────────────────
+  // == Scalar reads =====================================================
 
   /**
    * Read an unsigned 8-bit integer at the given byte offset.
@@ -144,7 +147,7 @@ export class FlatBufferReader {
     return hi * 0x100000000 + lo;
   }
 
-  // ─── String reads ─────────────────────────────────────────────────────
+  // == String reads =====================================================
 
   /**
    * Read a FlatBuffers-encoded UTF-8 string at the given byte offset.
@@ -160,12 +163,12 @@ export class FlatBufferReader {
     // Strings in FlatBuffers: uint32 length prefix, then UTF-8 bytes
     const len = this.view.getUint32(offset, true);
     const start = this.bytes.byteOffset + (this.view.byteOffset - this.bytes.byteOffset) + offset + 4;
-    return new TextDecoder().decode(
+    return textDecoder.decode(
       new Uint8Array(this.bytes.buffer, start, len),
     );
   }
 
-  // ─── FlatBuffer Table navigation ──────────────────────────────────────
+  // == FlatBuffer Table navigation ======================================
 
   /**
    * Read the root table offset from position 0 of the buffer.
@@ -254,7 +257,7 @@ export class FlatBufferReader {
     return vectorOffset + 4;
   }
 
-  // ─── Typed array reads ────────────────────────────────────────────────
+  // == Typed array reads ================================================
 
   /**
    * Read a contiguous sequence of `float64` values into a `Float64Array`.

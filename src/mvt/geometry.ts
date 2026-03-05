@@ -129,7 +129,7 @@ export function encodeGeometry(
   }
 }
 
-// ─── Point encoding ─────────────────────────────────────────────────────────
+// == Point encoding =========================================================
 
 /**
  * Encode one or more points as an MVT command sequence.
@@ -159,7 +159,7 @@ function encodePoints(coords: Int32Array): number[] {
   return cmds;
 }
 
-// ─── Line encoding ──────────────────────────────────────────────────────────
+// == Line encoding ==========================================================
 
 /**
  * Encode one or more linestrings as an MVT command sequence.
@@ -202,7 +202,7 @@ function encodeLines(coords: Int32Array, ends: Uint32Array | null): number[] {
   return cmds;
 }
 
-// ─── Polygon encoding ───────────────────────────────────────────────────────
+// == Polygon encoding =======================================================
 
 /**
  * Encode one or more polygon rings as an MVT command sequence.
@@ -258,7 +258,7 @@ function encodePolygons(coords: Int32Array, ends: Uint32Array | null): number[] 
   return cmds;
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// == Helpers ================================================================
 
 /**
  * Pack a command ID and repeat count into a single MVT command integer.

@@ -191,7 +191,7 @@ export function buildMvtLayer(
   };
 }
 
-// ─── Tag building ───────────────────────────────────────────────────────────
+// == Tag building ===========================================================
 
 /**
  * Build interleaved key/value index tag pairs for a single feature.

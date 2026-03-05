@@ -72,7 +72,7 @@ export class PbfWriter {
     this.view = new DataView(this.buf.buffer);
   }
 
-  // ─── Varint encoding ────────────────────────────────────────────────
+  // == Varint encoding ================================================
 
   /**
    * Write an unsigned varint (variable-length integer) to the buffer.
@@ -114,7 +114,7 @@ export class PbfWriter {
     this.writeVarint((val << 1) ^ (val >> 31));
   }
 
-  // ─── Fixed-width types ──────────────────────────────────────────────
+  // == Fixed-width types ==============================================
 
   /**
    * Write a 32-bit IEEE 754 float in little-endian byte order.
@@ -138,7 +138,7 @@ export class PbfWriter {
     this.pos += 8;
   }
 
-  // ─── String / bytes ─────────────────────────────────────────────────
+  // == String / bytes =================================================
 
   /**
    * Write a UTF-8 length-delimited string (varint length prefix followed
@@ -167,7 +167,7 @@ export class PbfWriter {
     this.pos += data.length;
   }
 
-  // ─── Field-level writes ─────────────────────────────────────────────
+  // == Field-level writes =============================================
 
   /**
    * Write a complete varint field (tag + value) with wire type 0.
@@ -237,7 +237,7 @@ export class PbfWriter {
     this.writeVarintField(fieldNum, val ? 1 : 0);
   }
 
-  // ─── Packed repeated fields ─────────────────────────────────────────
+  // == Packed repeated fields =========================================
 
   /**
    * Write a packed repeated uint32 field.
@@ -272,7 +272,7 @@ export class PbfWriter {
     }
   }
 
-  // ─── Nested messages ────────────────────────────────────────────────
+  // == Nested messages ================================================
 
   /**
    * Start writing a nested message for the given field.
@@ -333,7 +333,7 @@ export class PbfWriter {
     this.buf[p] = val;
   }
 
-  // ─── Output ─────────────────────────────────────────────────────────
+  // == Output =========================================================
 
   /**
    * Finalize and return the encoded buffer trimmed to the actual data size.
@@ -347,7 +347,7 @@ export class PbfWriter {
     return this.buf.subarray(0, this.pos);
   }
 
-  // ─── Internal ───────────────────────────────────────────────────────
+  // == Internal =======================================================
 
   /**
    * Write a protobuf field tag (field number + wire type).
@@ -383,7 +383,7 @@ export class PbfWriter {
   }
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// == Helpers ================================================================
 
 /**
  * Compute the number of bytes needed to encode a value as a varint.

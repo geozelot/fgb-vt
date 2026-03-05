@@ -51,19 +51,19 @@
  *   {@link HttpConnectorOptions}, {@link S3ConnectorOptions}.
  */
 
-// ─── API Tiers ──────────────────────────────────────────────────────────────
+// == API Tiers ==============================================================
 
 export { TileServer } from './server.js';
 export { TileClient } from './client.js';
 export { tile } from './tile.js';
 
-// ─── Connectors ─────────────────────────────────────────────────────────────
+// == Connectors =============================================================
 
 export { LocalConnector } from './connectors/local.js';
 export { HttpConnector } from './connectors/http.js';
 export { S3Connector } from './connectors/s3.js';
 
-// ─── Types ──────────────────────────────────────────────────────────────────
+// == Types ==================================================================
 
 export type { Connector } from './connectors/connector.js';
 export type { LocalConnectorOptions } from './connectors/local.js';

@@ -275,7 +275,7 @@ export class S3Connector implements Connector {
     }
   }
 
-  // ─── Internal ──────────────────────────────────────────────────────────
+  // == Internal ==========================================================
 
   /**
    * Lazily initialize and return the `S3Client` and SDK module.

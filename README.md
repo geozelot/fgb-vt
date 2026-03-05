@@ -6,17 +6,32 @@
 
 # fgb-vt
 
-#### [Mapbox Vector Tiles](https://github.com/mapbox/vector-tile-spec) straight from [FlatGeobuf](https://flatgeobuf.org/) - no pre-tiling, no ingestion pipeline, no dependencies.
-
-The classic tile trade-off goes something like this: either you pre-generate a pyramid of millions of tiles, or you send raw geometries to the client and let the browser figure it out. `fgb-vt` is built to provide the best of both worlds, suitable for highly dynamic deployments. Point it at one or multiple `.fgb` file, ask for a tile, get a PBF. The data stays where it is - on disk, behind a CDN, in an S3 bucket - and every request reads only the bytes it actually needs, honoring the beauty of FlatGeobuf's packed Hilbert R-tree: byte-range reads _are_ spatial queries, so there's nothing to pre-process and nothing to cache. Constant memory, single file, arbitrary zoom.
-
-`fgb-vt` supports multi-layered tiles via concurrent access to different sources - even across different storage. It fully utilizes _FlatGeobuf's_ ranged access for cloud-optimized deployment.
-
-Under the hood it's binary all the way down - no _GeoJSON_ detour, no intermediate format, just _FlatBuffers_ in and _Protobuf_ out, with projection, clipping and simplification squeezed in between at the lowest level the types allow. The API ranges from a slim `TileServer` with lazy header caching and concurrent multi-source fetches, through a `TileClient` that works as middleware, down to a bare `tile()` function you could drop into a Lambda. Browser builds included.
-
 ---
 
-# Quick Start
+Native _Node/TypeScript_ library for high-performance [_Vector Tile_](https://github.com/mapbox/vector-tile-spec) layering, encoding and serving - directly from [_FlatGeobuf_](https://flatgeobuf.org/) files. Fully utilizes _FlatGeobuf's_ _Packed Hilbert R-tree_ for tile-sized byte-range reads over the main feature storage.
+
+`fgb-vt` attempts to conceptually close the gap between full tile pyramid creation on the backend, database-driven tile servers and processing static datasets on the client. It is specifically designed to access large, single-file objects on cloud storage via load-efficient _(HTTP) Range Requests_ and stateless deployment (e.g. via _AWS Lambda_) - targeting highly dynamic geospatial big-data mapping requirements.
+
+Under the hood it's binary all the way down - no _GeoJSON_ detour, no intermediate format, just _FlatBuffers_ in and _Protobuf_ out, with projection, clipping and simplification natively implemented at the lowest level the types allow.
+
+`fgb-vt` supports multi-layered tiles via concurrent access to different sources - even across different storage backends. It follows a slim, three-tier API layer approach for different use cases:
+- `TileServer` - a semi-stateful, lazy-caching tile server over an initially configured set of sources
+- `TileClient` - semi-stateful, connection-optimized tile client middleware with dynamic source selection
+- `tile()` - semi-stateless, request-scoped, one-off tile generation function, suitable for Lambda-driven setups
+
+and includes a Browser bundle for client-side _HTTP(S)_ source access.
+
+Shipped with three concurrency-optimized connectors:
+- `LocalConnector` - for local filesystem access
+- `HttpConnector` - for _HTTP(S)_ with _Range Requests_
+- `S3Connector` - for Amazon S3 / compatible storage backends with _Byte Range_ reads
+
+___
+
+### Quick Start
+
+#### [Examples](examples) | [API Docs](https://geozelot.github.io/fgb-vt/)
+
 
 ```bash
 npm install @geozelot/fgb-vt
@@ -37,16 +52,13 @@ const pbf = await client.tile(4, 4, 6, {
 // pbf is a ready-to-serve Uint8Array (MVT/PBF encoded)
 await client.close();
 ```
+<br>
 
-See [`examples/tile-server`](examples/tile-server) for a full interactive demo with a Node tile server, MapLibre GL frontend, live API tier switching and both local and HTTP connectors side by side.
+***
 
----
+# Usage
 
-# Setup
-
-### Install
-
-- **Node**
+## Installation
 
     ```bash
     npm install @geozelot/fgb-vt
@@ -58,7 +70,7 @@ See [`examples/tile-server`](examples/tile-server) for a full interactive demo w
     npm install @aws-sdk/client-s3
     ```
 
-- **Browser**
+**Browser**
      
     ```html
     <!-- UMD -->
@@ -69,11 +81,15 @@ See [`examples/tile-server`](examples/tile-server) for a full interactive demo w
       import { tile, HttpConnector } from 'https://unpkg.com/@geozelot/fgb-vt/dist/fgb-vt.esm.min.js';
     </script>
     ```
-    **Note:** Browser builds ship with `HttpConnector` only!
 
-<br>
+  **Note:** Browser builds ship with `HttpConnector` only!
 
-### `TileServer` - stateful
+---
+
+## Setup
+
+
+### `TileServer`
 
 Bind connectors and sources once; call `tile()` for the life of the process. Headers and spatial index metadata are lazily cached on first access - maximum throughput after warm-up.
 
@@ -112,9 +128,8 @@ Bind connectors and sources once; call `tile()` for the life of the process. Hea
       { connector: new HttpConnector(), sources: { name: 'remote', path: 'https://cdn.example.com/remote.fgb' } },
     ]);
     ```
-<br>
-
-### `TileClient` - semi-stateful
+---
+### `TileClient`
 
 Connector bound at construction; sources provided per call. One connector, varying datasets - well suited for middleware or request-scoped source selection.
 
@@ -141,9 +156,10 @@ Connector bound at construction; sources provided per call. One connector, varyi
       { name: 'roads', path: '/data/roads.fgb' },
     ]);
     ```
-<br>
 
-### `tile()` - semi-stateless
+___
+
+### `tile()`
 
 Everything per call - connector, coordinates, sources. No instance state beyond a module-level tile bounds cache. Drop it into a Lambda and call it a day.
 
@@ -168,9 +184,9 @@ Everything per call - connector, coordinates, sources. No instance state beyond 
     ]);
     ```
 
-<br>
+---
 
-### Browser
+### Browser bundle
 
 Use the browser bundle to turn any hosted `.fgb` into a vector tile source - no tile server required:
 
@@ -186,14 +202,11 @@ Use the browser bundle to turn any hosted `.fgb` into a vector tile source - no 
 </script>
 ```
 
-<br>
-
 ---
-# API Reference
 
-#### [> Full API docs](https://geozelot.github.io/fgb-vt/)
+## API Reference
 
-## Connectors
+### Connectors
 
 Connectors abstract concurrent byte-range I/O across storage backends. Each implements the `Connector` interface.
 
@@ -220,8 +233,9 @@ new S3Connector({
   endpoint: 'http://localhost:9000'   // for S3-compatible storage backends
 })
 ```
+---
 
-## Options
+### Options
 
 Options cascade through three levels - **source** overrides **tile-level defaults** overrides **built-in defaults**:
 
@@ -245,8 +259,9 @@ const server = new TileServer(
   { tolerance: 5, maxZoom: 18 },  // tile-level defaults
 );
 ```
+---
 
-## Types
+### Types
 
 ```typescript
 import type {
@@ -256,9 +271,9 @@ import type {
   LocalConnectorOptions, HttpConnectorOptions, S3ConnectorOptions,
 } from '@geozelot/fgb-vt';
 ```
-<br>
 
----
+***
+
 # Testing
 
 ### Unit Tests
@@ -287,7 +302,7 @@ npm run bench
 
 <br>
 
----
+***
 # License
 
 [MIT](LICENSE)

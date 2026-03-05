@@ -22,7 +22,7 @@ function buildAndEncode(
 }
 
 describe('Pipeline edge cases', () => {
-  // ─── Empty tiles ──────────────────────────────────────────────────────
+  // == Empty tiles ======================================================
 
   it('should produce a valid (possibly empty) PBF for empty feature array', () => {
     const pbf = buildAndEncode([], 'empty', 5, 16, 16);
@@ -45,7 +45,7 @@ describe('Pipeline edge cases', () => {
     expect(layer.features.length).toBe(0);
   });
 
-  // ─── Features at exact tile boundary ─────────────────────────────────
+  // == Features at exact tile boundary =================================
 
   it('should handle features at exact tile boundaries', () => {
     const z = 5, x = 16, y = 16;
@@ -64,7 +64,7 @@ describe('Pipeline edge cases', () => {
     expect(layer.features.length).toBe(1);
   });
 
-  // ─── Very small feature at high zoom ─────────────────────────────────
+  // == Very small feature at high zoom =================================
 
   it('should handle a tiny polygon at high zoom', () => {
     const z = 18, x = 131072, y = 131072;
@@ -94,7 +94,7 @@ describe('Pipeline edge cases', () => {
     expect(layer.name).toBe('micro');
   });
 
-  // ─── Feature with many properties ────────────────────────────────────
+  // == Feature with many properties ====================================
 
   it('should handle features with many properties', () => {
     const z = 5, x = 16, y = 16;
@@ -129,7 +129,7 @@ describe('Pipeline edge cases', () => {
     }
   });
 
-  // ─── Feature with null properties ────────────────────────────────────
+  // == Feature with null properties ====================================
 
   it('should skip null and binary property values', () => {
     const z = 5, x = 16, y = 16;
@@ -157,7 +157,7 @@ describe('Pipeline edge cases', () => {
     }
   });
 
-  // ─── Feature with no ID ─────────────────────────────────────────────
+  // == Feature with no ID =============================================
 
   it('should handle features with null id', () => {
     const z = 5, x = 16, y = 16;
@@ -178,7 +178,7 @@ describe('Pipeline edge cases', () => {
     }
   });
 
-  // ─── Large number of features ────────────────────────────────────────
+  // == Large number of features ========================================
 
   it('should handle hundreds of features in a single tile', () => {
     const z = 10, x = 512, y = 340;
@@ -202,7 +202,7 @@ describe('Pipeline edge cases', () => {
     expect(tile.layers.many.length).toBe(500);
   });
 
-  // ─── MultiLineString / MultiPolygon ──────────────────────────────────
+  // == MultiLineString / MultiPolygon ==================================
 
   it('should handle a MultiLineString feature', () => {
     const z = 5, x = 16, y = 16;
@@ -265,7 +265,7 @@ describe('Pipeline edge cases', () => {
     }
   });
 
-  // ─── Multi-layer encoding ─────────────────────────────────────────────
+  // == Multi-layer encoding =============================================
 
   it('should encode multiple empty layers without crashing', () => {
     const z = 5, x = 16, y = 16;
@@ -281,7 +281,7 @@ describe('Pipeline edge cases', () => {
     expect(() => new VectorTile(new Pbf(pbf))).not.toThrow();
   });
 
-  // ─── Properties deduplication ─────────────────────────────────────────
+  // == Properties deduplication =========================================
 
   it('should deduplicate property keys and values across features', () => {
     const z = 5, x = 16, y = 16;
