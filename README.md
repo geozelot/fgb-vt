@@ -6,8 +6,6 @@
 
 # fgb-vt
 
----
-
 Native _Node/TypeScript_ library for high-performance [_Vector Tile_](https://github.com/mapbox/vector-tile-spec) layering, encoding and serving - directly from [_FlatGeobuf_](https://flatgeobuf.org/) files. Fully utilizes _FlatGeobuf's_ _Packed Hilbert R-tree_ for tile-sized byte-range reads over the main feature storage.
 
 `fgb-vt` attempts to conceptually close the gap between full tile pyramid creation on the backend, database-driven tile servers and processing static datasets on the client. It is specifically designed to access large, single-file objects on cloud storage via load-efficient _(HTTP) Range Requests_ and stateless deployment (e.g. via _AWS Lambda_) - targeting highly dynamic geospatial big-data mapping requirements.
@@ -26,8 +24,8 @@ Shipped with three concurrency-optimized connectors:
 - `HttpConnector` - for _HTTP(S)_ with _Range Requests_
 - `S3Connector` - for Amazon S3 / compatible storage backends with _Byte Range_ reads
 
-___
 
+##
 ### Quick Start
 
 #### [Examples](examples) | [API Docs](https://geozelot.github.io/fgb-vt/)
@@ -56,9 +54,7 @@ await client.close();
 
 ***
 
-# Usage
-
-## Installation
+### Installation  
 
     ```bash
     npm install @geozelot/fgb-vt
@@ -86,10 +82,9 @@ await client.close();
 
 ---
 
-## Setup
+### Usage
 
-
-### `TileServer`
+#### `TileServer`
 
 Bind connectors and sources once; call `tile()` for the life of the process. Headers and spatial index metadata are lazily cached on first access - maximum throughput after warm-up.
 
@@ -128,8 +123,8 @@ Bind connectors and sources once; call `tile()` for the life of the process. Hea
       { connector: new HttpConnector(), sources: { name: 'remote', path: 'https://cdn.example.com/remote.fgb' } },
     ]);
     ```
----
-### `TileClient`
+##
+#### `TileClient`
 
 Connector bound at construction; sources provided per call. One connector, varying datasets - well suited for middleware or request-scoped source selection.
 
@@ -157,9 +152,8 @@ Connector bound at construction; sources provided per call. One connector, varyi
     ]);
     ```
 
-___
-
-### `tile()`
+##
+#### `tile()`
 
 Everything per call - connector, coordinates, sources. No instance state beyond a module-level tile bounds cache. Drop it into a Lambda and call it a day.
 
@@ -184,9 +178,8 @@ Everything per call - connector, coordinates, sources. No instance state beyond 
     ]);
     ```
 
----
-
-### Browser bundle
+##
+##### Browser bundle
 
 Use the browser bundle to turn any hosted `.fgb` into a vector tile source - no tile server required:
 
@@ -204,9 +197,9 @@ Use the browser bundle to turn any hosted `.fgb` into a vector tile source - no 
 
 ---
 
-## API Reference
+### API Reference
 
-### Connectors
+#### Connectors
 
 Connectors abstract concurrent byte-range I/O across storage backends. Each implements the `Connector` interface.
 
@@ -233,9 +226,9 @@ new S3Connector({
   endpoint: 'http://localhost:9000'   // for S3-compatible storage backends
 })
 ```
----
 
-### Options
+##
+#### Options
 
 Options cascade through three levels - **source** overrides **tile-level defaults** overrides **built-in defaults**:
 
@@ -259,9 +252,8 @@ const server = new TileServer(
   { tolerance: 5, maxZoom: 18 },  // tile-level defaults
 );
 ```
----
-
-### Types
+##
+#### Types
 
 ```typescript
 import type {
@@ -274,7 +266,7 @@ import type {
 
 ***
 
-# Testing
+## Testing
 
 ### Unit Tests
 
@@ -284,6 +276,7 @@ npm test
 
 Runs the full test suite via [Vitest](https://vitest.dev/).
 
+##
 ### Benchmarks
 
 ```bash
@@ -300,7 +293,6 @@ npm run bench
 | Full Pipeline | 100 mixed features | ~2.6k ops/s |
 
 
-<br>
 
 ***
 # License
