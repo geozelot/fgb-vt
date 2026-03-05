@@ -1,6 +1,6 @@
 {
   "name": "@geozelot/fgb-vt",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "High-performance FlatGeobuf to Mapbox Vector Tiles",
   "type": "module",
   "main": "./dist/index.js",
