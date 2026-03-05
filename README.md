@@ -266,9 +266,9 @@ import type {
 
 ***
 
-## Testing
+### Testing
 
-### Unit Tests
+#### Unit Tests
 
 ```bash
 npm test
@@ -277,7 +277,7 @@ npm test
 Runs the full test suite via [Vitest](https://vitest.dev/).
 
 ##
-### Benchmarks
+#### Benchmarks
 
 ```bash
 npm run bench
@@ -295,6 +295,6 @@ npm run bench
 
 
 ***
-# License
+### License
 
 [MIT](LICENSE)
