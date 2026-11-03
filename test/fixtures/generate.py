@@ -124,3 +124,17 @@ lines = [
     feature({"name": "multi-2"}, {"type": "MultiLineString", "coordinates": [wave(-100, 43, 500), wave(-94, 43, 500)]}),
 ]
 write("lines.fgb", fc(lines))
+
+# 5,000 points on a jittered grid: a five-level packed R-tree (node size 16)
+# for index search, containment and paging tests.
+import random
+rng = random.Random(42)
+grid = []
+for i in range(5000):
+    lon = -125 + (i % 100) * 0.58 + rng.uniform(-0.2, 0.2)
+    lat = 25 + (i // 100) * 0.48 + rng.uniform(-0.2, 0.2)
+    grid.append(feature({"id": i}, {"type": "Point", "coordinates": [round(lon, 6), round(lat, 6)]}))
+write("grid-5k.fgb", fc(grid))
+
+# The same 200 points as points.fgb, written without a spatial index.
+write("no-index.fgb", fc(points), "SPATIAL_INDEX=NO")

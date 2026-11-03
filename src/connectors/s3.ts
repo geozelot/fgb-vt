@@ -12,7 +12,8 @@
  * Backblaze B2, etc.) via the `endpoint` and `forcePathStyle` options.
  */
 
-import type { Connector } from './connector.js';
+import type { Connector, ConnectorHints, ReadHeadResult, ReadOptions } from './connector.js';
+import { ConnectorError, SourceChangedError } from '../errors.js';
 
 /**
  * Configuration options for {@link S3Connector}.
@@ -57,6 +58,18 @@ export interface S3ConnectorOptions {
    * @defaultValue 10
    */
   maxConcurrency?: number;
+  /**
+   * Size of the first read of a file (header plus top of the index).
+   *
+   * @defaultValue 262144 (256 KiB)
+   */
+  prefetch?: number;
+  /**
+   * Merge byte ranges separated by at most this many bytes into one request.
+   *
+   * @defaultValue 65536 (64 KiB)
+   */
+  coalesceGap?: number;
 }
 
 /**
@@ -156,6 +169,8 @@ async function loadS3Sdk(): Promise<any> {
  * ```
  */
 export class S3Connector implements Connector {
+  readonly hints: ConnectorHints;
+
   private readonly maxConcurrency: number;
   private client: any = null;
   private sdk: any = null;
@@ -172,6 +187,10 @@ export class S3Connector implements Connector {
    */
   constructor(options: S3ConnectorOptions) {
     this.maxConcurrency = options.maxConcurrency ?? 10;
+    this.hints = {
+      prefetch: options.prefetch ?? 256 * 1024,
+      coalesceGap: options.coalesceGap ?? 64 * 1024,
+    };
     this.clientOptions = options;
   }
 
@@ -184,45 +203,30 @@ export class S3Connector implements Connector {
    * @param path - S3 path in `s3://bucket/key` or `bucket/key` format.
    * @param offset - Zero-based byte offset to begin reading from.
    * @param length - Number of bytes to read.
+   * @param options - Optional version check (`IfMatch`) and abort signal.
    * @returns The requested byte range.
-   * @throws {Error} If the S3 response body is empty.
+   * @throws {ConnectorError} If the S3 response body is empty.
+   * @throws {SourceChangedError} If `ifMatch` no longer matches the object.
    * @throws {Error} If the `@aws-sdk/client-s3` peer dependency is not
    *   installed (on first call only).
    * @throws {Error} If the SDK `GetObject` call fails (permissions,
    *   invalid bucket/key, network errors, etc.).
    */
-  async read(path: string, offset: number, length: number): Promise<Uint8Array> {
-    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 0) {
-      throw new RangeError(`Invalid byte range for ${path}: offset ${offset}, length ${length}`);
-    }
-    if (length === 0) return new Uint8Array(0);
+  async read(path: string, offset: number, length: number, options?: ReadOptions): Promise<Uint8Array> {
+    return (await this.getRange(path, offset, length, options)).bytes;
+  }
 
-    const { client, sdk } = await this.getClient();
-    const { bucket, key } = parseS3Path(path);
-    const end = offset + length - 1;
-
-    const command = new sdk.GetObjectCommand({
-      Bucket: bucket,
-      Key: key,
-      Range: `bytes=${offset}-${end}`,
-    });
-
-    let response: any;
-    try {
-      response = await client.send(command);
-    } catch (err) {
-      // Range starting at or beyond the end of the object: nothing to read
-      if (isInvalidRange(err)) return new Uint8Array(0);
-      throw err;
-    }
-    const body = response.Body;
-
-    if (!body) {
-      throw new Error(`Empty response body for ${path} [${offset}-${end}]`);
-    }
-
-    const bytes = await streamToUint8Array(body);
-    return bytes.length > length ? bytes.subarray(0, length) : bytes;
+  /**
+   * Read the first `length` bytes of an object together with its size
+   * (from `ContentRange`) and `ETag`.
+   *
+   * @param path - S3 path in `s3://bucket/key` or `bucket/key` format.
+   * @param length - Number of leading bytes to read.
+   * @param options - Optional abort signal.
+   * @returns The leading bytes plus size and version tag.
+   */
+  async readHead(path: string, length: number, options?: ReadOptions): Promise<ReadHeadResult> {
+    return this.getRange(path, 0, length, options);
   }
 
   /**
@@ -235,6 +239,7 @@ export class S3Connector implements Connector {
    *
    * @param path - S3 path in `s3://bucket/key` or `bucket/key` format.
    * @param ranges - Array of `{ offset, length }` byte-range descriptors.
+   * @param options - Optional version check and abort signal, applied to every range.
    * @returns Array of `Uint8Array` chunks in the same order as the input ranges.
    *   Returns an empty array when `ranges` is empty.
    * @throws {Error} If any individual `GetObject` call fails after the
@@ -243,11 +248,12 @@ export class S3Connector implements Connector {
   async readRanges(
     path: string,
     ranges: ReadonlyArray<{ offset: number; length: number }>,
+    options?: ReadOptions,
   ): Promise<Uint8Array[]> {
     if (ranges.length === 0) return [];
     if (ranges.length === 1) {
       const r = ranges[0];
-      return [await this.read(path, r.offset, r.length)];
+      return [await this.read(path, r.offset, r.length, options)];
     }
 
     // Throttled parallel GetObject calls
@@ -259,7 +265,7 @@ export class S3Connector implements Connector {
       while (cursor < queue.length) {
         const idx = cursor++;
         const item = queue[idx];
-        results[item.index] = await this.read(path, item.offset, item.length);
+        results[item.index] = await this.read(path, item.offset, item.length, options);
       }
     };
 
@@ -289,6 +295,60 @@ export class S3Connector implements Connector {
   }
 
   // == Internal ==========================================================
+
+  /**
+   * Issue one ranged `GetObject` and return the body with the object size
+   * and `ETag`.
+   *
+   * @param path - S3 path in `s3://bucket/key` or `bucket/key` format.
+   * @param offset - Zero-based byte offset.
+   * @param length - Number of bytes.
+   * @param options - Optional version check and abort signal.
+   * @returns Body bytes, total size (or `null`) and ETag (or `null`).
+   */
+  private async getRange(path: string, offset: number, length: number, options?: ReadOptions): Promise<ReadHeadResult> {
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 0) {
+      throw new RangeError(`Invalid byte range for ${path}: offset ${offset}, length ${length}`);
+    }
+    options?.signal?.throwIfAborted();
+    if (length === 0) return { bytes: new Uint8Array(0), size: null, etag: null };
+
+    const { client, sdk } = await this.getClient();
+    const { bucket, key } = parseS3Path(path);
+    const end = offset + length - 1;
+
+    const command = new sdk.GetObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Range: `bytes=${offset}-${end}`,
+      ...(options?.ifMatch !== undefined ? { IfMatch: options.ifMatch } : {}),
+    });
+
+    let response: any;
+    try {
+      response = await client.send(command, options?.signal ? { abortSignal: options.signal } : undefined);
+    } catch (err) {
+      // Range starting at or beyond the end of the object: nothing to read
+      if (isInvalidRange(err)) return { bytes: new Uint8Array(0), size: null, etag: null };
+      if (isPreconditionFailed(err)) {
+        throw new SourceChangedError(`${path} changed since it was opened`, { path, status: 412 });
+      }
+      throw err;
+    }
+    const body = response.Body;
+
+    if (!body) {
+      throw new ConnectorError(`Empty response body for ${path} [${offset}-${end}]`, { path });
+    }
+
+    const bytes = await streamToUint8Array(body);
+    const total = /\/(\d+)\s*$/.exec(response.ContentRange ?? '');
+    return {
+      bytes: bytes.length > length ? bytes.subarray(0, length) : bytes,
+      size: total ? Number(total[1]) : null,
+      etag: typeof response.ETag === 'string' ? response.ETag : null,
+    };
+  }
 
   /**
    * Lazily initialize and return the `S3Client` and SDK module.
@@ -359,6 +419,17 @@ export class S3Connector implements Connector {
 function isInvalidRange(err: any): boolean {
   return err?.name === 'InvalidRange' || err?.Code === 'InvalidRange' ||
     err?.$metadata?.httpStatusCode === 416;
+}
+
+/**
+ * Whether an SDK error means an `IfMatch` precondition failed (HTTP 412).
+ *
+ * @param err - Error thrown by `S3Client.send`.
+ * @returns `true` for precondition failures.
+ */
+function isPreconditionFailed(err: any): boolean {
+  return err?.name === 'PreconditionFailed' || err?.Code === 'PreconditionFailed' ||
+    err?.$metadata?.httpStatusCode === 412;
 }
 
 /**

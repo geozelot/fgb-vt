@@ -9,8 +9,10 @@
  * in parallel via `Promise.all`, leveraging OS-level I/O scheduling.
  */
 
-import { open, type FileHandle } from 'node:fs/promises';
-import type { Connector } from './connector.js';
+import { open, stat, type FileHandle } from 'node:fs/promises';
+import type { Stats } from 'node:fs';
+import type { Connector, ConnectorHints, ReadHeadResult, ReadOptions } from './connector.js';
+import { SourceChangedError } from '../errors.js';
 
 /**
  * Maximum number of bytes per individual `FileHandle.read()` call.
@@ -79,6 +81,9 @@ interface PoolEntry {
  * ```
  */
 export class LocalConnector implements Connector {
+  /** Local reads are cheap: merge only near-adjacent ranges, read a modest prefix. */
+  readonly hints: ConnectorHints = { coalesceGap: 4 * 1024, prefetch: 64 * 1024 };
+
   private readonly maxOpenFiles: number;
   /** LRU pool: Map preserves insertion order; most recently used is moved to end */
   private readonly pool = new Map<string, PoolEntry>();
@@ -99,44 +104,75 @@ export class LocalConnector implements Connector {
    * access). The returned `Uint8Array` may be shorter than `length` if
    * the file is smaller than `offset + length`.
    *
+   * With {@link ReadOptions.ifMatch}, the file's current version tag
+   * (inode, size and modification time) is checked first.
+   *
    * @param path - Absolute or relative filesystem path to the FGB file.
    * @param offset - Zero-based byte offset to begin reading from.
    * @param length - Number of bytes to read.
+   * @param options - Optional version check and abort signal.
    * @returns The requested byte range.
    * @throws {Error} If the file cannot be opened or read (e.g. `ENOENT`,
-   *   `EACCES`).
+   *   `EACCES`), or the read was aborted.
+   * @throws {SourceChangedError} If `ifMatch` no longer matches the file.
    * @throws {RangeError} If `offset` or `length` is negative or not an integer.
    */
-  async read(path: string, offset: number, length: number): Promise<Uint8Array> {
+  async read(path: string, offset: number, length: number, options?: ReadOptions): Promise<Uint8Array> {
     if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 0) {
       throw new RangeError(`Invalid byte range for ${path}: offset ${offset}, length ${length}`);
     }
+    options?.signal?.throwIfAborted();
     if (length === 0) return new Uint8Array(0);
+
+    if (options?.ifMatch !== undefined) {
+      const current = versionTag(await stat(path));
+      if (current !== options.ifMatch) {
+        this.evict(path);
+        throw new SourceChangedError(`${path} changed since it was opened`, { path });
+      }
+    }
 
     const entry = this.acquire(path);
     try {
-      const handle = await entry.handle;
-      const buf = Buffer.alloc(length);
-
-      if (length <= MAX_READ_CHUNK) {
-        const { bytesRead } = await handle.read(buf, 0, length, offset);
-        return new Uint8Array(buf.buffer, buf.byteOffset, bytesRead);
-      }
-
-      // Chunked read for ranges exceeding the Node.js Int32 `length` limit
-      let totalRead = 0;
-      let remaining = length;
-      while (remaining > 0) {
-        const chunk = Math.min(remaining, MAX_READ_CHUNK);
-        const { bytesRead } = await handle.read(buf, totalRead, chunk, offset + totalRead);
-        totalRead += bytesRead;
-        if (bytesRead < chunk) break; // EOF
-        remaining -= bytesRead;
-      }
-
-      return new Uint8Array(buf.buffer, buf.byteOffset, totalRead);
+      return await readFromHandle(await entry.handle, offset, length);
     } finally {
       this.release(entry);
+    }
+  }
+
+  /**
+   * Read the first `length` bytes of a file together with its size and
+   * version tag (inode, size and modification time).
+   *
+   * If the file at `path` was replaced since its handle was pooled, the
+   * stale handle is dropped first, so bytes and metadata always describe
+   * the same file.
+   *
+   * @param path - Absolute or relative filesystem path to the FGB file.
+   * @param length - Number of leading bytes to read.
+   * @param options - Optional abort signal.
+   * @returns The leading bytes plus size and version tag.
+   */
+  async readHead(path: string, length: number, options?: ReadOptions): Promise<ReadHeadResult> {
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw new RangeError(`Invalid read length for ${path}: ${length}`);
+    }
+    options?.signal?.throwIfAborted();
+
+    for (let attempt = 0; ; attempt++) {
+      const entry = this.acquire(path);
+      try {
+        const handle = await entry.handle;
+        const [opened, current] = await Promise.all([handle.stat(), stat(path)]);
+        if ((opened.ino !== current.ino || opened.dev !== current.dev) && attempt === 0) {
+          this.evict(path); // pooled handle belongs to a replaced file
+          continue;
+        }
+        const bytes = length === 0 ? new Uint8Array(0) : await readFromHandle(handle, 0, length);
+        return { bytes, size: opened.size, etag: versionTag(opened) };
+      } finally {
+        this.release(entry);
+      }
     }
   }
 
@@ -148,16 +184,28 @@ export class LocalConnector implements Connector {
    *
    * @param path - Absolute or relative filesystem path to the FGB file.
    * @param ranges - Array of `{ offset, length }` byte-range descriptors.
+   * @param options - Optional version check (performed once) and abort signal.
    * @returns Array of `Uint8Array` chunks in the same order as the input ranges.
    * @throws {Error} If the file cannot be opened or any individual read fails.
+   * @throws {SourceChangedError} If `ifMatch` no longer matches the file.
    */
   async readRanges(
     path: string,
     ranges: ReadonlyArray<{ offset: number; length: number }>,
+    options?: ReadOptions,
   ): Promise<Uint8Array[]> {
-    // Delegate to read() which handles chunking transparently
+    // Check the version once for the whole batch, then read in parallel
+    options?.signal?.throwIfAborted();
+    if (options?.ifMatch !== undefined && ranges.length > 0) {
+      const current = versionTag(await stat(path));
+      if (current !== options.ifMatch) {
+        this.evict(path);
+        throw new SourceChangedError(`${path} changed since it was opened`, { path });
+      }
+    }
+    const perRange = options?.signal ? { signal: options.signal } : undefined;
     return Promise.all(
-      ranges.map(({ offset, length }) => this.read(path, offset, length)),
+      ranges.map(({ offset, length }) => this.read(path, offset, length, perRange)),
     );
   }
 
@@ -226,6 +274,19 @@ export class LocalConnector implements Connector {
   }
 
   /**
+   * Remove the pool entry for `path`, closing its handle once idle.
+   *
+   * @param path - Filesystem path whose handle should be dropped.
+   */
+  private evict(path: string): void {
+    const entry = this.pool.get(path);
+    if (entry) {
+      this.pool.delete(path);
+      void retire(entry);
+    }
+  }
+
+  /**
    * Evict idle least-recently-used entries until the pool is within
    * {@link LocalConnectorOptions.maxOpenFiles}.
    */
@@ -238,6 +299,47 @@ export class LocalConnector implements Connector {
       }
     }
   }
+}
+
+/**
+ * Read up to `length` bytes at `offset` from an open handle.
+ *
+ * @param handle - Open file handle.
+ * @param offset - Zero-based byte offset.
+ * @param length - Number of bytes to read (> 0).
+ * @returns The bytes read; shorter than `length` at end of file.
+ */
+async function readFromHandle(handle: FileHandle, offset: number, length: number): Promise<Uint8Array> {
+  const buf = Buffer.alloc(length);
+
+  if (length <= MAX_READ_CHUNK) {
+    const { bytesRead } = await handle.read(buf, 0, length, offset);
+    return new Uint8Array(buf.buffer, buf.byteOffset, bytesRead);
+  }
+
+  // Chunked read for ranges exceeding the Node.js Int32 `length` limit
+  let totalRead = 0;
+  let remaining = length;
+  while (remaining > 0) {
+    const chunk = Math.min(remaining, MAX_READ_CHUNK);
+    const { bytesRead } = await handle.read(buf, totalRead, chunk, offset + totalRead);
+    totalRead += bytesRead;
+    if (bytesRead < chunk) break; // EOF
+    remaining -= bytesRead;
+  }
+
+  return new Uint8Array(buf.buffer, buf.byteOffset, totalRead);
+}
+
+/**
+ * Version tag of a local file: identity (device, inode) plus size and
+ * modification time, so both in-place edits and replacements change it.
+ *
+ * @param stats - File stats.
+ * @returns Opaque tag string.
+ */
+function versionTag(stats: Stats): string {
+  return `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeMs}`;
 }
 
 /**

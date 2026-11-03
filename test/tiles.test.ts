@@ -1,25 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { tileId, tileBBox, tileClipBounds, TileBoundsCache } from '../src/tiles.js';
-
-describe('tileId', () => {
-  it('should produce unique IDs for different tiles', () => {
-    const ids = new Set<number>();
-    for (let z = 0; z <= 5; z++) {
-      const n = 1 << z;
-      for (let x = 0; x < n; x++) {
-        for (let y = 0; y < n; y++) {
-          ids.add(tileId(z, x, y));
-        }
-      }
-    }
-    // Total tiles for z0-5: 1 + 4 + 16 + 64 + 256 + 1024 = 1365
-    expect(ids.size).toBe(1365);
-  });
-
-  it('should encode z=0 x=0 y=0 consistently', () => {
-    expect(tileId(0, 0, 0)).toBe(0);
-  });
-});
+import { tileBBox, tileClipBounds, validateTile, mercatorToWgs84BBox, MAX_ZOOM } from '../src/tiles.js';
 
 describe('tileBBox', () => {
   it('should cover the world at z=0', () => {
@@ -83,26 +63,35 @@ describe('tileClipBounds', () => {
   });
 });
 
-describe('TileBoundsCache', () => {
-  it('should cache and return consistent WGS84 bounds', () => {
-    const cache = new TileBoundsCache();
-    const b1 = cache.getWgs84(5, 10, 10);
-    const b2 = cache.getWgs84(5, 10, 10);
-    expect(b1).toBe(b2); // Same reference (cached)
+describe('validateTile', () => {
+  it('accepts every tile of a zoom level', () => {
+    expect(() => validateTile(0, 0, 0)).not.toThrow();
+    expect(() => validateTile(3, 7, 7)).not.toThrow();
+    expect(() => validateTile(MAX_ZOOM, 2 ** MAX_ZOOM - 1, 0)).not.toThrow();
   });
 
-  it('should cache and return consistent clip bounds', () => {
-    const cache = new TileBoundsCache();
-    const b1 = cache.getClip(5, 10, 10, 64, 4096);
-    const b2 = cache.getClip(5, 10, 10, 64, 4096);
-    expect(b1).toBe(b2); // Same reference (cached)
+  it.each([
+    [-1, 0, 0], [MAX_ZOOM + 1, 0, 0], [1.5, 0, 0], [NaN, 0, 0],
+    [2, 4, 0], [2, 0, 4], [2, -1, 0], [2, 0.5, 0], [2, 0, Infinity],
+  ])('rejects %s/%s/%s', (z, x, y) => {
+    expect(() => validateTile(z, x, y)).toThrow(RangeError);
+  });
+});
+
+describe('mercatorToWgs84BBox', () => {
+  it('inverts tileClipBounds without buffer', () => {
+    const bbox = tileBBox(5, 10, 12);
+    const fromClip = mercatorToWgs84BBox(tileClipBounds(5, 10, 12, 0, 4096));
+    expect(fromClip.minX).toBeCloseTo(bbox.minX, 9);
+    expect(fromClip.minY).toBeCloseTo(bbox.minY, 9);
+    expect(fromClip.maxX).toBeCloseTo(bbox.maxX, 9);
+    expect(fromClip.maxY).toBeCloseTo(bbox.maxY, 9);
   });
 
-  it('should produce different clip bounds for different buffer/extent', () => {
-    const cache = new TileBoundsCache();
-    const b1 = cache.getClip(5, 10, 10, 64, 4096);
-    const b2 = cache.getClip(5, 10, 10, 128, 4096);
-    expect(b1).not.toBe(b2);
-    expect(b2.minX).toBeLessThan(b1.minX);
+  it('extends to the poles at the projection edges', () => {
+    const top = mercatorToWgs84BBox(tileClipBounds(2, 1, 0, 64, 4096));
+    const bottom = mercatorToWgs84BBox(tileClipBounds(2, 1, 3, 64, 4096));
+    expect(top.maxY).toBe(90);
+    expect(bottom.minY).toBe(-90);
   });
 });

@@ -65,10 +65,26 @@ export { S3Connector } from './connectors/s3.js';
 
 // == Types ==================================================================
 
-export type { Connector } from './connectors/connector.js';
+export type { Connector, ReadOptions, ReadHeadResult, ConnectorHints } from './connectors/connector.js';
 export type { LocalConnectorOptions } from './connectors/local.js';
 export type { HttpConnectorOptions } from './connectors/http.js';
 export type { S3ConnectorOptions } from './connectors/s3.js';
 export type { Source, SourceOptions, TileOptions } from './source.js';
 export type { TileServerLayer } from './server.js';
 export type { TileJSON, BBox } from './types.js';
+export type { ByteCache, MemoryCacheOptions } from './cache.js';
+export type { IoOptions } from './fgb/reader.js';
+export type { OpenOptions } from './client.js';
+
+// == Caching & errors =======================================================
+
+export { MemoryCache } from './cache.js';
+export {
+  FgbVtError,
+  FormatError,
+  UnsupportedFormatError,
+  ConnectorError,
+  RangeNotSupportedError,
+  SourceChangedError,
+  LimitExceededError,
+} from './errors.js';

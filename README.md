@@ -91,7 +91,7 @@ await client.close();
 
 ### `TileServer`
 
-Bind connectors and sources once; call `tile()` for the life of the process. Headers and spatial index metadata are lazily cached on first access - maximum throughput after warm-up.
+Bind connectors and sources once; call `tile()` for the life of the process. File headers and spatial index pages are read on first access and kept in a bounded cache; `await server.open()` preloads them at start-up.
 
 - **Single connector:**
 
@@ -161,7 +161,7 @@ ___
 
 ### `tile()`
 
-Everything per call - connector, coordinates, sources. No instance state beyond a module-level tile bounds cache. Drop it into a Lambda and call it a day.
+Everything per call - connector, coordinates, sources. The only state is a bounded module-level cache of headers and index pages (64 MiB), which warm serverless containers reuse; pass `{ cache: false }` for none. Drop it into a Lambda and call it a day.
 
 - **Single source:**
 
@@ -261,12 +261,59 @@ const server = new TileServer(
 ```
 ---
 
+### I/O and caching
+
+Tiles read only what they need: one initial request returns the header and the top of the spatial index, the index is searched level by level (whole subtrees inside the tile are resolved without descending), and matching features are fetched with merged range requests. Headers and index pages are cached, so repeated requests against the same files — including requests to a warm serverless container — typically need a single feature read.
+
+I/O options are accepted alongside the tiling options by `tile()`, `TileClient` and `TileServer`:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `cache` | shared 64 MiB `MemoryCache` (`tile()`), one per instance (`TileClient`, `TileServer`) | Header and index page cache; any `ByteCache` (`get`/`set`/`delete`), or `false` |
+| `prefetch` | connector hint: 64 KiB local, 256 KiB HTTP/S3 (16 KiB HTTP in browsers) | Size of the first read of each file |
+| `coalesceGap` | connector hint: 4 KiB local, 64 KiB HTTP/S3 | Merge byte ranges at most this far apart |
+| `maxScanBytes` | 32 MiB | Largest feature section scanned for files **without** a spatial index |
+
+```typescript
+import { TileClient, S3Connector, MemoryCache } from '@geozelot/fgb-vt';
+
+// module scope: survives warm invocations
+const client = new TileClient(new S3Connector({ region: 'us-east-1' }), {
+  cache: new MemoryCache({ maxBytes: 128 * 1024 * 1024 }),
+});
+
+// optional, e.g. during init: read headers and upper index levels up front
+await client.open({ name: 'parcels', path: 's3://bucket/parcels.fgb' });
+```
+
+Cache entries are keyed by path and version tag (ETag, or inode/size/mtime for local files). Every read carries the version tag; if a file is replaced, the source is reopened automatically. With custom connectors that report no version tag, cached files must not change in place.
+
+---
+
+### Errors
+
+Data and I/O problems raise subclasses of `FgbVtError` with a stable `code` and the source `path`:
+
+| Class | `code` | Raised when |
+|-------|--------|-------------|
+| `FormatError` | `FGB_FORMAT` | The file is not valid FlatGeobuf (corrupt, truncated, inconsistent) |
+| `UnsupportedFormatError` | `FGB_UNSUPPORTED` | Valid FlatGeobuf this reader does not support (major versions other than 3) |
+| `ConnectorError` | `FGB_IO` | Storage access failed |
+| `RangeNotSupportedError` | `FGB_RANGE_UNSUPPORTED` | An HTTP server ignores `Range` requests |
+| `SourceChangedError` | `FGB_SOURCE_CHANGED` | A file kept changing between reads |
+| `LimitExceededError` | `FGB_LIMIT` | An unindexed file exceeds `maxScanBytes` |
+
+Invalid tile coordinates raise `RangeError`.
+
+---
+
 ### Types
 
 ```typescript
 import type {
-  Connector,
-  Source, SourceOptions, TileOptions,
+  Connector, ReadOptions, ReadHeadResult, ConnectorHints,
+  Source, SourceOptions, TileOptions, IoOptions, OpenOptions,
+  ByteCache, MemoryCacheOptions,
   TileServerLayer, TileJSON, BBox,
   LocalConnectorOptions, HttpConnectorOptions, S3ConnectorOptions,
 } from '@geozelot/fgb-vt';

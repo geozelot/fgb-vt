@@ -65,8 +65,17 @@ export interface FeatureChunk {
    * here to obtain the complete feature.
    */
   truncatedAt: number;
-  /** Full byte length of the truncated feature, including its 4-byte size prefix. */
+  /**
+   * Full byte length of the truncated feature, including its 4-byte size
+   * prefix, or `0` when the buffer ended inside the size prefix itself.
+   */
   truncatedLength: number;
+  /**
+   * Bytes consumed by the complete features. Smaller than the buffer when
+   * decoding stopped at a truncated feature or at a zero size prefix
+   * (end-of-data marker).
+   */
+  end: number;
 }
 
 /**
@@ -83,10 +92,17 @@ export interface FeatureChunk {
  *   FlatBuffers.
  * @param header - Parsed FGB header providing the geometry type and column
  *   schema needed for decoding.
+ * @param accept - Optional filter on a feature's offset within `bytes`;
+ *   rejected features are skipped without decoding (e.g. features that
+ *   were only read because they sit between two requested ranges).
  * @returns Decoded features and the position of a truncated trailing
  *   feature, if any.
  */
-export function decodeFeatureChunk(bytes: Uint8Array, header: FgbHeader): FeatureChunk {
+export function decodeFeatureChunk(
+  bytes: Uint8Array,
+  header: FgbHeader,
+  accept?: (offset: number) => boolean,
+): FeatureChunk {
   const features: RawFeature[] = [];
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let offset = 0;
@@ -97,19 +113,25 @@ export function decodeFeatureChunk(bytes: Uint8Array, header: FgbHeader): Featur
     if (featureSize === 0) break;
 
     if (offset + 4 + featureSize > bytes.length) {
-      return { features, truncatedAt: offset, truncatedLength: 4 + featureSize };
+      return { features, truncatedAt: offset, truncatedLength: 4 + featureSize, end: offset };
     }
 
-    const featureBytes = bytes.subarray(offset + 4, offset + 4 + featureSize);
-    const feature = decodeSingleFeature(featureBytes, header);
-    if (feature) {
-      features.push(feature);
+    if (!accept || accept(offset)) {
+      const featureBytes = bytes.subarray(offset + 4, offset + 4 + featureSize);
+      const feature = decodeSingleFeature(featureBytes, header);
+      if (feature) {
+        features.push(feature);
+      }
     }
 
     offset += 4 + featureSize;
   }
 
-  return { features, truncatedAt: -1, truncatedLength: 0 };
+  if (offset < bytes.length && offset + 4 > bytes.length) {
+    // The buffer ended inside a size prefix
+    return { features, truncatedAt: offset, truncatedLength: 0, end: offset };
+  }
+  return { features, truncatedAt: -1, truncatedLength: 0, end: offset };
 }
 
 /**

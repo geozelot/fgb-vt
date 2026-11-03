@@ -21,6 +21,7 @@
  */
 
 import type { BBox } from '../types.js';
+import { FormatError } from '../errors.js';
 
 /** Byte size of a single packed R-tree node (4 x f64 bbox + 1 x u64 offset). */
 const NODE_ITEM_SIZE = 40;
@@ -105,7 +106,7 @@ export function queryIndex(
     // Read node bbox
     const nodeByteOff = nodeIdx * NODE_ITEM_SIZE;
     if (nodeByteOff + NODE_ITEM_SIZE > indexBytes.length) {
-      throw new Error(`Corrupt FlatGeobuf index: node ${nodeIdx} lies beyond the index (${indexBytes.length} bytes)`);
+      throw new FormatError(`Corrupt FlatGeobuf index: node ${nodeIdx} lies beyond the index (${indexBytes.length} bytes)`);
     }
 
     const nodeMinX = view.getFloat64(nodeByteOff, true);
@@ -127,7 +128,7 @@ export function queryIndex(
       const firstChild = readUint64AsNumber(view, nodeByteOff + 32);
       const [childLevelStart, childLevelEnd] = levelBounds[level - 1];
       if (firstChild < childLevelStart || firstChild >= childLevelEnd) {
-        throw new Error(`Corrupt FlatGeobuf index: node ${nodeIdx} points to child ${firstChild} outside its level`);
+        throw new FormatError(`Corrupt FlatGeobuf index: node ${nodeIdx} points to child ${firstChild} outside its level`);
       }
       const childEnd = Math.min(firstChild + nodeSize, childLevelEnd);
 
@@ -192,14 +193,14 @@ export function queryIndex(
  * @param featuresCount - Number of features (leaf nodes); must be >= 1.
  * @param nodeSize - Branching factor; must be >= 2.
  * @returns Node counts per level, `[leaves, ..., 1]`.
- * @throws {Error} On a feature count < 1 or a node size < 2.
+ * @throws {FormatError} On a feature count < 1 or a node size < 2.
  */
 function levelNodeCounts(featuresCount: number, nodeSize: number): number[] {
   if (!Number.isSafeInteger(featuresCount) || featuresCount < 1) {
-    throw new Error(`Invalid packed R-tree: feature count ${featuresCount}`);
+    throw new FormatError(`Invalid packed R-tree: feature count ${featuresCount}`);
   }
   if (!Number.isInteger(nodeSize) || nodeSize < 2 || nodeSize > 65535) {
-    throw new Error(`Invalid packed R-tree: node size ${nodeSize}`);
+    throw new FormatError(`Invalid packed R-tree: node size ${nodeSize}`);
   }
   let n = featuresCount;
   const counts = [n];
@@ -220,7 +221,7 @@ function levelNodeCounts(featuresCount: number, nodeSize: number): number[] {
  * @param featuresCount - Total number of features (leaf nodes); must be >= 1.
  * @param nodeSize - Branching factor (max children per internal node); must be >= 2.
  * @returns Total byte size of the packed R-tree.
- * @throws {Error} On a feature count < 1 or a node size < 2.
+ * @throws {FormatError} On a feature count < 1 or a node size < 2.
  */
 export function calcTreeSize(featuresCount: number, nodeSize: number): number {
   let total = 0;
@@ -251,7 +252,7 @@ export function calcTreeSize(featuresCount: number, nodeSize: number): number {
  * @param nodeSize - Branching factor of the R-tree.
  * @returns Array of `[startIndex, endIndex)` pairs, one per level.
  *   `result[0]` = leaf bounds, `result[result.length - 1]` = root bounds.
- * @throws {Error} On a feature count < 1 or a node size < 2.
+ * @throws {FormatError} On a feature count < 1 or a node size < 2.
  */
 export function computeLevelBounds(
   featuresCount: number,

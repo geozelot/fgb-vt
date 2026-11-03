@@ -6,13 +6,14 @@
  * The {@link TileServer} binds all {@link Connector | Connectors} and
  * {@link Source | Sources} at construction time. Tile requests accept only
  * coordinates, making the hot path as lean as possible. FGB headers and
- * spatial index metadata are lazily cached on first access and reused for
- * the lifetime of the server instance.
+ * spatial index pages are read on first access and kept in a bounded cache
+ * (a 64 MiB {@link MemoryCache} by default); {@link TileServer.open}
+ * preloads them, e.g. at start-up.
  *
  * This tier is designed for long-running tile server processes with a fixed
- * set of FGB sources. All per-source overhead (header parsing, index
- * location) is amortized after the first request, yielding maximum
- * throughput on subsequent calls.
+ * set of FGB sources. Per-source overhead (header parsing, index reads) is
+ * amortized across requests. Sources are opened independently: one
+ * unreadable source fails only the tiles that include it.
  *
  * Multiple connectors are supported via the {@link TileServerLayer}
  * configuration interface, allowing a single server to combine local files,
@@ -42,14 +43,15 @@
 import type { Connector } from './connectors/connector.js';
 import type { Source, TileOptions } from './source.js';
 import type { TileJSON } from './types.js';
-import { TileBoundsCache } from './tiles.js';
 import {
   processMultiConnectorTile,
-  readHeader,
-  type FgbCache,
   type ConnectorSourceGroup,
 } from './pipeline.js';
 import { resolveOptions } from './source.js';
+import { MemoryCache } from './cache.js';
+import { createIoContext, getSource, type IoContext, type IoOptions } from './fgb/reader.js';
+import { openSources, type OpenOptions } from './client.js';
+import { withPath } from './errors.js';
 
 /**
  * A layer configuration binding a {@link Connector} to one or more
@@ -129,10 +131,9 @@ export interface TileServerLayer {
 export class TileServer {
   private readonly groups: ConnectorSourceGroup[];
   private readonly options: TileOptions | undefined;
-  private readonly boundsCache = new TileBoundsCache();
-  private readonly fgbCaches = new Map<string, FgbCache>();
-  private initialized = false;
-  private initPromise: Promise<void> | null = null;
+  private readonly context: IoContext;
+  /** Cache created by this instance (cleared on close), if not caller-supplied. */
+  private readonly ownCache: MemoryCache | null;
   private closed = false;
 
   /**
@@ -145,13 +146,16 @@ export class TileServer {
    * @param layers - One or more layer configurations binding connectors to
    *   sources. A single {@link TileServerLayer} is accepted for convenience.
    * @param options - Tile-level tiling option defaults applied to all sources
-   *   unless overridden by per-source options.
+   *   unless overridden by per-source options, plus I/O options (cache,
+   *   prefetch, range merging, scan budget).
    */
   constructor(
     layers: TileServerLayer | TileServerLayer[],
-    options?: TileOptions,
+    options?: TileOptions & IoOptions,
   ) {
     this.options = options;
+    this.ownCache = options?.cache === undefined ? new MemoryCache() : null;
+    this.context = createIoContext(options, this.ownCache ?? new MemoryCache());
 
     const layerArray = Array.isArray(layers) ? layers : [layers];
     this.groups = layerArray.map(layer => ({
@@ -164,26 +168,44 @@ export class TileServer {
    * Render a vector tile as a PBF-encoded MVT.
    *
    * Layers appear in the output in the order defined at construction time.
-   * FGB headers and spatial indices are lazily cached on the first request
-   * for each source and reused on subsequent calls.
+   * Sources are opened on first use and their headers and index pages
+   * cached for subsequent calls.
    *
    * @param z - Tile zoom level.
    * @param x - Tile column.
    * @param y - Tile row.
    * @returns PBF-encoded Mapbox Vector Tile. Returns an empty tile if no
    *   features intersect the requested tile bounds.
+   * @throws {RangeError} If `z/x/y` is not a valid tile.
+   * @throws {FgbVtError} If a source cannot be read (annotated with its path).
    */
   async tile(z: number, x: number, y: number): Promise<Uint8Array> {
-    // Ensure all headers are cached (lazy init)
-    await this.ensureInitialized();
-
+    this.assertOpen();
     return processMultiConnectorTile(
       this.groups,
       z, x, y,
       this.options,
-      this.boundsCache,
-      this.fgbCaches,
+      this.context,
     );
+  }
+
+  /**
+   * Open every configured source ahead of the first tile request: read
+   * headers and the top of each spatial index and, within the
+   * {@link OpenOptions.warmIndex} budget, all upper index levels.
+   *
+   * Opening is otherwise lazy. Call this at start-up (or in the init phase
+   * of a serverless function) to move that I/O out of the first requests.
+   *
+   * @param options - Index warm-up budget.
+   * @returns Resolves when every source is open.
+   * @throws {FgbVtError} If a source cannot be opened (annotated with its path).
+   */
+  async open(options?: OpenOptions): Promise<void> {
+    this.assertOpen();
+    await Promise.all(this.groups.map(group =>
+      openSources(group.connector, group.sources, this.context, options),
+    ));
   }
 
   /**
@@ -191,29 +213,39 @@ export class TileServer {
    *
    * Returns aggregated bounds, zoom range, and a `vector_layers` array
    * listing each source's layer name, field schema, and zoom range.
-   * FGB headers are read lazily if not already cached.
+   * Sources are opened (headers read) if not already open.
    *
    * @returns TileJSON metadata object conforming to the 3.0.0 specification.
+   * @throws {FgbVtError} If a source cannot be opened (annotated with its path).
    */
   async tileJSON(): Promise<TileJSON> {
-    await this.ensureInitialized();
+    this.assertOpen();
+
+    const headers = await Promise.all(this.groups.flatMap(group =>
+      group.sources.map(async (source) => {
+        try {
+          return (await getSource(group.connector, source.path, this.context)).header;
+        } catch (err) {
+          throw withPath(err, source.path);
+        }
+      }),
+    ));
 
     const vectorLayers: TileJSON['vector_layers'] = [];
     let globalBounds: [number, number, number, number] = [180, 90, -180, -90];
     let globalMinZoom = Infinity;
     let globalMaxZoom = 0;
 
+    let index = 0;
     for (const group of this.groups) {
       for (const source of group.sources) {
-        const cache = this.fgbCaches.get(source.path);
+        const header = headers[index++];
         const opts = resolveOptions(source.options, this.options);
 
         // Build field map from header columns
         const fields: Record<string, string> = {};
-        if (cache) {
-          for (const col of cache.header.columns) {
-            fields[col.name] = columnTypeToString(col.type);
-          }
+        for (const col of header.columns) {
+          fields[col.name] = columnTypeToString(col.type);
         }
 
         vectorLayers.push({
@@ -228,8 +260,8 @@ export class TileServer {
         globalMaxZoom = Math.max(globalMaxZoom, opts.maxZoom);
 
         // Update global bounds from header bbox
-        if (cache?.header.bbox) {
-          const b = cache.header.bbox;
+        if (header.bbox) {
+          const b = header.bbox;
           globalBounds = [
             Math.min(globalBounds[0], b.minX),
             Math.min(globalBounds[1], b.minY),
@@ -257,17 +289,15 @@ export class TileServer {
   /**
    * Release all connector resources and cached state.
    *
-   * Clears FGB header caches, resets initialization state, and closes
-   * every unique connector. After calling `close()`, this server instance
-   * must not be used again.
+   * Clears the instance's own cache (a caller-supplied cache is left
+   * untouched) and closes every unique connector. After calling `close()`,
+   * this server instance must not be used again.
    *
    * @returns Resolves when all connectors have been closed.
    */
   async close(): Promise<void> {
     this.closed = true;
-    this.fgbCaches.clear();
-    this.initialized = false;
-    this.initPromise = null;
+    this.ownCache?.clear();
 
     // Close all unique connectors
     const connectors = new Set(this.groups.map(g => g.connector));
@@ -277,54 +307,14 @@ export class TileServer {
   // == Internal ==========================================================
 
   /**
-   * Guard that triggers lazy initialization on first access.
+   * Reject use after {@link close}.
    *
-   * Subsequent calls return immediately if already initialized, or
-   * await the in-flight initialization promise if one is pending.
-   *
-   * @returns Resolves when all FGB headers have been read and cached.
+   * @throws {Error} If the server has been closed.
    */
-  private ensureInitialized(): Promise<void> {
+  private assertOpen(): void {
     if (this.closed) {
-      return Promise.reject(new Error('TileServer is closed'));
+      throw new Error('TileServer is closed');
     }
-    if (this.initialized) return Promise.resolve();
-    if (this.initPromise) return this.initPromise;
-
-    this.initPromise = this.initialize().then(() => {
-      this.initialized = true;
-    }).catch(err => {
-      this.initPromise = null; // allow retry on transient failure
-      throw err;
-    });
-
-    return this.initPromise;
-  }
-
-  /**
-   * Read and cache FGB headers and spatial index metadata for all sources.
-   *
-   * Sources that are already cached (e.g. duplicate paths across layers)
-   * are skipped. All reads are issued concurrently.
-   *
-   * @returns Resolves when every source header has been cached.
-   */
-  private async initialize(): Promise<void> {
-    const jobs: Promise<void>[] = [];
-
-    for (const group of this.groups) {
-      for (const source of group.sources) {
-        if (this.fgbCaches.has(source.path)) continue;
-
-        jobs.push(
-          readHeader(group.connector, source.path).then(result => {
-            this.fgbCaches.set(source.path, result);
-          }),
-        );
-      }
-    }
-
-    await Promise.all(jobs);
   }
 }
 

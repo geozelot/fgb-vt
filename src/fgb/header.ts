@@ -17,6 +17,7 @@ import { FlatBufferReader } from './flatbuffers.js';
 import { calcTreeSize } from './index.js';
 import type { FgbHeader, ColumnMeta, BBox } from '../types.js';
 import { ColumnType, GeomType } from '../types.js';
+import { FormatError, UnsupportedFormatError } from '../errors.js';
 
 /**
  * FGB file magic bytes: `"fgb"` followed by major version `0x03`, `"fgb"`,
@@ -72,7 +73,8 @@ export function verifyMagic(bytes: Uint8Array): boolean {
  * an incompatible index layout).
  *
  * @param bytes - Raw bytes from the beginning of the file.
- * @throws {Error} If the signature is missing or the major version is unsupported.
+ * @throws {FormatError} If the signature is missing.
+ * @throws {UnsupportedFormatError} If the major version is not 3.
  */
 function assertMagic(bytes: Uint8Array): void {
   if (verifyMagic(bytes)) return;
@@ -80,11 +82,11 @@ function assertMagic(bytes: Uint8Array): void {
     bytes[0] === 0x66 && bytes[1] === 0x67 && bytes[2] === 0x62 &&
     bytes[4] === 0x66 && bytes[5] === 0x67 && bytes[6] === 0x62;
   if (looksLikeFgb) {
-    throw new Error(
+    throw new UnsupportedFormatError(
       `Unsupported FlatGeobuf major version ${bytes[3]} (only ${SUPPORTED_MAJOR_VERSION}.x is supported)`,
     );
   }
-  throw new Error('Invalid FlatGeobuf magic bytes');
+  throw new FormatError('Invalid FlatGeobuf magic bytes', { offset: 0 });
 }
 
 /**
@@ -120,17 +122,19 @@ function assertMagic(bytes: Uint8Array): void {
  *   magic + header).
  * @returns Parsed header containing geometry type, column schema, feature
  *   count, spatial index parameters, bounding box, and byte offsets.
- * @throws {Error} If the magic bytes are invalid, the major version is
- *   unsupported, the header is truncated or out of bounds, or the index
- *   parameters are invalid.
+ * @throws {FormatError} If the magic bytes are invalid, the header is
+ *   truncated or out of bounds, or the index parameters are invalid.
+ * @throws {UnsupportedFormatError} If the major version is not 3, or a
+ *   column uses a type this reader does not know.
  */
 export function parseHeader(bytes: Uint8Array): FgbHeader {
   assertMagic(bytes);
 
   const totalHeaderSize = headerByteSize(bytes);
   if (bytes.length < totalHeaderSize) {
-    throw new Error(
+    throw new FormatError(
       `Truncated FlatGeobuf header: need ${totalHeaderSize} bytes, got ${bytes.length}`,
+      { offset: bytes.length },
     );
   }
   const headerStart = HEADER_MAGIC_SIZE + 4; // offset where the flatbuffer data starts
@@ -147,14 +151,14 @@ export function parseHeader(bytes: Uint8Array): FgbHeader {
   const fcOff = fb.fieldOffset(rootOffset, 8);
   const featuresCount = fcOff ? fb.readUint64AsNumber(fcOff) : 0;
   if (!Number.isSafeInteger(featuresCount)) {
-    throw new Error(`Invalid FlatGeobuf header: features_count ${featuresCount} is out of range`);
+    throw new FormatError(`Invalid FlatGeobuf header: features_count ${featuresCount} is out of range`);
   }
 
   // Index node size (field 9, default 16; 0 = no index)
   const insOff = fb.fieldOffset(rootOffset, 9);
   const indexNodeSize = insOff ? fb.readUint16(insOff) : DEFAULT_INDEX_NODE_SIZE;
   if (indexNodeSize === 1) {
-    throw new Error('Invalid FlatGeobuf header: index_node_size must be 0 or at least 2');
+    throw new FormatError('Invalid FlatGeobuf header: index_node_size must be 0 or at least 2');
   }
 
   // Envelope / bbox (field 1) — vector of doubles: [minX, minY, maxX, maxY]
@@ -224,19 +228,20 @@ export function parseHeader(bytes: Uint8Array): FgbHeader {
  * @param bytes - At least the first 12 bytes of the FGB file.
  * @returns Total byte length occupied by the magic signature and the
  *   header FlatBuffer (i.e. `8 + 4 + headerFbSize`).
- * @throws {Error} If `bytes` contains fewer than 12 bytes, does not start
- *   with supported magic bytes, or declares a header size outside
+ * @throws {FormatError} If `bytes` contains fewer than 12 bytes, does not
+ *   start with FlatGeobuf magic bytes, or declares a header size outside
  *   8 B..10 MiB.
+ * @throws {UnsupportedFormatError} If the major version is not 3.
  */
 export function headerByteSize(bytes: Uint8Array): number {
   if (bytes.length < HEADER_MAGIC_SIZE + 4) {
-    throw new Error('Not enough bytes to read FGB header size');
+    throw new FormatError('Not enough bytes to read FGB header size', { offset: bytes.length });
   }
   assertMagic(bytes);
   const view = new DataView(bytes.buffer, bytes.byteOffset + HEADER_MAGIC_SIZE, 4);
   const headerFbSize = view.getUint32(0, true);
   if (headerFbSize < HEADER_MIN_SIZE || headerFbSize > HEADER_MAX_SIZE) {
-    throw new Error(`Invalid FlatGeobuf header size: ${headerFbSize} bytes`);
+    throw new FormatError(`Invalid FlatGeobuf header size: ${headerFbSize} bytes`, { offset: HEADER_MAGIC_SIZE });
   }
   return HEADER_MAGIC_SIZE + 4 + headerFbSize;
 }
@@ -299,9 +304,9 @@ const MAX_COLUMN_TYPE = ColumnType.Binary;
  * @param tablePos - Absolute byte offset of the Column table within the
  *   header FlatBuffer.
  * @returns Decoded column metadata.
- * @throws {Error} If the column type is not defined by the specification
- *   (its values could not be decoded, so the property stream would be
- *   misread).
+ * @throws {UnsupportedFormatError} If the column type is not defined by the
+ *   3.x specification (its values could not be decoded, so the property
+ *   stream would be misread).
  */
 function parseColumn(fb: FlatBufferReader, tablePos: number): ColumnMeta {
   // Name (field 0)
@@ -312,7 +317,7 @@ function parseColumn(fb: FlatBufferReader, tablePos: number): ColumnMeta {
   const typeOff = fb.fieldOffset(tablePos, 1);
   const type: ColumnType = typeOff ? fb.readUint8(typeOff) : ColumnType.Byte;
   if (type > MAX_COLUMN_TYPE) {
-    throw new Error(`Invalid FlatGeobuf header: column "${name}" has unknown type ${type}`);
+    throw new UnsupportedFormatError(`Unsupported FlatGeobuf column type ${type} (column "${name}")`);
   }
 
   // Nullable (field 7, default true)

@@ -7,12 +7,12 @@
  * reading through geometry processing to Mapbox Vector Tile (MVT) encoding.
  * The pipeline stages are:
  *
- * 1. **Header read** — parse the FGB header and spatial index via a
- *    {@link Connector}, optionally caching the result in {@link FgbCache}.
- * 2. **Spatial query** — query the packed Hilbert R-tree index to determine
- *    which features intersect the requested tile bounding box.
- * 3. **Feature read** — issue byte-range reads through the Connector to
- *    fetch only the matching feature data.
+ * 1. **Open** — read (or take from cache) the FGB header and the top of the
+ *    spatial index via an {@link FgbSource}.
+ * 2. **Spatial query** — walk the packed Hilbert R-tree level by level,
+ *    reading only the index pages the buffered tile box reaches.
+ * 3. **Feature read** — issue coalesced byte-range reads through the
+ *    Connector for the matching features only.
  * 4. **Decode** — deserialize FlatGeobuf features into {@link RawFeature}
  *    objects with flat coordinate arrays and typed properties.
  * 5. **MVT build** — project WGS84 coordinates to Mercator, clip to tile
@@ -35,36 +35,12 @@
 import type { Connector } from './connectors/connector.js';
 import type { Source, TileOptions } from './source.js';
 import { resolveOptions } from './source.js';
-import type { FgbHeader, MvtLayer, BBox, RawFeature } from './types.js';
-import { parseHeader, headerByteSize, INITIAL_HEADER_READ_SIZE } from './fgb/header.js';
-import { queryIndex, computeLevelBounds } from './fgb/index.js';
-import { decodeFeatureChunk } from './fgb/feature.js';
+import type { MvtLayer, BBox, RawFeature } from './types.js';
+import { getSource, invalidateSource, type IoContext } from './fgb/reader.js';
 import { buildMvtLayer } from './mvt/layer.js';
 import { encodePbf } from './pbf/encode.js';
-import { TileBoundsCache, mercatorToWgs84BBox } from './tiles.js';
-
-/**
- * Cached FGB metadata for a single source path.
- *
- * Stores the parsed header and raw spatial index bytes so that repeated
- * tile requests against the same FGB file can skip the two initial read
- * operations required by {@link readHeader}. Typically populated once at
- * startup and shared across all subsequent tile requests.
- */
-export interface FgbCache {
-  /** Parsed FlatGeobuf file header containing schema, offsets, and feature count. */
-  header: FgbHeader;
-  /** Raw bytes of the packed Hilbert R-tree spatial index. */
-  indexBytes: Uint8Array;
-  /**
-   * Pre-computed R-tree level bounds, cached to avoid recomputing per query.
-   *
-   * Optional — when omitted, level bounds are computed on demand from the
-   * header's `featuresCount` and `indexNodeSize`. Providing this avoids
-   * redundant work on repeated tile requests against the same source.
-   */
-  levelBounds?: Array<[number, number]>;
-}
+import { tileClipBounds, mercatorToWgs84BBox, validateTile } from './tiles.js';
+import { SourceChangedError, withPath } from './errors.js';
 
 // == Single-source pipeline =================================================
 
@@ -81,101 +57,81 @@ export interface FgbCache {
  * @param z - Tile zoom level.
  * @param x - Tile column.
  * @param y - Tile row.
- * @param wgs84BBox - WGS84 query box for the spatial index: the tile plus its
- *   buffer, so features in the buffer zone are found.
- * @param clipBounds - Mercator clip bounds (with buffer) for geometry clipping.
  * @param tileOpts - Fully resolved tiling options (extent, buffer, tolerance, zoom range).
- * @param cache - Optional pre-cached header and spatial index bytes; when provided,
- *   the two header-read I/O operations are skipped entirely.
+ * @param context - I/O settings, cache and source registry.
  * @returns The encoded MVT layer for this source. Returns an empty layer (no features)
- *   when the zoom is out of range, the file has no spatial index, or no features
- *   intersect the tile.
+ *   when the zoom is out of range or no features intersect the tile.
+ * @throws {FgbVtError} On format, I/O or limit errors, annotated with the source path.
  */
 export async function processSource(
   connector: Connector,
   source: Source,
   z: number, x: number, y: number,
-  wgs84BBox: BBox,
-  clipBounds: BBox,
   tileOpts: Required<TileOptions>,
-  cache?: FgbCache,
+  context: IoContext,
 ): Promise<MvtLayer> {
   // Skip if outside zoom range
   if (z < tileOpts.minZoom || z > tileOpts.maxZoom) {
     return emptyLayer(source.name, tileOpts.extent);
   }
 
-  // Get header (from cache or by reading)
-  let header: FgbHeader;
-  let indexBytes: Uint8Array;
-  let levelBounds: Array<[number, number]>;
+  // Query with the buffered tile box, so features in the buffer zone are read
+  const clipBounds = tileClipBounds(z, x, y, tileOpts.buffer, tileOpts.extent);
+  const queryBBox = mercatorToWgs84BBox(clipBounds);
 
-  if (cache) {
-    header = cache.header;
-    indexBytes = cache.indexBytes;
-    levelBounds = cache.levelBounds
-      ?? computeLevelBoundsIfNeeded(header);
-  } else {
-    const hdr = await readHeader(connector, source.path);
-    header = hdr.header;
-    indexBytes = hdr.indexBytes;
-    levelBounds = hdr.levelBounds!;
+  let features: RawFeature[];
+  try {
+    features = await readSourceFeatures(connector, source.path, queryBBox, context);
+  } catch (err) {
+    throw withPath(err, source.path);
   }
 
-  // Query spatial index to find matching feature byte ranges
-  if (header.indexNodeSize === 0 || header.featuresCount === 0) {
-    return emptyLayer(source.name, tileOpts.extent);
-  }
-
-  const ranges = queryIndex(
-    indexBytes,
-    header.featuresCount,
-    header.indexNodeSize,
-    header.featuresOffset,
-    wgs84BBox,
-    levelBounds,
-  );
-
-  if (ranges.length === 0) {
-    return emptyLayer(source.name, tileOpts.extent);
-  }
-
-  // Read feature data
-  const featureChunks = await connector.readRanges(source.path, ranges);
-
-  // Decode features from all chunks. The index cannot tell the length of
-  // the last feature in the file, so its range is an estimate; when the
-  // feature turns out longer, re-read it exactly using its size prefix.
-  const allFeatures: RawFeature[] = [];
-  const rereads: Array<Promise<RawFeature[]>> = [];
-  for (let c = 0; c < featureChunks.length; c++) {
-    const { features, truncatedAt, truncatedLength } = decodeFeatureChunk(featureChunks[c], header);
-    for (let i = 0; i < features.length; i++) {
-      allFeatures.push(features[i]);
-    }
-    if (truncatedAt >= 0) {
-      rereads.push(readWholeFeature(connector, source.path, ranges[c].offset + truncatedAt, truncatedLength, header));
-    }
-  }
-  for (const features of await Promise.all(rereads)) {
-    for (let i = 0; i < features.length; i++) {
-      allFeatures.push(features[i]);
-    }
-  }
-
-  if (allFeatures.length === 0) {
+  if (features.length === 0) {
     return emptyLayer(source.name, tileOpts.extent);
   }
 
   // Build MVT layer (includes project → clip → simplify → transform → encode)
   return buildMvtLayer(
-    allFeatures,
+    features,
     source.name,
     z, x, y,
     clipBounds,
     tileOpts.extent,
     tileOpts.tolerance,
   );
+}
+
+/**
+ * Read the features of one source intersecting `bbox`. If the file changed
+ * since its header was cached, forget the cached state and retry once.
+ *
+ * @param connector - Connector to read through.
+ * @param path - Source path.
+ * @param bbox - WGS84 query box.
+ * @param context - I/O settings.
+ * @returns Decoded features.
+ */
+async function readSourceFeatures(
+  connector: Connector,
+  path: string,
+  bbox: BBox,
+  context: IoContext,
+): Promise<RawFeature[]> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const fgb = await getSource(connector, path, context);
+      return await fgb.readFeatures(bbox, {
+        coalesceGap: context.coalesceGap,
+        maxScanBytes: context.maxScanBytes,
+      });
+    } catch (err) {
+      if (err instanceof SourceChangedError && attempt === 0) {
+        await invalidateSource(connector, path, context);
+        continue;
+      }
+      throw err;
+    }
+  }
 }
 
 // == Multi-source pipeline ==================================================
@@ -195,21 +151,18 @@ export async function processSource(
  * @param sources - Array of source descriptors to include in the tile.
  * @param tileOptions - Tile-level option defaults applied to sources
  *   that do not specify their own overrides.
- * @param boundsCache - Cached tile-coordinate-to-bounds lookup.
- * @param fgbCaches - Optional map of FGB path to pre-cached header/index data.
+ * @param context - I/O settings, cache and source registry.
  * @returns PBF-encoded binary tile containing one layer per source.
+ * @throws {RangeError} If `z/x/y` is not a valid tile.
  */
 export async function processTile(
   connector: Connector,
   z: number, x: number, y: number,
   sources: Source[],
   tileOptions: TileOptions | undefined,
-  boundsCache: TileBoundsCache,
-  fgbCaches?: Map<string, FgbCache>,
+  context: IoContext,
 ): Promise<Uint8Array> {
-  const layers = await processTileLayers(
-    connector, z, x, y, sources, tileOptions, boundsCache, fgbCaches,
-  );
+  const layers = await processTileLayers(connector, z, x, y, sources, tileOptions, context);
   return encodePbf(layers);
 }
 
@@ -226,34 +179,22 @@ export async function processTile(
  * @param sources - Array of source descriptors to include in the tile.
  * @param tileOptions - Tile-level option defaults applied to sources
  *   that do not specify their own overrides.
- * @param boundsCache - Cached tile-coordinate-to-bounds lookup.
- * @param fgbCaches - Optional map of FGB path to pre-cached header/index data.
+ * @param context - I/O settings, cache and source registry.
  * @returns Array of MVT layers in source-array order; empty layers are
  *   included for sources that produce no features.
+ * @throws {RangeError} If `z/x/y` is not a valid tile.
  */
 export async function processTileLayers(
   connector: Connector,
   z: number, x: number, y: number,
   sources: Source[],
   tileOptions: TileOptions | undefined,
-  boundsCache: TileBoundsCache,
-  fgbCaches?: Map<string, FgbCache>,
+  context: IoContext,
 ): Promise<MvtLayer[]> {
-  // Process all sources concurrently. The index is queried with the
-  // buffered tile box so that features in the buffer zone are included.
-  const layerPromises = sources.map(source => {
-    const opts = resolveOptions(source.options, tileOptions);
-    const clipBounds = boundsCache.getClip(z, x, y, opts.buffer, opts.extent);
-    const queryBBox = mercatorToWgs84BBox(clipBounds);
-    const cache = fgbCaches?.get(source.path);
-
-    return processSource(
-      connector, source, z, x, y,
-      queryBBox, clipBounds, opts, cache,
-    );
-  });
-
-  return Promise.all(layerPromises);
+  validateTile(z, x, y);
+  return Promise.all(sources.map(source =>
+    processSource(connector, source, z, x, y, resolveOptions(source.options, tileOptions), context),
+  ));
 }
 
 // == Multi-connector pipeline ===============================================
@@ -287,32 +228,24 @@ export interface ConnectorSourceGroup {
  * @param y - Tile row.
  * @param tileOptions - Tile-level option defaults applied to sources
  *   that do not specify their own overrides.
- * @param boundsCache - Cached tile-coordinate-to-bounds lookup.
- * @param fgbCaches - Optional map of FGB path to pre-cached header/index data.
+ * @param context - I/O settings, cache and source registry.
  * @returns PBF-encoded binary tile containing one layer per source, ordered
  *   by group then by source within each group.
+ * @throws {RangeError} If `z/x/y` is not a valid tile.
  */
 export async function processMultiConnectorTile(
   groups: ConnectorSourceGroup[],
   z: number, x: number, y: number,
   tileOptions: TileOptions | undefined,
-  boundsCache: TileBoundsCache,
-  fgbCaches?: Map<string, FgbCache>,
+  context: IoContext,
 ): Promise<Uint8Array> {
-  const allLayerPromises: Promise<MvtLayer>[] = [];
+  validateTile(z, x, y);
 
+  const allLayerPromises: Promise<MvtLayer>[] = [];
   for (const group of groups) {
     for (const source of group.sources) {
-      const opts = resolveOptions(source.options, tileOptions);
-      const clipBounds = boundsCache.getClip(z, x, y, opts.buffer, opts.extent);
-      const queryBBox = mercatorToWgs84BBox(clipBounds);
-      const cache = fgbCaches?.get(source.path);
-
       allLayerPromises.push(
-        processSource(
-          group.connector, source, z, x, y,
-          queryBBox, clipBounds, opts, cache,
-        ),
+        processSource(group.connector, source, z, x, y, resolveOptions(source.options, tileOptions), context),
       );
     }
   }
@@ -321,111 +254,7 @@ export async function processMultiConnectorTile(
   return encodePbf(layers);
 }
 
-// == Header reading =========================================================
-
-/**
- * Read and parse an FGB header and spatial index from a {@link Connector}.
- *
- * This performs up to three byte-range reads:
- *
- * 1. An initial read of {@link INITIAL_HEADER_READ_SIZE} bytes to determine
- *    the full header size.
- * 2. If the initial read was too small, a second read for the complete
- *    header bytes.
- * 3. A read for the packed Hilbert R-tree spatial index (skipped when
- *    `indexSize` is zero).
- *
- * The returned object is suitable for caching in {@link FgbCache} to
- * eliminate these reads on subsequent tile requests.
- *
- * @param connector - The connector to read bytes from.
- * @param path - Connector-specific path to the FGB file.
- * @returns A complete {@link FgbCache} containing parsed header metadata,
- *   raw spatial index bytes, and pre-computed R-tree level bounds.
- * @throws {Error} If the file does not contain a valid FlatGeobuf header
- *   (propagated from the header parser).
- */
-export async function readHeader(
-  connector: Connector,
-  path: string,
-): Promise<FgbCache> {
-  // First read: get enough to parse header size
-  const initialBytes = await connector.read(path, 0, INITIAL_HEADER_READ_SIZE);
-  const hdrSize = headerByteSize(initialBytes);
-
-  // Read full header if needed
-  let headerBytes: Uint8Array;
-  if (hdrSize <= initialBytes.length) {
-    headerBytes = initialBytes.subarray(0, hdrSize);
-  } else {
-    headerBytes = await connector.read(path, 0, hdrSize);
-  }
-
-  const header = parseHeader(headerBytes);
-
-  // Read spatial index
-  let indexBytes: Uint8Array;
-  if (header.indexSize > 0) {
-    indexBytes = await connector.read(path, header.indexOffset, header.indexSize);
-    if (indexBytes.length < header.indexSize) {
-      throw new Error(
-        `Truncated FlatGeobuf index in ${path}: expected ${header.indexSize} bytes, got ${indexBytes.length}`,
-      );
-    }
-  } else {
-    indexBytes = new Uint8Array(0);
-  }
-
-  // Pre-compute R-tree level bounds for reuse across queries
-  const levelBounds = (header.indexNodeSize > 0 && header.featuresCount > 0)
-    ? computeLevelBounds(header.featuresCount, header.indexNodeSize)
-    : [];
-
-  return { header, indexBytes, levelBounds };
-}
-
 // == Helpers ================================================================
-
-/**
- * Read and decode one feature whose exact extent is known from its size
- * prefix.
- *
- * @param connector - Connector to read from.
- * @param path - Connector-specific path to the FGB file.
- * @param offset - Absolute file offset of the feature's size prefix.
- * @param length - Feature length including the 4-byte size prefix.
- * @param header - Parsed FGB header.
- * @returns The decoded feature (empty if its geometry is unusable).
- * @throws {Error} If the file ends before the feature does.
- */
-async function readWholeFeature(
-  connector: Connector,
-  path: string,
-  offset: number,
-  length: number,
-  header: FgbHeader,
-): Promise<RawFeature[]> {
-  const bytes = await connector.read(path, offset, length);
-  const { features, truncatedAt } = decodeFeatureChunk(bytes, header);
-  if (truncatedAt >= 0 || bytes.length < length) {
-    throw new Error(
-      `Truncated FlatGeobuf feature in ${path} at byte ${offset}: expected ${length} bytes, got ${bytes.length}`,
-    );
-  }
-  return features;
-}
-
-/**
- * Compute R-tree level bounds from the header when not supplied via cache.
- *
- * Returns an empty array when the header indicates no spatial index,
- * matching the behaviour of {@link readHeader}.
- */
-function computeLevelBoundsIfNeeded(header: FgbHeader): Array<[number, number]> {
-  return (header.indexNodeSize > 0 && header.featuresCount > 0)
-    ? computeLevelBounds(header.featuresCount, header.indexNodeSize)
-    : [];
-}
 
 /**
  * Create an empty MVT layer with no features, keys, or values.
