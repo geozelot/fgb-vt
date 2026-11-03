@@ -148,6 +148,39 @@ export function tileClipBounds(
   };
 }
 
+// == Mercator → WGS84 =======================================================
+
+/**
+ * Convert a bounding box in mercator [0, 1] space to WGS84.
+ *
+ * Used to turn buffered clip bounds into the spatial index query box, so
+ * that features inside the tile buffer — but outside the tile itself — are
+ * read. Where the box touches or crosses the top or bottom edge of the
+ * projection, latitude extends to the pole: projection clamps everything
+ * beyond ±85.0511° onto that edge, so those features belong to edge tiles.
+ *
+ * @param bounds - Box in mercator [0, 1] space (y = 0 is north).
+ * @returns The equivalent WGS84 bounding box.
+ */
+export function mercatorToWgs84BBox(bounds: BBox): BBox {
+  return {
+    minX: bounds.minX * 360 - 180,
+    minY: bounds.maxY >= 1 ? -90 : mercatorYToLat(bounds.maxY),
+    maxX: bounds.maxX * 360 - 180,
+    maxY: bounds.minY <= 0 ? 90 : mercatorYToLat(bounds.minY),
+  };
+}
+
+/**
+ * Inverse Web Mercator for a y coordinate in [0, 1] space.
+ *
+ * @param y - Mercator y (0 = north edge, 1 = south edge).
+ * @returns Latitude in degrees.
+ */
+function mercatorYToLat(y: number): number {
+  return (Math.atan(Math.sinh(PI * (1 - 2 * y))) * 180) / PI;
+}
+
 // == Cached Tile Bounds =====================================================
 
 /**

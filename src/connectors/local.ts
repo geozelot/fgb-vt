@@ -43,13 +43,27 @@ export interface LocalConnectorOptions {
 }
 
 /**
+ * A pooled file handle.
+ */
+interface PoolEntry {
+  /** Resolves to the open handle; shared by concurrent first readers. */
+  handle: Promise<FileHandle>;
+  /** Number of reads currently using the handle. */
+  refs: number;
+  /** Set once the entry has left the pool; the last release closes it. */
+  retired: boolean;
+}
+
+/**
  * Local filesystem connector using Node.js `FileHandle` with LRU pooling.
  *
  * Opens FGB files on demand and caches the resulting `FileHandle` in an
  * LRU map. Subsequent reads against the same path reuse the cached handle,
- * avoiding repeated `open()` syscalls. When the pool exceeds
- * {@link LocalConnectorOptions.maxOpenFiles}, the least-recently-used
- * handle is evicted and closed.
+ * avoiding repeated `open()` syscalls; concurrent first reads of a path
+ * share a single `open()`. When the pool exceeds
+ * {@link LocalConnectorOptions.maxOpenFiles}, least-recently-used handles
+ * that no read is using are evicted and closed. Handles in use are never
+ * closed underneath a read, so the limit is soft while every handle is busy.
  *
  * @example
  * ```typescript
@@ -67,7 +81,7 @@ export interface LocalConnectorOptions {
 export class LocalConnector implements Connector {
   private readonly maxOpenFiles: number;
   /** LRU pool: Map preserves insertion order; most recently used is moved to end */
-  private readonly handles = new Map<string, FileHandle>();
+  private readonly pool = new Map<string, PoolEntry>();
 
   /**
    * Create a new local filesystem connector.
@@ -75,7 +89,7 @@ export class LocalConnector implements Connector {
    * @param options - Optional configuration. See {@link LocalConnectorOptions}.
    */
   constructor(options?: LocalConnectorOptions) {
-    this.maxOpenFiles = options?.maxOpenFiles ?? 64;
+    this.maxOpenFiles = Math.max(1, options?.maxOpenFiles ?? 64);
   }
 
   /**
@@ -91,28 +105,39 @@ export class LocalConnector implements Connector {
    * @returns The requested byte range.
    * @throws {Error} If the file cannot be opened or read (e.g. `ENOENT`,
    *   `EACCES`).
+   * @throws {RangeError} If `offset` or `length` is negative or not an integer.
    */
   async read(path: string, offset: number, length: number): Promise<Uint8Array> {
-    const handle = await this.getHandle(path);
-    const buf = Buffer.alloc(length);
-
-    if (length <= MAX_READ_CHUNK) {
-      const { bytesRead } = await handle.read(buf, 0, length, offset);
-      return new Uint8Array(buf.buffer, buf.byteOffset, bytesRead);
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 0) {
+      throw new RangeError(`Invalid byte range for ${path}: offset ${offset}, length ${length}`);
     }
+    if (length === 0) return new Uint8Array(0);
 
-    // Chunked read for ranges exceeding the Node.js Int32 `length` limit
-    let totalRead = 0;
-    let remaining = length;
-    while (remaining > 0) {
-      const chunk = Math.min(remaining, MAX_READ_CHUNK);
-      const { bytesRead } = await handle.read(buf, totalRead, chunk, offset + totalRead);
-      totalRead += bytesRead;
-      if (bytesRead < chunk) break; // EOF
-      remaining -= bytesRead;
+    const entry = this.acquire(path);
+    try {
+      const handle = await entry.handle;
+      const buf = Buffer.alloc(length);
+
+      if (length <= MAX_READ_CHUNK) {
+        const { bytesRead } = await handle.read(buf, 0, length, offset);
+        return new Uint8Array(buf.buffer, buf.byteOffset, bytesRead);
+      }
+
+      // Chunked read for ranges exceeding the Node.js Int32 `length` limit
+      let totalRead = 0;
+      let remaining = length;
+      while (remaining > 0) {
+        const chunk = Math.min(remaining, MAX_READ_CHUNK);
+        const { bytesRead } = await handle.read(buf, totalRead, chunk, offset + totalRead);
+        totalRead += bytesRead;
+        if (bytesRead < chunk) break; // EOF
+        remaining -= bytesRead;
+      }
+
+      return new Uint8Array(buf.buffer, buf.byteOffset, totalRead);
+    } finally {
+      this.release(entry);
     }
-
-    return new Uint8Array(buf.buffer, buf.byteOffset, totalRead);
   }
 
   /**
@@ -139,49 +164,103 @@ export class LocalConnector implements Connector {
   /**
    * Close all pooled file handles and clear the LRU pool.
    *
-   * After calling this method, the connector must not be used for further
-   * reads. Handles are closed concurrently via `Promise.all`.
+   * Idle handles are closed immediately; handles still in use by in-flight
+   * reads are closed as soon as those reads finish. A later read reopens
+   * its file, so calling `close()` repeatedly is safe.
    *
-   * @returns Resolves when every open handle has been closed.
+   * @returns Resolves when every idle handle has been closed.
    */
   async close(): Promise<void> {
-    const handles = [...this.handles.values()];
-    this.handles.clear();
-    await Promise.all(handles.map(h => h.close()));
+    const entries = [...this.pool.values()];
+    this.pool.clear();
+    await Promise.all(entries.map(entry => retire(entry)));
   }
 
   // == Handle pool ====================================================
 
   /**
-   * Retrieve a cached file handle or open a new one.
+   * Take a reference on the pooled handle for `path`, opening it if needed.
    *
-   * On cache hit the handle is promoted to the most-recently-used position.
-   * On cache miss a new handle is opened and, if the pool is at capacity,
-   * the least-recently-used handle is evicted and closed.
+   * On cache hit the entry is promoted to the most-recently-used position.
+   * On cache miss the open is started (and shared with concurrent callers)
+   * and idle least-recently-used entries are evicted if the pool is over
+   * capacity. Every call must be paired with {@link release}.
    *
    * @param path - Filesystem path to the FGB file.
-   * @returns An open `FileHandle` for the given path.
+   * @returns The pool entry, with its reference count incremented.
    */
-  private async getHandle(path: string): Promise<FileHandle> {
-    const existing = this.handles.get(path);
+  private acquire(path: string): PoolEntry {
+    const existing = this.pool.get(path);
     if (existing) {
       // Move to end (most recently used)
-      this.handles.delete(path);
-      this.handles.set(path, existing);
+      this.pool.delete(path);
+      this.pool.set(path, existing);
+      existing.refs++;
       return existing;
     }
 
-    // Open new handle
-    const handle = await open(path, 'r');
-    this.handles.set(path, handle);
+    const entry: PoolEntry = { handle: open(path, 'r'), refs: 1, retired: false };
+    // A failed open must not stay cached; the error reaches the caller via `await`.
+    entry.handle.catch(() => {
+      entry.retired = true;
+      if (this.pool.get(path) === entry) this.pool.delete(path);
+    });
+    this.pool.set(path, entry);
+    this.evictIdle();
+    return entry;
+  }
 
-    // Evict LRU if over capacity
-    if (this.handles.size > this.maxOpenFiles) {
-      const [oldestPath, oldestHandle] = this.handles.entries().next().value!;
-      this.handles.delete(oldestPath);
-      await oldestHandle.close();
+  /**
+   * Drop a reference taken by {@link acquire}, closing the handle if it
+   * was retired while in use.
+   *
+   * @param entry - Entry returned by `acquire`.
+   */
+  private release(entry: PoolEntry): void {
+    entry.refs--;
+    if (entry.retired) {
+      if (entry.refs === 0) void closeEntry(entry);
+    } else {
+      this.evictIdle();
     }
+  }
 
-    return handle;
+  /**
+   * Evict idle least-recently-used entries until the pool is within
+   * {@link LocalConnectorOptions.maxOpenFiles}.
+   */
+  private evictIdle(): void {
+    for (const [path, entry] of this.pool) {
+      if (this.pool.size <= this.maxOpenFiles) return;
+      if (entry.refs === 0) {
+        this.pool.delete(path);
+        void retire(entry);
+      }
+    }
+  }
+}
+
+/**
+ * Mark an entry as retired and close its handle now if it is idle;
+ * otherwise the last {@link LocalConnector.release} closes it.
+ *
+ * @param entry - Pool entry that has been removed from the pool.
+ * @returns Resolves once an idle handle has been closed.
+ */
+function retire(entry: PoolEntry): Promise<void> {
+  entry.retired = true;
+  return entry.refs === 0 ? closeEntry(entry) : Promise.resolve();
+}
+
+/**
+ * Close an entry's handle, ignoring failed opens and repeated closes.
+ *
+ * @param entry - Pool entry to close.
+ */
+async function closeEntry(entry: PoolEntry): Promise<void> {
+  try {
+    await (await entry.handle).close();
+  } catch {
+    // The open failed or the handle is already closed: nothing to release.
   }
 }

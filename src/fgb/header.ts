@@ -14,21 +14,37 @@
  */
 
 import { FlatBufferReader } from './flatbuffers.js';
+import { calcTreeSize } from './index.js';
 import type { FgbHeader, ColumnMeta, BBox } from '../types.js';
 import { ColumnType, GeomType } from '../types.js';
 
 /**
- * FGB file magic bytes: `"fgb"` followed by version `0x03`, `"fgb"`, and
- * patch byte `0x00`.
+ * FGB file magic bytes: `"fgb"` followed by major version `0x03`, `"fgb"`,
+ * and a patch level byte.
  *
  * The first 7 bytes are checked during verification; the trailing patch byte
- * is intentionally ignored so that minor patch-level revisions remain
- * forward-compatible.
+ * is intentionally ignored because the specification requires readers of a
+ * major version to accept every patch level (3.0.0 writes `0x00`, 3.0.1
+ * writes `0x01`).
  */
 const MAGIC_BYTES = new Uint8Array([0x66, 0x67, 0x62, 0x03, 0x66, 0x67, 0x62, 0x00]);
 
 /** Byte length of the FGB magic signature. */
 const HEADER_MAGIC_SIZE = 8;
+
+/** The only FlatGeobuf major version this reader understands. */
+const SUPPORTED_MAJOR_VERSION = 3;
+
+/**
+ * Smallest and largest accepted header FlatBuffer sizes, matching the
+ * reference implementation. The lower bound guards FlatBuffer decoding, the
+ * upper bound guards against allocating for a corrupt size prefix.
+ */
+const HEADER_MIN_SIZE = 8;
+const HEADER_MAX_SIZE = 10 * 1024 * 1024;
+
+/** Schema default for `Header.index_node_size`, applied when the field is absent. */
+const DEFAULT_INDEX_NODE_SIZE = 16;
 
 /**
  * Verify that the leading bytes of a buffer contain the FGB magic signature.
@@ -45,6 +61,30 @@ export function verifyMagic(bytes: Uint8Array): boolean {
     if (bytes[i] !== MAGIC_BYTES[i]) return false;
   }
   return true;
+}
+
+/**
+ * Throw a descriptive error unless the buffer starts with the magic bytes
+ * of a supported FlatGeobuf version.
+ *
+ * Distinguishes "not a FlatGeobuf file" from "FlatGeobuf, but a major
+ * version other than 3" (1.x and 2.x were never widely implemented and use
+ * an incompatible index layout).
+ *
+ * @param bytes - Raw bytes from the beginning of the file.
+ * @throws {Error} If the signature is missing or the major version is unsupported.
+ */
+function assertMagic(bytes: Uint8Array): void {
+  if (verifyMagic(bytes)) return;
+  const looksLikeFgb = bytes.length >= HEADER_MAGIC_SIZE &&
+    bytes[0] === 0x66 && bytes[1] === 0x67 && bytes[2] === 0x62 &&
+    bytes[4] === 0x66 && bytes[5] === 0x67 && bytes[6] === 0x62;
+  if (looksLikeFgb) {
+    throw new Error(
+      `Unsupported FlatGeobuf major version ${bytes[3]} (only ${SUPPORTED_MAJOR_VERSION}.x is supported)`,
+    );
+  }
+  throw new Error('Invalid FlatGeobuf magic bytes');
 }
 
 /**
@@ -72,38 +112,50 @@ export function verifyMagic(bytes: Uint8Array): boolean {
  * | 12  | description     | string             |
  * | 13  | metadata        | string             |
  *
+ * Absent fields take their schema defaults. FlatBuffers writers omit fields
+ * whose value equals the default, so this matters in practice: GDAL and the
+ * Go writer both leave out `index_node_size` when it is 16.
+ *
  * @param bytes - Raw file bytes, starting at byte 0 (must include the full
  *   magic + header).
  * @returns Parsed header containing geometry type, column schema, feature
  *   count, spatial index parameters, bounding box, and byte offsets.
- * @throws {Error} If the magic bytes are invalid.
+ * @throws {Error} If the magic bytes are invalid, the major version is
+ *   unsupported, the header is truncated or out of bounds, or the index
+ *   parameters are invalid.
  */
 export function parseHeader(bytes: Uint8Array): FgbHeader {
-  if (!verifyMagic(bytes)) {
-    throw new Error('Invalid FlatGeobuf magic bytes');
-  }
+  assertMagic(bytes);
 
-  // Header size (uint32, little-endian) at offset 8
-  const headerSizeView = new DataView(bytes.buffer, bytes.byteOffset + HEADER_MAGIC_SIZE, 4);
-  const headerFbSize = headerSizeView.getUint32(0, true);
+  const totalHeaderSize = headerByteSize(bytes);
+  if (bytes.length < totalHeaderSize) {
+    throw new Error(
+      `Truncated FlatGeobuf header: need ${totalHeaderSize} bytes, got ${bytes.length}`,
+    );
+  }
   const headerStart = HEADER_MAGIC_SIZE + 4; // offset where the flatbuffer data starts
-  const totalHeaderSize = headerStart + headerFbSize;
 
   // Parse the header FlatBuffer
   const fb = new FlatBufferReader(bytes.subarray(headerStart, totalHeaderSize));
   const rootOffset = fb.rootTableOffset();
 
-  // Geometry type (field 2)
+  // Geometry type (field 2, default Unknown)
   const geomTypeOff = fb.fieldOffset(rootOffset, 2);
   const geometryType: GeomType = geomTypeOff ? fb.readUint8(geomTypeOff) : GeomType.Unknown;
 
-  // Features count (field 8)
+  // Features count (field 8, default 0 = unknown)
   const fcOff = fb.fieldOffset(rootOffset, 8);
   const featuresCount = fcOff ? fb.readUint64AsNumber(fcOff) : 0;
+  if (!Number.isSafeInteger(featuresCount)) {
+    throw new Error(`Invalid FlatGeobuf header: features_count ${featuresCount} is out of range`);
+  }
 
-  // Index node size (field 9)
+  // Index node size (field 9, default 16; 0 = no index)
   const insOff = fb.fieldOffset(rootOffset, 9);
-  const indexNodeSize = insOff ? fb.readUint16(insOff) : 0;
+  const indexNodeSize = insOff ? fb.readUint16(insOff) : DEFAULT_INDEX_NODE_SIZE;
+  if (indexNodeSize === 1) {
+    throw new Error('Invalid FlatGeobuf header: index_node_size must be 0 or at least 2');
+  }
 
   // Envelope / bbox (field 1) — vector of doubles: [minX, minY, maxX, maxY]
   let bbox: BBox | null = null;
@@ -139,9 +191,12 @@ export function parseHeader(bytes: Uint8Array): FgbHeader {
   // Detect an ID column among the parsed columns
   const idColumnIndex = detectIdColumn(columns);
 
-  // Compute spatial index size and offsets
+  // Compute spatial index size and offsets. An index requires a known
+  // feature count; with features_count = 0 (unknown) there is none.
   const indexOffset = totalHeaderSize;
-  const indexSize = indexNodeSize > 0 ? calcIndexSize(featuresCount, indexNodeSize) : 0;
+  const indexSize = indexNodeSize > 0 && featuresCount > 0
+    ? calcTreeSize(featuresCount, indexNodeSize)
+    : 0;
   const featuresOffset = indexOffset + indexSize;
 
   return {
@@ -169,14 +224,21 @@ export function parseHeader(bytes: Uint8Array): FgbHeader {
  * @param bytes - At least the first 12 bytes of the FGB file.
  * @returns Total byte length occupied by the magic signature and the
  *   header FlatBuffer (i.e. `8 + 4 + headerFbSize`).
- * @throws {Error} If `bytes` contains fewer than 12 bytes.
+ * @throws {Error} If `bytes` contains fewer than 12 bytes, does not start
+ *   with supported magic bytes, or declares a header size outside
+ *   8 B..10 MiB.
  */
 export function headerByteSize(bytes: Uint8Array): number {
   if (bytes.length < HEADER_MAGIC_SIZE + 4) {
     throw new Error('Not enough bytes to read FGB header size');
   }
+  assertMagic(bytes);
   const view = new DataView(bytes.buffer, bytes.byteOffset + HEADER_MAGIC_SIZE, 4);
-  return HEADER_MAGIC_SIZE + 4 + view.getUint32(0, true);
+  const headerFbSize = view.getUint32(0, true);
+  if (headerFbSize < HEADER_MIN_SIZE || headerFbSize > HEADER_MAX_SIZE) {
+    throw new Error(`Invalid FlatGeobuf header size: ${headerFbSize} bytes`);
+  }
+  return HEADER_MAGIC_SIZE + 4 + headerFbSize;
 }
 
 // == ID column detection =====================================================
@@ -222,65 +284,42 @@ function detectIdColumn(columns: ColumnMeta[]): number {
 
 // == Column parsing =========================================================
 
+/** Highest {@link ColumnType} value defined by the FlatGeobuf 3.x schema. */
+const MAX_COLUMN_TYPE = ColumnType.Binary;
+
 /**
  * Parse a single Column table from the header FlatBuffer.
  *
- * Column FlatBuffer schema field indices:
- * - `0`: name (string)
- * - `1`: type (ubyte / `ColumnType` enum)
- * - `14`: nullable (bool)
+ * Column FlatBuffer schema field indices and defaults (`header.fbs`):
+ * - `0`: name (string, required)
+ * - `1`: type (ubyte / `ColumnType` enum, default `Byte` = 0)
+ * - `7`: nullable (bool, default `true`)
  *
  * @param fb - FlatBuffer reader positioned over the header buffer.
  * @param tablePos - Absolute byte offset of the Column table within the
  *   header FlatBuffer.
  * @returns Decoded column metadata.
+ * @throws {Error} If the column type is not defined by the specification
+ *   (its values could not be decoded, so the property stream would be
+ *   misread).
  */
 function parseColumn(fb: FlatBufferReader, tablePos: number): ColumnMeta {
   // Name (field 0)
   const nameOff = fb.fieldOffset(tablePos, 0);
   const name = nameOff ? fb.readString(fb.indirect(nameOff)) : '';
 
-  // Type (field 1)
+  // Type (field 1, default Byte)
   const typeOff = fb.fieldOffset(tablePos, 1);
-  const type: ColumnType = typeOff ? fb.readUint8(typeOff) : ColumnType.String;
+  const type: ColumnType = typeOff ? fb.readUint8(typeOff) : ColumnType.Byte;
+  if (type > MAX_COLUMN_TYPE) {
+    throw new Error(`Invalid FlatGeobuf header: column "${name}" has unknown type ${type}`);
+  }
 
-  // Nullable (field 14)
-  const nullOff = fb.fieldOffset(tablePos, 14);
+  // Nullable (field 7, default true)
+  const nullOff = fb.fieldOffset(tablePos, 7);
   const nullable = nullOff ? fb.readUint8(nullOff) !== 0 : true;
 
   return { name, type, nullable };
-}
-
-// == Index size calculation =================================================
-
-/**
- * Calculate the byte size of a packed Hilbert R-tree index.
- *
- * Each node occupies exactly 40 bytes: 4 x `float64` for the bounding box
- * (32 bytes) plus 1 x `uint64` for the offset (8 bytes).
- * The total size is the sum of nodes across all tree levels.
- *
- * @param featuresCount - Total number of features (leaf nodes).
- * @param nodeSize - Branching factor (max children per internal node).
- * @returns Total byte size of the packed R-tree, or `0` if there are no
- *   features or the node size is zero.
- */
-function calcIndexSize(featuresCount: number, nodeSize: number): number {
-  if (featuresCount === 0 || nodeSize === 0) return 0;
-
-  const NODE_ITEM_BYTE_SIZE = 40; // 4 * 8 (bbox doubles) + 8 (offset)
-  let n = featuresCount;
-  let totalNodes = n;
-
-  // Sum up all levels of the tree
-  while (n > 1) {
-    n = Math.ceil(n / nodeSize);
-    totalNodes += n;
-  }
-
-  // The packed r-tree is just raw nodes without its own header.
-  // The byte size is simply totalNodes * NODE_ITEM_BYTE_SIZE.
-  return totalNodes * NODE_ITEM_BYTE_SIZE;
 }
 
 /**

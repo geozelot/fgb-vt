@@ -154,6 +154,9 @@ export function buildMvtLayer(
       } else {
         xy = simplify(xy, sqTol);
         if (xy.length < 4 && !isPoint) continue; // degenerate
+        // A single ring/part needs no ends; any existing ends indexed the
+        // unsimplified coordinates and would now point past the array.
+        ends = null;
       }
     }
 
@@ -253,8 +256,10 @@ function buildTags(
 /**
  * Convert a decoded FGB property value to a typed {@link MvtValue}.
  *
- * Numeric values are classified as `uint` (non-negative integers), `int`
- * (negative integers), or `double` (fractional). Booleans map directly.
+ * Integers that are exactly representable (safe-integer `number`s and
+ * `bigint`s) are classified as `uint` (non-negative) or `int` (negative).
+ * Fractional numbers, and integral doubles beyond the safe range (which
+ * carry no exact integer value), become `double`. Booleans map directly.
  * All other types (including unexpected ones) are coerced to strings.
  *
  * @param value - Raw property value from the FGB feature.
@@ -268,13 +273,13 @@ function toMvtValue(value: PropertyValue): MvtValue {
     return { type: 'bool', value };
   }
   if (typeof value === 'number') {
-    if (Number.isInteger(value)) {
-      if (value >= 0) {
-        return { type: 'uint', value };
-      }
-      return { type: 'int', value };
+    if (Number.isSafeInteger(value)) {
+      return value >= 0 ? { type: 'uint', value } : { type: 'int', value };
     }
     return { type: 'double', value };
+  }
+  if (typeof value === 'bigint') {
+    return value >= 0n ? { type: 'uint', value } : { type: 'int', value };
   }
   return { type: 'string', value: String(value) };
 }

@@ -50,8 +50,8 @@ describe('signedArea', () => {
     const cw = [0, 0, 100, 0, 100, 100, 0, 100];
     const areaCW = signedArea(cw, 0, cw.length);
     expect(areaCW).not.toBe(0);
-    // In this shoelace formula, CW in screen coords (Y-down) gives negative
-    expect(areaCW).toBeLessThan(0);
+    // Surveyor's formula per the MVT spec: CW in screen coords (Y-down) is positive
+    expect(areaCW).toBeGreaterThan(0);
   });
 
   it('should give opposite signs for opposite windings', () => {

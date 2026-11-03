@@ -192,6 +192,11 @@ export class S3Connector implements Connector {
    *   invalid bucket/key, network errors, etc.).
    */
   async read(path: string, offset: number, length: number): Promise<Uint8Array> {
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 0) {
+      throw new RangeError(`Invalid byte range for ${path}: offset ${offset}, length ${length}`);
+    }
+    if (length === 0) return new Uint8Array(0);
+
     const { client, sdk } = await this.getClient();
     const { bucket, key } = parseS3Path(path);
     const end = offset + length - 1;
@@ -202,14 +207,22 @@ export class S3Connector implements Connector {
       Range: `bytes=${offset}-${end}`,
     });
 
-    const response = await client.send(command);
+    let response: any;
+    try {
+      response = await client.send(command);
+    } catch (err) {
+      // Range starting at or beyond the end of the object: nothing to read
+      if (isInvalidRange(err)) return new Uint8Array(0);
+      throw err;
+    }
     const body = response.Body;
 
     if (!body) {
       throw new Error(`Empty response body for ${path} [${offset}-${end}]`);
     }
 
-    return streamToUint8Array(body);
+    const bytes = await streamToUint8Array(body);
+    return bytes.length > length ? bytes.subarray(0, length) : bytes;
   }
 
   /**
@@ -334,6 +347,18 @@ export class S3Connector implements Connector {
       throw err;
     }
   }
+}
+
+/**
+ * Whether an SDK error means the requested range lies beyond the object
+ * (HTTP 416 / `InvalidRange`).
+ *
+ * @param err - Error thrown by `S3Client.send`.
+ * @returns `true` for range-not-satisfiable errors.
+ */
+function isInvalidRange(err: any): boolean {
+  return err?.name === 'InvalidRange' || err?.Code === 'InvalidRange' ||
+    err?.$metadata?.httpStatusCode === 416;
 }
 
 /**

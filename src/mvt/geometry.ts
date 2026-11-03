@@ -27,6 +27,7 @@
 
 import { MvtGeomType } from '../types.js';
 import { GeomType } from '../types.js';
+import { signedArea } from '../geometry/transform.js';
 
 const CMD_MOVE_TO = 1;
 const CMD_LINE_TO = 2;
@@ -165,8 +166,10 @@ function encodePoints(coords: Int32Array): number[] {
  * Encode one or more linestrings as an MVT command sequence.
  *
  * Each line segment begins with a `MoveTo(1)` for the first vertex,
- * followed by a `LineTo(n-1)` for the remaining vertices. Segments
- * with fewer than 2 vertices are skipped.
+ * followed by a `LineTo(n-1)` for the remaining vertices. Consecutive
+ * duplicate vertices (e.g. from rounding to integer tile coordinates) are
+ * dropped, because the MVT spec forbids zero-length `LineTo` parameters.
+ * Segments with fewer than 2 distinct vertices are skipped.
  *
  * @param coords - Flat interleaved tile coordinates.
  * @param ends - Ring/part end indices (pair counts), or `null` for a single linestring.
@@ -174,29 +177,10 @@ function encodePoints(coords: Int32Array): number[] {
  */
 function encodeLines(coords: Int32Array, ends: Uint32Array | null): number[] {
   const cmds: number[] = [];
-  let cx = 0, cy = 0;
+  const cursor = { x: 0, y: 0 };
 
-  const segments = getRingBounds(coords.length / 2, ends);
-
-  for (const [startPair, endPair] of segments) {
-    const numPairs = endPair - startPair;
-    if (numPairs < 2) continue;
-
-    // MoveTo(1) for the first point
-    const si = startPair * 2;
-    cmds.push(commandInt(CMD_MOVE_TO, 1));
-    cmds.push(zigzag(coords[si] - cx), zigzag(coords[si + 1] - cy));
-    cx = coords[si];
-    cy = coords[si + 1];
-
-    // LineTo(numPairs - 1) for the rest
-    cmds.push(commandInt(CMD_LINE_TO, numPairs - 1));
-    for (let i = startPair + 1; i < endPair; i++) {
-      const idx = i * 2;
-      cmds.push(zigzag(coords[idx] - cx), zigzag(coords[idx + 1] - cy));
-      cx = coords[idx];
-      cy = coords[idx + 1];
-    }
+  for (const [startPair, endPair] of getRingBounds(coords.length / 2, ends)) {
+    emitPath(cmds, cursor, coords, startPair, endPair, false);
   }
 
   return cmds;
@@ -207,10 +191,15 @@ function encodeLines(coords: Int32Array, ends: Uint32Array | null): number[] {
 /**
  * Encode one or more polygon rings as an MVT command sequence.
  *
- * Each ring emits `MoveTo(1)` for the first vertex, `LineTo(n)` for interior
- * vertices, and `ClosePath(1)` to implicitly close the ring. If the input
- * ring is explicitly closed (last vertex equals first), the redundant closing
- * vertex is omitted. Rings with fewer than 3 effective vertices are skipped.
+ * Each ring emits `MoveTo(1)` for the first vertex, `LineTo(n)` for the
+ * remaining vertices, and `ClosePath(1)` to implicitly close the ring. The
+ * explicit closing vertex and consecutive duplicate vertices are omitted.
+ *
+ * Rings are expected in MVT winding order (see {@link correctWinding}):
+ * positive signed area for exteriors, negative for holes. Rings with zero
+ * area (including those with fewer than 3 distinct vertices) are skipped,
+ * and so are holes whose exterior ring was skipped — otherwise a hole would
+ * open the polygon and decoders would infer the opposite winding convention.
  *
  * @param coords - Flat interleaved tile coordinates.
  * @param ends - Ring end indices (pair counts), or `null` for a single ring.
@@ -218,44 +207,86 @@ function encodeLines(coords: Int32Array, ends: Uint32Array | null): number[] {
  */
 function encodePolygons(coords: Int32Array, ends: Uint32Array | null): number[] {
   const cmds: number[] = [];
-  let cx = 0, cy = 0;
+  const cursor = { x: 0, y: 0 };
+  let exteriorOpen = false;
 
-  const rings = getRingBounds(coords.length / 2, ends);
-
-  for (const [startPair, endPair] of rings) {
-    const numPairs = endPair - startPair;
-    if (numPairs < 3) continue;
-
-    // For polygons, the last point should equal the first (closed ring).
-    // MVT uses ClosePath command instead, so we skip the closing point.
-    const si = startPair * 2;
-    const lastIdx = (endPair - 1) * 2;
-    const isClosed = coords[si] === coords[lastIdx] && coords[si + 1] === coords[lastIdx + 1];
-    const lineCount = isClosed ? numPairs - 2 : numPairs - 1;
-
-    if (lineCount < 2) continue;
-
-    // MoveTo(1) for the first point
-    cmds.push(commandInt(CMD_MOVE_TO, 1));
-    cmds.push(zigzag(coords[si] - cx), zigzag(coords[si + 1] - cy));
-    cx = coords[si];
-    cy = coords[si + 1];
-
-    // LineTo for interior points
-    cmds.push(commandInt(CMD_LINE_TO, lineCount));
-    const lineEnd = isClosed ? endPair - 1 : endPair;
-    for (let i = startPair + 1; i < lineEnd; i++) {
-      const idx = i * 2;
-      cmds.push(zigzag(coords[idx] - cx), zigzag(coords[idx + 1] - cy));
-      cx = coords[idx];
-      cy = coords[idx + 1];
+  for (const [startPair, ringEnd] of getRingBounds(coords.length / 2, ends)) {
+    // Drop the explicit closing vertex(es); ClosePath closes the ring
+    let endPair = ringEnd;
+    const sx = coords[startPair * 2], sy = coords[startPair * 2 + 1];
+    while (endPair - startPair > 1 &&
+           coords[(endPair - 1) * 2] === sx && coords[(endPair - 1) * 2 + 1] === sy) {
+      endPair--;
     }
 
-    // ClosePath(1)
-    cmds.push(commandInt(CMD_CLOSE_PATH, 1));
+    const area = signedArea(coords, startPair * 2, endPair * 2);
+    if (area === 0) continue;
+    if (area > 0) {
+      exteriorOpen = true;
+    } else if (!exteriorOpen) {
+      continue; // hole without an emitted exterior
+    }
+
+    emitPath(cmds, cursor, coords, startPair, endPair, true);
   }
 
   return cmds;
+}
+
+/**
+ * Emit `MoveTo(1)`, `LineTo(n)` and optionally `ClosePath` for one path in
+ * a single pass, skipping consecutive duplicate vertices.
+ *
+ * The `LineTo` count is patched in after the vertices are written. A path
+ * left with too few distinct vertices (fewer than 2 for lines, 3 for rings)
+ * is rolled back entirely, restoring `cmds` and `cursor`.
+ *
+ * @param cmds - Command array to append to.
+ * @param cursor - Running cursor shared across all paths of the feature.
+ * @param coords - Flat interleaved tile coordinates.
+ * @param startPair - First pair index (inclusive).
+ * @param endPair - Last pair index (exclusive).
+ * @param close - Whether this is a polygon ring (appends `ClosePath(1)`).
+ */
+function emitPath(
+  cmds: number[],
+  cursor: { x: number; y: number },
+  coords: Int32Array,
+  startPair: number,
+  endPair: number,
+  close: boolean,
+): void {
+  if (endPair <= startPair) return;
+  const rollbackLength = cmds.length;
+  const rollbackX = cursor.x, rollbackY = cursor.y;
+
+  const si = startPair * 2;
+  let x = coords[si], y = coords[si + 1];
+  cmds.push(commandInt(CMD_MOVE_TO, 1), zigzag(x - cursor.x), zigzag(y - cursor.y));
+
+  const lineToIndex = cmds.length;
+  cmds.push(0); // LineTo command, patched below
+  let lineCount = 0;
+  for (let i = startPair + 1; i < endPair; i++) {
+    const nx = coords[i * 2], ny = coords[i * 2 + 1];
+    if (nx === x && ny === y) continue;
+    cmds.push(zigzag(nx - x), zigzag(ny - y));
+    x = nx;
+    y = ny;
+    lineCount++;
+  }
+
+  if (lineCount < (close ? 2 : 1)) {
+    cmds.length = rollbackLength;
+    cursor.x = rollbackX;
+    cursor.y = rollbackY;
+    return;
+  }
+
+  cmds[lineToIndex] = commandInt(CMD_LINE_TO, lineCount);
+  if (close) cmds.push(commandInt(CMD_CLOSE_PATH, 1));
+  cursor.x = x;
+  cursor.y = y;
 }
 
 // == Helpers ================================================================
@@ -288,11 +319,12 @@ function getRingBounds(totalPairs: number, ends: Uint32Array | null): Array<[num
   const bounds: Array<[number, number]> = [];
   let start = 0;
   for (let i = 0; i < ends.length; i++) {
-    const end = ends[i];
+    // Clamp defensively: never index past the coordinate array
+    const end = Math.min(ends[i], totalPairs);
     if (end > start) {
       bounds.push([start, end]);
     }
-    start = end;
+    start = Math.max(start, end);
   }
   return bounds;
 }

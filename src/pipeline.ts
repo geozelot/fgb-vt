@@ -38,10 +38,10 @@ import { resolveOptions } from './source.js';
 import type { FgbHeader, MvtLayer, BBox, RawFeature } from './types.js';
 import { parseHeader, headerByteSize, INITIAL_HEADER_READ_SIZE } from './fgb/header.js';
 import { queryIndex, computeLevelBounds } from './fgb/index.js';
-import { decodeFeatures } from './fgb/feature.js';
+import { decodeFeatureChunk } from './fgb/feature.js';
 import { buildMvtLayer } from './mvt/layer.js';
 import { encodePbf } from './pbf/encode.js';
-import { TileBoundsCache } from './tiles.js';
+import { TileBoundsCache, mercatorToWgs84BBox } from './tiles.js';
 
 /**
  * Cached FGB metadata for a single source path.
@@ -81,7 +81,8 @@ export interface FgbCache {
  * @param z - Tile zoom level.
  * @param x - Tile column.
  * @param y - Tile row.
- * @param wgs84BBox - WGS84 bounding box of the tile, used for the spatial index query.
+ * @param wgs84BBox - WGS84 query box for the spatial index: the tile plus its
+ *   buffer, so features in the buffer zone are found.
  * @param clipBounds - Mercator clip bounds (with buffer) for geometry clipping.
  * @param tileOpts - Fully resolved tiling options (extent, buffer, tolerance, zoom range).
  * @param cache - Optional pre-cached header and spatial index bytes; when provided,
@@ -142,10 +143,21 @@ export async function processSource(
   // Read feature data
   const featureChunks = await connector.readRanges(source.path, ranges);
 
-  // Decode features from all chunks
+  // Decode features from all chunks. The index cannot tell the length of
+  // the last feature in the file, so its range is an estimate; when the
+  // feature turns out longer, re-read it exactly using its size prefix.
   const allFeatures: RawFeature[] = [];
-  for (const chunk of featureChunks) {
-    const features = decodeFeatures(chunk, header);
+  const rereads: Array<Promise<RawFeature[]>> = [];
+  for (let c = 0; c < featureChunks.length; c++) {
+    const { features, truncatedAt, truncatedLength } = decodeFeatureChunk(featureChunks[c], header);
+    for (let i = 0; i < features.length; i++) {
+      allFeatures.push(features[i]);
+    }
+    if (truncatedAt >= 0) {
+      rereads.push(readWholeFeature(connector, source.path, ranges[c].offset + truncatedAt, truncatedLength, header));
+    }
+  }
+  for (const features of await Promise.all(rereads)) {
     for (let i = 0; i < features.length; i++) {
       allFeatures.push(features[i]);
     }
@@ -227,18 +239,17 @@ export async function processTileLayers(
   boundsCache: TileBoundsCache,
   fgbCaches?: Map<string, FgbCache>,
 ): Promise<MvtLayer[]> {
-  // Compute tile bounds (cached)
-  const wgs84BBox = boundsCache.getWgs84(z, x, y);
-
-  // Process all sources concurrently
+  // Process all sources concurrently. The index is queried with the
+  // buffered tile box so that features in the buffer zone are included.
   const layerPromises = sources.map(source => {
     const opts = resolveOptions(source.options, tileOptions);
     const clipBounds = boundsCache.getClip(z, x, y, opts.buffer, opts.extent);
+    const queryBBox = mercatorToWgs84BBox(clipBounds);
     const cache = fgbCaches?.get(source.path);
 
     return processSource(
       connector, source, z, x, y,
-      wgs84BBox, clipBounds, opts, cache,
+      queryBBox, clipBounds, opts, cache,
     );
   });
 
@@ -288,20 +299,19 @@ export async function processMultiConnectorTile(
   boundsCache: TileBoundsCache,
   fgbCaches?: Map<string, FgbCache>,
 ): Promise<Uint8Array> {
-  const wgs84BBox = boundsCache.getWgs84(z, x, y);
-
   const allLayerPromises: Promise<MvtLayer>[] = [];
 
   for (const group of groups) {
     for (const source of group.sources) {
       const opts = resolveOptions(source.options, tileOptions);
       const clipBounds = boundsCache.getClip(z, x, y, opts.buffer, opts.extent);
+      const queryBBox = mercatorToWgs84BBox(clipBounds);
       const cache = fgbCaches?.get(source.path);
 
       allLayerPromises.push(
         processSource(
           group.connector, source, z, x, y,
-          wgs84BBox, clipBounds, opts, cache,
+          queryBBox, clipBounds, opts, cache,
         ),
       );
     }
@@ -357,6 +367,11 @@ export async function readHeader(
   let indexBytes: Uint8Array;
   if (header.indexSize > 0) {
     indexBytes = await connector.read(path, header.indexOffset, header.indexSize);
+    if (indexBytes.length < header.indexSize) {
+      throw new Error(
+        `Truncated FlatGeobuf index in ${path}: expected ${header.indexSize} bytes, got ${indexBytes.length}`,
+      );
+    }
   } else {
     indexBytes = new Uint8Array(0);
   }
@@ -370,6 +385,35 @@ export async function readHeader(
 }
 
 // == Helpers ================================================================
+
+/**
+ * Read and decode one feature whose exact extent is known from its size
+ * prefix.
+ *
+ * @param connector - Connector to read from.
+ * @param path - Connector-specific path to the FGB file.
+ * @param offset - Absolute file offset of the feature's size prefix.
+ * @param length - Feature length including the 4-byte size prefix.
+ * @param header - Parsed FGB header.
+ * @returns The decoded feature (empty if its geometry is unusable).
+ * @throws {Error} If the file ends before the feature does.
+ */
+async function readWholeFeature(
+  connector: Connector,
+  path: string,
+  offset: number,
+  length: number,
+  header: FgbHeader,
+): Promise<RawFeature[]> {
+  const bytes = await connector.read(path, offset, length);
+  const { features, truncatedAt } = decodeFeatureChunk(bytes, header);
+  if (truncatedAt >= 0 || bytes.length < length) {
+    throw new Error(
+      `Truncated FlatGeobuf feature in ${path} at byte ${offset}: expected ${length} bytes, got ${bytes.length}`,
+    );
+  }
+  return features;
+}
 
 /**
  * Compute R-tree level bounds from the header when not supplied via cache.

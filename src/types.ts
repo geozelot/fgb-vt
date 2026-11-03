@@ -75,9 +75,11 @@ export interface BBox {
  *
  * Maps to the FlatGeobuf column types: numeric types → `number`,
  * string/json/datetime → `string`, bool → `boolean`, binary → `Uint8Array`.
- * Nullable columns may produce `null`.
+ * 64-bit integers (`Long`/`ULong`) outside the safe-integer range decode to
+ * `bigint` so they survive to the tile exactly. Nullable columns may
+ * produce `null`.
  */
-export type PropertyValue = string | number | boolean | Uint8Array | null;
+export type PropertyValue = string | number | bigint | boolean | Uint8Array | null;
 
 /**
  * A decoded FlatGeobuf feature with flat coordinate arrays.
@@ -121,8 +123,11 @@ export interface RawFeature {
   parts: Uint32Array | null;
   /** Decoded property key-value pairs. */
   properties: Map<string, PropertyValue>;
-  /** FGB feature ID, or `null` if the feature has no ID. */
-  id: number | null;
+  /**
+   * Feature ID taken from the detected ID column: a non-negative safe
+   * integer or a non-negative `bigint` (MVT ids are `uint64`), or `null`.
+   */
+  id: number | bigint | null;
 }
 
 // == FGB Column Schema ======================================================
@@ -215,16 +220,16 @@ export interface FgbHeader {
 export type MvtValue =
   | { type: 'string'; value: string }
   | { type: 'double'; value: number }
-  | { type: 'int'; value: number }
-  | { type: 'uint'; value: number }
+  | { type: 'int'; value: number | bigint }
+  | { type: 'uint'; value: number | bigint }
   | { type: 'bool'; value: boolean };
 
 /**
  * A single feature within an MVT layer, ready for PBF encoding.
  */
 export interface MvtFeature {
-  /** Feature ID, or `null` if absent. Written as `uint64` in the PBF. */
-  id: number | null;
+  /** Feature ID (non-negative), or `null` if absent. Written as `uint64` in the PBF. */
+  id: number | bigint | null;
   /** MVT geometry type (POINT, LINESTRING, or POLYGON). */
   type: MvtGeomType;
   /** Command-encoded geometry integers per the MVT 2.1 spec. */

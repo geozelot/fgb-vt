@@ -53,19 +53,77 @@ const textDecoder = new TextDecoder();
 const propResult: { value: PropertyValue; bytesRead: number } = { value: null, bytesRead: 0 };
 
 /**
- * Decode all features from a contiguous byte buffer that may contain one or
- * more length-prefixed feature FlatBuffers.
+ * Result of decoding a buffer of length-prefixed features.
+ */
+export interface FeatureChunk {
+  /** Features decoded completely from the buffer. */
+  features: RawFeature[];
+  /**
+   * Byte offset (within the buffer) of a feature whose size prefix says it
+   * extends past the end of the buffer, or `-1` if the buffer ended on a
+   * feature boundary. The caller can re-read `truncatedLength` bytes from
+   * here to obtain the complete feature.
+   */
+  truncatedAt: number;
+  /** Full byte length of the truncated feature, including its 4-byte size prefix. */
+  truncatedLength: number;
+}
+
+/**
+ * Decode features from a contiguous byte buffer that may contain one or
+ * more length-prefixed feature FlatBuffers, reporting a trailing feature
+ * that was cut off by the end of the buffer.
  *
  * The decoder walks the buffer sequentially, reading `uint32` size prefixes
  * to delimit individual features. Decoding stops when the buffer is
- * exhausted, a zero-length prefix is encountered, or `maxFeatures` have
- * been decoded.
+ * exhausted, a zero-length prefix is encountered, or a feature extends past
+ * the end of the buffer.
  *
  * @param bytes - Contiguous buffer of one or more length-prefixed feature
  *   FlatBuffers.
  * @param header - Parsed FGB header providing the geometry type and column
  *   schema needed for decoding.
- * @param maxFeatures - Upper limit on the number of features to decode.
+ * @returns Decoded features and the position of a truncated trailing
+ *   feature, if any.
+ */
+export function decodeFeatureChunk(bytes: Uint8Array, header: FgbHeader): FeatureChunk {
+  const features: RawFeature[] = [];
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let offset = 0;
+
+  while (offset + 4 <= bytes.length) {
+    // Read feature size prefix (uint32 LE)
+    const featureSize = view.getUint32(offset, true);
+    if (featureSize === 0) break;
+
+    if (offset + 4 + featureSize > bytes.length) {
+      return { features, truncatedAt: offset, truncatedLength: 4 + featureSize };
+    }
+
+    const featureBytes = bytes.subarray(offset + 4, offset + 4 + featureSize);
+    const feature = decodeSingleFeature(featureBytes, header);
+    if (feature) {
+      features.push(feature);
+    }
+
+    offset += 4 + featureSize;
+  }
+
+  return { features, truncatedAt: -1, truncatedLength: 0 };
+}
+
+/**
+ * Decode all complete features from a contiguous byte buffer that may
+ * contain one or more length-prefixed feature FlatBuffers.
+ *
+ * A trailing feature cut off by the end of the buffer is ignored; use
+ * {@link decodeFeatureChunk} to detect and re-read it.
+ *
+ * @param bytes - Contiguous buffer of one or more length-prefixed feature
+ *   FlatBuffers.
+ * @param header - Parsed FGB header providing the geometry type and column
+ *   schema needed for decoding.
+ * @param maxFeatures - Upper limit on the number of features to return.
  *   Defaults to `Infinity` (decode all).
  * @returns Array of decoded {@link RawFeature} objects.
  */
@@ -74,30 +132,8 @@ export function decodeFeatures(
   header: FgbHeader,
   maxFeatures: number = Infinity,
 ): RawFeature[] {
-  const features: RawFeature[] = [];
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  let offset = 0;
-
-  while (offset < bytes.length && features.length < maxFeatures) {
-    if (offset + 4 > bytes.length) break;
-
-    // Read feature size prefix (uint32 LE)
-    const featureSize = view.getUint32(offset, true);
-    if (featureSize === 0) break;
-
-    offset += 4;
-    if (offset + featureSize > bytes.length) break;
-
-    const featureBytes = bytes.subarray(offset, offset + featureSize);
-    const feature = decodeSingleFeature(featureBytes, header);
-    if (feature) {
-      features.push(feature);
-    }
-
-    offset += featureSize;
-  }
-
-  return features;
+  const { features } = decodeFeatureChunk(bytes, header);
+  return features.length > maxFeatures ? features.slice(0, maxFeatures) : features;
 }
 
 /**
@@ -134,12 +170,15 @@ function decodeSingleFeature(
     ? decodeProperties(fb, fb.indirect(propsFieldOff), header.columns)
     : new Map<string, PropertyValue>();
 
-  // Extract feature ID from a detected ID column (if any)
-  let id: number | null = null;
+  // Extract feature ID from a detected ID column (if any). MVT ids are
+  // uint64, so only non-negative integers qualify; anything else stays a
+  // regular property rather than being mangled.
+  let id: number | bigint | null = null;
   if (header.idColumnIndex >= 0) {
     const idCol = header.columns[header.idColumnIndex];
     const rawId = properties.get(idCol.name);
-    if (typeof rawId === 'number') {
+    if ((typeof rawId === 'number' && Number.isSafeInteger(rawId) && rawId >= 0) ||
+        (typeof rawId === 'bigint' && rawId >= 0n)) {
       id = rawId;
       properties.delete(idCol.name);
     }
@@ -212,6 +251,8 @@ function decodeGeometry(
     const xyVecOffset = fb.indirect(xyFieldOff);
     const xyLen = fb.vectorLen(xyVecOffset);
     if (xyLen > 0) {
+      // Coordinates come in (x, y) pairs
+      if (xyLen % 2 !== 0) return null;
       const xyDataStart = fb.vectorStart(xyVecOffset);
       const xy = fb.readFloat64Array(xyDataStart, xyLen);
 
@@ -224,6 +265,7 @@ function decodeGeometry(
         if (endsLen > 0) {
           const endsDataStart = fb.vectorStart(endsVecOffset);
           ends = fb.readUint32Array(endsDataStart, endsLen);
+          if (!validEnds(ends, xyLen / 2)) return null;
         }
       }
 
@@ -299,6 +341,26 @@ function decodeGeometry(
     : null;
 
   return { type, xy, ends, parts };
+}
+
+/**
+ * Check that ring/part end indices are strictly increasing and that the
+ * last one covers exactly the coordinate pairs present.
+ *
+ * Every downstream stage indexes coordinates through `ends`, so malformed
+ * values would otherwise read out of bounds.
+ *
+ * @param ends - End indices in coordinate pairs.
+ * @param pairCount - Number of coordinate pairs in `xy`.
+ * @returns `true` when `ends` is consistent with `pairCount`.
+ */
+function validEnds(ends: Uint32Array, pairCount: number): boolean {
+  let prev = 0;
+  for (let i = 0; i < ends.length; i++) {
+    if (ends[i] <= prev) return false;
+    prev = ends[i];
+  }
+  return prev === pairCount;
 }
 
 // == Properties decoding ====================================================
@@ -420,9 +482,11 @@ function readPropertyValue(
       return;
 
     case ColumnType.Long: {
+      // number when exactly representable, bigint otherwise
       const lo = view.getUint32(offset, true);
       const hi = view.getInt32(offset + 4, true);
-      propResult.value = hi * 0x100000000 + lo;
+      const n = hi * 0x100000000 + lo;
+      propResult.value = Number.isSafeInteger(n) ? n : view.getBigInt64(offset, true);
       propResult.bytesRead = 8;
       return;
     }
@@ -430,7 +494,8 @@ function readPropertyValue(
     case ColumnType.ULong: {
       const lo = view.getUint32(offset, true);
       const hi = view.getUint32(offset + 4, true);
-      propResult.value = hi * 0x100000000 + lo;
+      const n = hi * 0x100000000 + lo;
+      propResult.value = Number.isSafeInteger(n) ? n : view.getBigUint64(offset, true);
       propResult.bytesRead = 8;
       return;
     }
