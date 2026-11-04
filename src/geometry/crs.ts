@@ -74,6 +74,13 @@ export interface CoordinateFrame {
   toMercator(xy: Float64Array): void;
   /** WGS 84 box covering a box in source coordinates. */
   toWgs84BBox(bbox: BBox): BBox;
+  /**
+   * Mercator x of a source x coordinate, without wrapping or clamping
+   * (beyond [0, 1] for longitudes outside ±180°). Defined only for frames
+   * whose x axis is longitude-like, which enables world copies at the
+   * antimeridian.
+   */
+  mercatorX?(x: number): number;
 }
 
 /** Equatorial radius of the WGS 84 ellipsoid, the Web Mercator sphere radius. */
@@ -93,6 +100,7 @@ export const LONLAT_FRAME: CoordinateFrame = {
   queryBBox: mercatorToWgs84BBox,
   toMercator: projectToMercator,
   toWgs84BBox: clampWgs84,
+  mercatorX: projectX,
 };
 
 /** Web Mercator (EPSG:3857) metres. */
@@ -117,6 +125,9 @@ export const WEB_MERCATOR_FRAME: CoordinateFrame = {
     const lon = (x: number) => (x / EARTH_RADIUS) * (180 / Math.PI);
     const lat = (y: number) => Math.atan(Math.sinh(y / EARTH_RADIUS)) * (180 / Math.PI);
     return clampWgs84({ minX: lon(b.minX), minY: lat(b.minY), maxX: lon(b.maxX), maxY: lat(b.maxY) });
+  },
+  mercatorX(x) {
+    return x / CIRCUMFERENCE + 0.5;
   },
 };
 

@@ -37,8 +37,8 @@ import type { Connector } from './connectors/connector.js';
 import type { Source, TileOptions } from './source.js';
 import { resolveOptions, DEFAULT_TILE_OPTIONS } from './source.js';
 import type { MvtLayer, BBox, RawFeature } from './types.js';
-import { getSource, invalidateSource, type IoContext } from './fgb/reader.js';
-import { buildMvtLayer } from './mvt/layer.js';
+import { getSource, invalidateSource, type FgbSource, type IoContext } from './fgb/reader.js';
+import { buildMvtLayer, mergeLayers } from './mvt/layer.js';
 import { encodePbf } from './pbf/encode.js';
 import { tileClipBounds, validateTile } from './tiles.js';
 import { resolveFrame, type CoordinateFrame } from './geometry/crs.js';
@@ -150,47 +150,51 @@ export async function processSource(
   // Query with the buffered tile box, so features in the buffer zone are read
   const clipBounds = tileClipBounds(z, x, y, tileOpts.buffer, tileOpts.extent);
 
-  let read: { features: RawFeature[]; frame: CoordinateFrame };
+  let features: RawFeature[];
   try {
-    read = await readSourceFeatures(connector, source, clipBounds, tileOpts, context, signal, stats);
+    features = await readSourceFeatures(connector, source, clipBounds, tileOpts, context, signal, stats);
   } catch (err) {
     throw withPath(err, source.path);
   }
   signal?.throwIfAborted();
-  if (stats) stats.featuresRead = read.features.length;
+  if (stats) stats.featuresRead = features.length;
 
-  if (read.features.length === 0) {
+  if (features.length === 0) {
     return emptyLayer(source.name, tileOpts.extent);
   }
 
-  // Build MVT layer (includes project → clip → simplify → transform → encode)
+  // Build MVT layer (clip → simplify → transform → encode; already in mercator)
   const layer = buildMvtLayer(
-    read.features,
+    features,
     source.name,
     z, x, y,
     clipBounds,
     tileOpts.extent,
     tileOpts.tolerance,
-    read.frame.toMercator,
+    inMercator,
+    { simplifyBeforeClip: tileOpts.simplifyBeforeClip, pointGrid: tileOpts.pointGrid },
   );
   if (stats) stats.featuresEncoded = layer.features.length;
   return layer;
 }
 
 /**
- * Read the features of one source intersecting a tile's clip box. If the
- * file changed since its header was cached, forget the cached state and
- * retry once.
+ * Read the features of one source reaching a tile's clip box, converted to
+ * mercator [0, 1] space. If the file changed since its header was cached,
+ * forget the cached state and retry once.
+ *
+ * At the antimeridian, features from the other side of the world that
+ * reach into the tile's buffer (or data stored with longitudes beyond
+ * ±180°) are added as world copies, shifted by ±1 in mercator x.
  *
  * @param connector - Connector to read through.
- * @param source - Source descriptor (path and CRS setting).
+ * @param source - Source descriptor (path, CRS and schema settings).
  * @param clipBounds - Buffered tile box in mercator [0, 1] space.
  * @param tileOpts - Resolved options (extent, buffer and budgets).
  * @param context - I/O settings.
  * @param signal - Optional abort signal.
  * @param stats - Receives read counts, when given.
- * @returns Decoded features in source coordinates, and the frame that
- *   converts them.
+ * @returns Features in mercator space.
  * @throws {UnsupportedFormatError} If the source CRS is not supported.
  * @throws {RangeError} If the source's `idColumn` does not fit the file.
  */
@@ -202,26 +206,52 @@ async function readSourceFeatures(
   context: IoContext,
   signal: AbortSignal | undefined,
   stats: SourceStats | undefined,
-): Promise<{ features: RawFeature[]; frame: CoordinateFrame }> {
+): Promise<RawFeature[]> {
   const schema = featureSchema(source);
   for (let attempt = 0; ; attempt++) {
     try {
       const fgb = await getSource(connector, source.path, context, signal);
       const frame = resolveFrame(fgb.header.crs, source.crs, source.path);
       validateSchema(schema, fgb.header, source.path);
-      const query = frame.queryBBox(clipBounds);
-      const features = await fgb.readFeatures(query, {
-        coalesceGap: context.coalesceGap,
-        maxScanBytes: context.maxScanBytes,
-        maxFeatureBytes: context.maxFeatureBytes,
-        maxFeatures: tileOpts.maxFeatures,
-        maxReadBytes: tileOpts.maxReadBytes,
-        curveTolerance: unitsPerTileUnit(query, tileOpts) * CURVE_TOLERANCE,
-        schema,
-        stats,
-        signal,
-      });
-      return { features, frame };
+
+      const read = (clip: BBox) => {
+        const query = frame.queryBBox(clip);
+        return fgb.readFeatures(query, {
+          coalesceGap: context.coalesceGap,
+          maxScanBytes: context.maxScanBytes,
+          maxFeatureBytes: context.maxFeatureBytes,
+          maxFeatures: tileOpts.maxFeatures,
+          maxReadBytes: tileOpts.maxReadBytes,
+          curveTolerance: unitsPerTileUnit(query, tileOpts) * CURVE_TOLERANCE,
+          schema,
+          stats,
+          signal,
+        });
+      };
+
+      const features = await read(clipBounds);
+      for (const f of features) frame.toMercator(f.xy);
+      const shifts = frame.mercatorX ? await worldShifts(fgb, frame, clipBounds, signal) : [];
+      if (shifts.length === 0) return features;
+
+      const out = [...features];
+      if (!fgb.hasIndex) {
+        // A scan already returned every feature: copy those reaching the tile
+        for (const shift of shifts) {
+          for (const f of features) {
+            if (reachesX(f.xy, shift, clipBounds)) out.push(shifted(f, f.xy.slice(), shift));
+          }
+        }
+        return out;
+      }
+      for (const shift of shifts) {
+        const copies = await read({ ...clipBounds, minX: clipBounds.minX - shift, maxX: clipBounds.maxX - shift });
+        for (const f of copies) {
+          frame.toMercator(f.xy);
+          out.push(shifted(f, f.xy, shift));
+        }
+      }
+      return out;
     } catch (err) {
       if (err instanceof SourceChangedError && attempt === 0) {
         await invalidateSource(connector, source.path, context);
@@ -230,6 +260,55 @@ async function readSourceFeatures(
       throw err;
     }
   }
+}
+
+/**
+ * World offsets (in mercator x) whose copies of the data reach the clip
+ * box: `-1` brings data east of the antimeridian (x ≥ 1 − buffer) into a
+ * tile at the west edge, `+1` data west of it into a tile at the east edge.
+ *
+ * @param fgb - Opened source.
+ * @param frame - Its coordinate frame (with `mercatorX`).
+ * @param clip - Buffered tile box in mercator space.
+ * @param signal - Optional abort signal for reading the data extent.
+ * @returns Offsets other than 0 to query; empty when none applies.
+ */
+async function worldShifts(
+  fgb: FgbSource,
+  frame: CoordinateFrame,
+  clip: BBox,
+  signal: AbortSignal | undefined,
+): Promise<number[]> {
+  // Only tiles near the world edge, or data beyond ±180°, need copies
+  if (clip.minX > 0 && clip.maxX < 1 && fgb.header.bbox &&
+      frame.mercatorX!(fgb.header.bbox.minX) >= 0 && frame.mercatorX!(fgb.header.bbox.maxX) <= 1) {
+    return [];
+  }
+  const bounds = await fgb.bounds(signal);
+  const dataMin = bounds ? frame.mercatorX!(bounds.minX) : 0;
+  const dataMax = bounds ? frame.mercatorX!(bounds.maxX) : 1;
+  const shifts: number[] = [];
+  for (const shift of [-1, 1]) {
+    // Copies shifted by `shift` come from data at [clip.minX - shift, clip.maxX - shift]
+    if (clip.minX - shift <= dataMax && clip.maxX - shift >= dataMin) shifts.push(shift);
+  }
+  return shifts;
+}
+
+/** Whether a feature moved by `shift` overlaps the clip box horizontally. */
+function reachesX(xy: Float64Array, shift: number, clip: BBox): boolean {
+  let min = Infinity, max = -Infinity;
+  for (let i = 0; i < xy.length; i += 2) {
+    if (xy[i] < min) min = xy[i];
+    if (xy[i] > max) max = xy[i];
+  }
+  return min + shift <= clip.maxX && max + shift >= clip.minX;
+}
+
+/** A copy of `feature` with coordinates `xy` moved by `shift` in x (in place). */
+function shifted(feature: RawFeature, xy: Float64Array, shift: number): RawFeature {
+  for (let i = 0; i < xy.length; i += 2) xy[i] += shift;
+  return { ...feature, xy };
 }
 
 /**
@@ -428,14 +507,18 @@ async function renderTile(
   return pbf;
 }
 
+/** Coordinate conversion for features already in mercator space. */
+function inMercator(): void {}
+
 /** Monotonic clock in milliseconds. */
 function now(): number {
   return performance.now();
 }
 
 /**
- * Encode layers into a PBF tile, leaving out empty layers when
- * `omitEmptyLayers` is set, and enforce `maxTileBytes`.
+ * Encode layers into a PBF tile, merging layers of sources that share a
+ * name, leaving out empty layers when `omitEmptyLayers` is set, and
+ * enforce `maxTileBytes`.
  *
  * @param layers - Layers to encode.
  * @param z - Tile zoom level (for the error message).
@@ -445,6 +528,7 @@ function now(): number {
  *   `omitEmptyLayers`.
  * @returns The encoded tile (zero bytes when every layer was left out).
  * @throws {LimitExceededError} If the tile is larger than `maxTileBytes`.
+ * @throws {RangeError} If sources sharing a name use different extents.
  */
 function encodeChecked(
   layers: MvtLayer[],
@@ -452,7 +536,8 @@ function encodeChecked(
   tileOptions: TileOptions | undefined,
 ): Uint8Array {
   const omitEmpty = tileOptions?.omitEmptyLayers ?? DEFAULT_TILE_OPTIONS.omitEmptyLayers;
-  const pbf = encodePbf(omitEmpty ? layers.filter(l => l.features.length > 0) : layers);
+  const merged = mergeLayers(layers);
+  const pbf = encodePbf(omitEmpty ? merged.filter(l => l.features.length > 0) : merged);
   const max = tileOptions?.maxTileBytes ?? DEFAULT_TILE_OPTIONS.maxTileBytes;
   if (pbf.length > max) {
     throw new LimitExceededError(

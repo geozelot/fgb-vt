@@ -245,3 +245,13 @@ for epsg in (3857, 4087):
     subprocess.run(["ogr2ogr", "-f", "FlatGeobuf", out, os.path.join(HERE, "points.fgb"),
                     "-t_srs", f"EPSG:{epsg}", "-nln", f"points-{epsg}"], check=True)
     print(f"wrote points-{epsg}.fgb ({os.path.getsize(out)} bytes)")
+
+# Data at the antimeridian: points either side, and a polygon and a line
+# stored with longitudes beyond 180 (as recommended over naive wrapping).
+write("antimeridian.fgb", fc([
+    feature({"id": 1, "kind": "east"}, {"type": "Point", "coordinates": [179.9, 10]}),
+    feature({"id": 2, "kind": "west"}, {"type": "Point", "coordinates": [-179.9, 10]}),
+    feature({"id": 3, "kind": "beyond"}, {"type": "Polygon", "coordinates": [
+        [[170, -10], [190, -10], [190, -5], [170, -5], [170, -10]]]}),
+    feature({"id": 4, "kind": "line"}, {"type": "LineString", "coordinates": [[175, 20], [185, 20]]}),
+]))

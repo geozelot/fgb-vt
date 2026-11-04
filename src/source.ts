@@ -55,6 +55,21 @@ export interface SourceOptions {
    * exceeding it raises `LimitExceededError`. @defaultValue 268435456 (256 MiB)
    */
   maxReadBytes?: number;
+  /**
+   * Simplify each feature as a whole before clipping it, so that adjacent
+   * tiles get identical vertices along the tile edges (no gaps or overlaps
+   * where a line or outline crosses a tile boundary). Costs the full
+   * simplification of every feature reaching a tile, however little of it
+   * is visible. @defaultValue false
+   */
+  simplifyBeforeClip?: boolean;
+  /**
+   * Keep at most one point per cell of this size, in tile units (`0`
+   * disables thinning); the first point in file order wins. Bounds the
+   * size of dense point layers at low zooms. Choose a divisor of `extent`
+   * so that cells line up across tiles. @defaultValue 0
+   */
+  pointGrid?: number;
 }
 
 /**
@@ -70,7 +85,11 @@ export interface SourceOptions {
  * | `S3Connector` | S3 URI (`s3://bucket/key.fgb`) |
  */
 export interface Source {
-  /** Layer name in the output MVT. Must be unique within a tile request. */
+  /**
+   * Layer name in the output MVT. Sources sharing a name are merged into
+   * one layer, e.g. an overview file for low zooms and a detailed file for
+   * high zooms, or one dataset split into several files.
+   */
   name: string;
   /** Path to the FGB file, interpreted by the Connector. */
   path: string;
@@ -126,6 +145,10 @@ export interface TileOptions {
   maxFeatures?: number;
   /** Default per-source limit on feature bytes read per tile. @defaultValue 268435456 (256 MiB) */
   maxReadBytes?: number;
+  /** Default for simplifying whole features before clipping. @defaultValue false */
+  simplifyBeforeClip?: boolean;
+  /** Default point thinning cell size in tile units (`0`: off). @defaultValue 0 */
+  pointGrid?: number;
   /**
    * Largest encoded tile, in bytes; larger tiles raise `LimitExceededError`
    * (e.g. to stay below a response size limit). Applies to the whole tile,
@@ -154,6 +177,8 @@ export const DEFAULT_TILE_OPTIONS: Required<TileOptions> = {
   minZoom: 0,
   maxFeatures: Infinity,
   maxReadBytes: 256 * 1024 * 1024,
+  simplifyBeforeClip: false,
+  pointGrid: 0,
   maxTileBytes: Infinity,
   omitEmptyLayers: false,
 };
@@ -187,6 +212,8 @@ export function resolveOptions(
     minZoom: source?.minZoom ?? tile?.minZoom ?? DEFAULT_TILE_OPTIONS.minZoom,
     maxFeatures: source?.maxFeatures ?? tile?.maxFeatures ?? DEFAULT_TILE_OPTIONS.maxFeatures,
     maxReadBytes: source?.maxReadBytes ?? tile?.maxReadBytes ?? DEFAULT_TILE_OPTIONS.maxReadBytes,
+    simplifyBeforeClip: source?.simplifyBeforeClip ?? tile?.simplifyBeforeClip ?? DEFAULT_TILE_OPTIONS.simplifyBeforeClip,
+    pointGrid: source?.pointGrid ?? tile?.pointGrid ?? DEFAULT_TILE_OPTIONS.pointGrid,
     maxTileBytes: tile?.maxTileBytes ?? DEFAULT_TILE_OPTIONS.maxTileBytes,
     omitEmptyLayers: tile?.omitEmptyLayers ?? DEFAULT_TILE_OPTIONS.omitEmptyLayers,
   };

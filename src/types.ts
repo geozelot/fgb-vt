@@ -260,11 +260,13 @@ export interface CrsInfo {
  * A tagged MVT property value.
  *
  * MVT stores values in a typed oneof: string, double, float, int64, uint64,
- * sint64, or bool. We collapse float/double into `double` and all integer
- * variants into `int` (signed) or `uint` (unsigned).
+ * sint64, or bool. Fractional numbers use `float` when a 32-bit float
+ * represents them exactly (always the case for FlatGeobuf `Float` columns)
+ * and `double` otherwise; integers use `int` (signed) or `uint` (unsigned).
  */
 export type MvtValue =
   | { type: 'string'; value: string }
+  | { type: 'float'; value: number }
   | { type: 'double'; value: number }
   | { type: 'int'; value: number | bigint }
   | { type: 'uint'; value: number | bigint }

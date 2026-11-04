@@ -258,9 +258,18 @@ Options cascade through three levels - **source** overrides **tile-level default
 | `maxFeatures` | `Infinity` | Most features a source may contribute to one tile |
 | `maxReadBytes` | `256 MiB` | Most feature bytes read from a source for one tile |
 | `maxTileBytes` | `Infinity` | Largest encoded tile (tile level only) |
+| `simplifyBeforeClip` | `false` | Simplify whole features before clipping, so adjacent tiles match exactly along tile edges (costs simplifying each feature in full) |
+| `pointGrid` | `0` | Keep at most one point per cell of this size in tile units (`0` = off); use a divisor of `extent` |
 | `omitEmptyLayers` | `false` | Leave out layers without features (tile level only); a tile without any features then encodes to **zero bytes**, e.g. to answer `204 No Content` |
 
-Budgets are checked against the spatial index **before** any feature data is read; an exceeded budget raises `LimitExceededError` (with `limit`, `max` and `actual`). For dense data at low zooms, prefer a higher `minZoom` or an overview file over large budgets.
+Budgets are checked against the spatial index **before** any feature data is read; an exceeded budget raises `LimitExceededError` (with `limit`, `max` and `actual`). For dense data at low zooms, prefer a higher `minZoom` or an overview file over large budgets: `pointGrid` bounds the tile size, but every point is still read. Sources sharing a name are merged into one layer, so a dataset can be split by zoom into an overview file and a detailed file:
+
+```typescript
+sources: [
+  { name: 'poi', path: 'poi-overview.fgb', options: { maxZoom: 9 } },
+  { name: 'poi', path: 'poi.fgb', options: { minZoom: 10 } },
+]
+```
 
 ```typescript
 const server = new TileServer(
@@ -293,6 +302,10 @@ const server = new TileServer(
 | GeometryCollection | one feature per geometry family (polygons, lines, points), sharing id and properties |
 
 Arcs are linearised per tile, so that no chord deviates from the true curve by more than one tile unit (up to 128 chords per arc): curves get smoother as you zoom in. Z, M, T and TM values are ignored (MVT is two-dimensional). Features with an unknown or abstract geometry type are skipped.
+
+**Antimeridian** — tiles at the world's east and west edges include features from the other side of the antimeridian in their buffer, and data stored with longitudes beyond ±180° (e.g. a polygon from 170° to 190°) appears on both sides. Rings that cross the antimeridian by jumping from 179° to -179° cannot be told apart from rings spanning the globe; split such data at ±180° (RFC 7946) or store it with longitudes beyond 180°.
+
+**Values** — fractional numbers are written as MVT `float` when a 32-bit float holds them exactly (every `Float` column value) and as `double` otherwise, so no precision is lost.
 
 **Properties** — all 15 column types (binary columns are dropped: MVT has no binary values); a feature's own column schema overrides the header schema. By default all properties are written, and an integer column named `id`, `fid`, `gid` or `ogc_fid` becomes the MVT feature id. Per source:
 

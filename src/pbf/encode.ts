@@ -155,6 +155,7 @@ function writeFeature(writer: PbfWriter, feature: MvtFeature): void {
  * {@link MvtValue.type} discriminant:
  *
  * - `'string'` -- field 1 (string)
+ * - `'float'`  -- field 2 (float, 32-bit)
  * - `'double'` -- field 3 (double, 64-bit float)
  * - `'int'`    -- field 6 (sint64, zigzag-encoded)
  * - `'uint'`   -- field 5 (uint64)
@@ -170,6 +171,9 @@ function writeValue(writer: PbfWriter, value: MvtValue): void {
   switch (value.type) {
     case 'string':
       writer.writeStringField(1, value.value);
+      break;
+    case 'float':
+      writer.writeFloatField(2, value.value);
       break;
     case 'double':
       writer.writeDoubleField(3, value.value);

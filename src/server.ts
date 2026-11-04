@@ -254,6 +254,8 @@ export class TileServer {
    * - **`fields`**: the columns actually written as properties, after the
    *   source's `properties` selection and without the id column (unless
    *   kept) and binary columns.
+   * - Sources sharing a name are listed as one layer (fields combined,
+   *   zoom range covering all of them), as they are merged in tiles.
    *
    * @param options - Tile URLs and descriptive metadata.
    * @returns TileJSON metadata object conforming to the 3.0.0 specification.
@@ -289,13 +291,22 @@ export class TileServer {
         fields[col.name] = columnTypeToString(col.type);
       }
       const description = header.description ?? header.title;
-      vectorLayers.push({
-        id: source.name,
-        ...(description ? { description } : {}),
-        fields,
-        minzoom: opts.minZoom,
-        maxzoom: opts.maxZoom,
-      });
+      const existing = vectorLayers.find(l => l.id === source.name);
+      if (existing) {
+        // Sources sharing a name form one layer
+        Object.assign(existing.fields, fields);
+        existing.minzoom = Math.min(existing.minzoom, opts.minZoom);
+        existing.maxzoom = Math.max(existing.maxzoom, opts.maxZoom);
+        if (!existing.description && description) existing.description = description;
+      } else {
+        vectorLayers.push({
+          id: source.name,
+          ...(description ? { description } : {}),
+          fields,
+          minzoom: opts.minZoom,
+          maxzoom: opts.maxZoom,
+        });
+      }
 
       minzoom = Math.min(minzoom, opts.minZoom);
       maxzoom = Math.max(maxzoom, opts.maxZoom);
