@@ -1,6 +1,8 @@
 {
   "$schema": "https://typedoc.org/schema.json",
-  "entryPoints": ["./src/index.ts"],
+  "entryPoints": [
+    "./src/index.ts"
+  ],
   "tsconfig": "./tsconfig.json",
   "out": "./docs",
   "name": "fgb-vt",
@@ -10,5 +12,12 @@
   "excludePrivate": true,
   "cleanOutputDir": true,
   "githubPages": true,
-  "sort": ["static-first", "alphabetical"]
+  "sort": [
+    "static-first",
+    "alphabetical"
+  ],
+  "projectDocuments": [
+    "guide/serverless.md",
+    "guide/producing-files.md"
+  ]
 }

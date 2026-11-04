@@ -21,6 +21,7 @@
  */
 
 import type { BBox } from '../types.js';
+import { FormatError } from '../errors.js';
 
 /** Byte size of a single packed R-tree node (4 x f64 bbox + 1 x u64 offset). */
 const NODE_ITEM_SIZE = 40;
@@ -57,6 +58,10 @@ export interface ByteRange {
  *   in the file; added to each relative feature offset stored in the index.
  * @param bbox - Query bounding box. Coordinate reference system must match
  *   the index (typically WGS 84).
+ * @param cachedLevelBounds - Optional precomputed `[start, end)` node-index
+ *   ranges per tree level, as returned by {@link computeLevelBounds} for the
+ *   same `featuresCount` and `nodeSize`. Pass it to skip recomputing the
+ *   level layout on every query; when omitted it is computed on demand.
  * @returns Sorted, merged array of {@link ByteRange} entries representing
  *   the file regions that contain matching features. Returns an empty array
  *   if no features intersect or if the index is empty.
@@ -100,7 +105,9 @@ export function queryIndex(
 
     // Read node bbox
     const nodeByteOff = nodeIdx * NODE_ITEM_SIZE;
-    if (nodeByteOff + NODE_ITEM_SIZE > indexBytes.length) break;
+    if (nodeByteOff + NODE_ITEM_SIZE > indexBytes.length) {
+      throw new FormatError(`Corrupt FlatGeobuf index: node ${nodeIdx} lies beyond the index (${indexBytes.length} bytes)`);
+    }
 
     const nodeMinX = view.getFloat64(nodeByteOff, true);
     const nodeMinY = view.getFloat64(nodeByteOff + 8, true);
@@ -119,7 +126,10 @@ export function queryIndex(
     } else {
       // Internal node: read first-child index from offset field
       const firstChild = readUint64AsNumber(view, nodeByteOff + 32);
-      const childLevelEnd = levelBounds[level - 1][1];
+      const [childLevelStart, childLevelEnd] = levelBounds[level - 1];
+      if (firstChild < childLevelStart || firstChild >= childLevelEnd) {
+        throw new FormatError(`Corrupt FlatGeobuf index: node ${nodeIdx} points to child ${firstChild} outside its level`);
+      }
       const childEnd = Math.min(firstChild + nodeSize, childLevelEnd);
 
       for (let i = firstChild; i < childEnd; i++) {
@@ -174,6 +184,52 @@ export function queryIndex(
 // == Internals ==============================================================
 
 /**
+ * Count the nodes on each level of a packed R-tree, leaf level first.
+ *
+ * Matches the reference implementation: the loop runs at least once, so
+ * the tree always has a root above the leaves — a single-feature file has
+ * two nodes (root + leaf), not one.
+ *
+ * @param featuresCount - Number of features (leaf nodes); must be >= 1.
+ * @param nodeSize - Branching factor; must be >= 2.
+ * @returns Node counts per level, `[leaves, ..., 1]`.
+ * @throws {FormatError} On a feature count < 1 or a node size < 2.
+ */
+function levelNodeCounts(featuresCount: number, nodeSize: number): number[] {
+  if (!Number.isSafeInteger(featuresCount) || featuresCount < 1) {
+    throw new FormatError(`Invalid packed R-tree: feature count ${featuresCount}`);
+  }
+  if (!Number.isInteger(nodeSize) || nodeSize < 2 || nodeSize > 65535) {
+    throw new FormatError(`Invalid packed R-tree: node size ${nodeSize}`);
+  }
+  let n = featuresCount;
+  const counts = [n];
+  do {
+    n = Math.ceil(n / nodeSize);
+    counts.push(n);
+  } while (n !== 1);
+  return counts;
+}
+
+/**
+ * Calculate the byte size of a packed Hilbert R-tree index.
+ *
+ * Each node occupies exactly 40 bytes: 4 x `float64` for the bounding box
+ * (32 bytes) plus 1 x `uint64` for the offset (8 bytes). The total size is
+ * the sum of nodes across all tree levels.
+ *
+ * @param featuresCount - Total number of features (leaf nodes); must be >= 1.
+ * @param nodeSize - Branching factor (max children per internal node); must be >= 2.
+ * @returns Total byte size of the packed R-tree.
+ * @throws {FormatError} On a feature count < 1 or a node size < 2.
+ */
+export function calcTreeSize(featuresCount: number, nodeSize: number): number {
+  let total = 0;
+  for (const n of levelNodeCounts(featuresCount, nodeSize)) total += n;
+  return total * NODE_ITEM_SIZE;
+}
+
+/**
  * Compute the node-index boundaries for each level of the packed R-tree.
  *
  * The FlatGeobuf v3 packed Hilbert R-tree stores nodes root-first: the
@@ -196,21 +252,14 @@ export function queryIndex(
  * @param nodeSize - Branching factor of the R-tree.
  * @returns Array of `[startIndex, endIndex)` pairs, one per level.
  *   `result[0]` = leaf bounds, `result[result.length - 1]` = root bounds.
+ * @throws {FormatError} On a feature count < 1 or a node size < 2.
  */
 export function computeLevelBounds(
   featuresCount: number,
   nodeSize: number,
 ): Array<[number, number]> {
   // Count nodes at each level, starting from the leaf level
-  let n = featuresCount;
-  const levelNumNodes: number[] = [n];
-  let numNodes = n;
-
-  while (n > 1) {
-    n = Math.ceil(n / nodeSize);
-    levelNumNodes.push(n);
-    numNodes += n;
-  }
+  const levelNumNodes = levelNodeCounts(featuresCount, nodeSize);
 
   // Assign node-index ranges: root starts at index 0, leaves at the end.
   // levelNumNodes[0] = leaf count, levelNumNodes[last] = root count (1).

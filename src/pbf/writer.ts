@@ -77,27 +77,29 @@ export class PbfWriter {
   /**
    * Write an unsigned varint (variable-length integer) to the buffer.
    *
-   * Positive values use standard base-128 encoding (1--5 bytes for 32-bit
-   * values). Negative values are sign-extended to 64 bits and encoded as
-   * 10-byte varints per the protobuf specification.
+   * Values use standard base-128 encoding: 1--5 bytes up to 2^32 - 1 and
+   * up to 10 bytes for the full 64-bit range. Negative values are written as
+   * 64-bit two's complement (10 bytes), per the protobuf specification for
+   * `int64`; use {@link writeSVarint} for signed values.
    *
-   * @param val - Unsigned integer value to encode. Negative values are
-   *   handled as 64-bit two's complement.
+   * @param val - Integer to encode: a safe-integer `number` or a `bigint`
+   *   in the range [-2^63, 2^64).
+   * @throws {RangeError} If `val` is not an integer or is out of range.
    */
-  writeVarint(val: number): void {
-    if (val < 0) {
-      // Negative numbers in protobuf varint are 10 bytes (sign-extended to 64 bits)
-      // For our use case this shouldn't happen — use writeSVarint for signed values
-      this.ensure(10);
-      this.pos = writeBigVarint(val, this.buf, this.pos);
+  writeVarint(val: number | bigint): void {
+    if (typeof val === 'number' && (val >>> 0) === val) {
+      // Fast path: uint32
+      this.ensure(5);
+      while (val > 0x7f) {
+        this.buf[this.pos++] = (val & 0x7f) | 0x80;
+        val >>>= 7;
+      }
+      this.buf[this.pos++] = val;
       return;
     }
-    this.ensure(5);
-    while (val > 0x7f) {
-      this.buf[this.pos++] = (val & 0x7f) | 0x80;
-      val >>>= 7;
-    }
-    this.buf[this.pos++] = val;
+    split64(val);
+    this.ensure(10);
+    this.pos = writeVarint64(this.buf, this.pos, split.lo, split.hi);
   }
 
   /**
@@ -107,11 +109,27 @@ export class PbfWriter {
    * small absolute values produce small varints:
    * `0 -> 0, -1 -> 1, 1 -> 2, -2 -> 3, ...`
    *
-   * @param val - Signed 32-bit integer value to encode.
+   * @param val - Signed integer to encode: a safe-integer `number` or a
+   *   `bigint` in the `int64` range.
+   * @throws {RangeError} If `val` is not an integer or is out of range.
    */
-  writeSVarint(val: number): void {
-    // Zigzag encode, then write as varint
-    this.writeVarint((val << 1) ^ (val >> 31));
+  writeSVarint(val: number | bigint): void {
+    if (typeof val === 'number' && (val | 0) === val) {
+      // Fast path: int32 zigzag fits in a uint32
+      this.writeVarint(((val << 1) ^ (val >> 31)) >>> 0);
+      return;
+    }
+    if (typeof val === 'bigint' && (val < INT64_MIN || val > INT64_MAX)) {
+      throw new RangeError(`Value out of int64 range: ${val}`);
+    }
+    // 64-bit zigzag on the two's complement halves: (n << 1) ^ (n >> 63)
+    split64(val);
+    const { lo, hi } = split;
+    const sign = (hi | 0) >> 31;
+    const zhi = (((hi << 1) | (lo >>> 31)) ^ sign) >>> 0;
+    const zlo = ((lo << 1) ^ sign) >>> 0;
+    this.ensure(10);
+    this.pos = writeVarint64(this.buf, this.pos, zlo, zhi);
   }
 
   // == Fixed-width types ==============================================
@@ -175,7 +193,7 @@ export class PbfWriter {
    * @param fieldNum - Protobuf field number.
    * @param val - Unsigned integer value.
    */
-  writeVarintField(fieldNum: number, val: number): void {
+  writeVarintField(fieldNum: number, val: number | bigint): void {
     this.writeTag(fieldNum, WIRE_VARINT);
     this.writeVarint(val);
   }
@@ -187,7 +205,7 @@ export class PbfWriter {
    * @param fieldNum - Protobuf field number.
    * @param val - Signed integer value.
    */
-  writeSVarintField(fieldNum: number, val: number): void {
+  writeSVarintField(fieldNum: number, val: number | bigint): void {
     this.writeTag(fieldNum, WIRE_VARINT);
     this.writeSVarint(val);
   }
@@ -385,11 +403,65 @@ export class PbfWriter {
 
 // == Helpers ================================================================
 
+const TWO_POW_32 = 0x100000000;
+const INT64_MIN = -(2n ** 63n);
+const INT64_MAX = 2n ** 63n - 1n;
+const UINT64_MAX = 2n ** 64n - 1n;
+
+/**
+ * Scratch output of {@link split64}, reused to avoid allocating per value.
+ */
+const split = { lo: 0, hi: 0 };
+
+/**
+ * Split an integer into the low and high 32-bit halves of its 64-bit two's
+ * complement representation, written to {@link split}.
+ *
+ * @param val - Safe-integer `number`, or `bigint` in [-2^63, 2^64).
+ * @throws {RangeError} If `val` is not an integer or is out of range.
+ */
+function split64(val: number | bigint): void {
+  if (typeof val === 'number') {
+    if (!Number.isSafeInteger(val)) {
+      throw new RangeError(`Varint value is not a safe integer: ${val}`);
+    }
+    // ToUint32 keeps the low 32 bits of the two's complement value, and the
+    // floored quotient is its (signed) high word.
+    split.lo = val >>> 0;
+    split.hi = Math.floor(val / TWO_POW_32) >>> 0;
+    return;
+  }
+  if (val < INT64_MIN || val > UINT64_MAX) {
+    throw new RangeError(`Varint value out of 64-bit range: ${val}`);
+  }
+  const u = BigInt.asUintN(64, val);
+  split.lo = Number(u & 0xffffffffn);
+  split.hi = Number(u >> 32n);
+}
+
+/**
+ * Write a 64-bit unsigned value, given as two 32-bit halves, as a varint.
+ *
+ * @param buf - Target byte buffer (at least 10 bytes free at `pos`).
+ * @param pos - Starting write position in `buf`.
+ * @param lo - Low 32 bits (unsigned).
+ * @param hi - High 32 bits (unsigned).
+ * @returns The new write position after encoding.
+ */
+function writeVarint64(buf: Uint8Array, pos: number, lo: number, hi: number): number {
+  while (hi !== 0 || lo > 0x7f) {
+    buf[pos++] = (lo & 0x7f) | 0x80;
+    lo = ((lo >>> 7) | (hi << 25)) >>> 0;
+    hi >>>= 7;
+  }
+  buf[pos++] = lo;
+  return pos;
+}
+
 /**
  * Compute the number of bytes needed to encode a value as a varint.
  *
- * Negative values require 10 bytes (64-bit sign extension). Non-negative
- * values use 1--5 bytes depending on magnitude.
+ * Negative values require 10 bytes (64-bit sign extension).
  *
  * @param val - Integer value to measure.
  * @returns Byte count in the range [1, 10].
@@ -400,35 +472,8 @@ function varintSize(val: number): number {
   if (val < 0x4000) return 2;
   if (val < 0x200000) return 3;
   if (val < 0x10000000) return 4;
-  return 5;
-}
-
-/**
- * Encode a negative number as a 64-bit two's complement varint.
- *
- * Protobuf represents negative integers as 10-byte varints by
- * sign-extending to 64 bits. This function splits the value into
- * low and high 32-bit halves and encodes them using standard base-128
- * continuation bits.
- *
- * @param val - Negative integer to encode.
- * @param buf - Target byte buffer.
- * @param pos - Starting write position in `buf`.
- * @returns The new write position after encoding.
- */
-function writeBigVarint(val: number, buf: Uint8Array, pos: number): number {
-  // Handle negative numbers as 64-bit two's complement
-  const lo = val >>> 0;
-  const hi = Math.floor(val / 0x100000000) >>> 0;
-
-  let loPart = lo;
-  let hiPart = hi;
-
-  while (hiPart > 0 || loPart > 0x7f) {
-    buf[pos++] = (loPart & 0x7f) | 0x80;
-    loPart = ((hiPart & 0x7f) << 25) | (loPart >>> 7);
-    hiPart >>>= 7;
-  }
-  buf[pos++] = loPart;
-  return pos;
+  if (val < 0x800000000) return 5;
+  let size = 5;
+  for (let v = Math.floor(val / 0x800000000); v > 0; v = Math.floor(v / 128)) size++;
+  return size;
 }

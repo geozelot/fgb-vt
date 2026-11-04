@@ -16,9 +16,9 @@
  *
  * | Tier | Export | State | Use case |
  * |------|--------|-------|----------|
- * | **Stateful** | {@link TileServer} | Connectors, sources, headers, indices | Long-running server with a fixed source set. Maximum throughput -- all per-source overhead is amortized across requests. |
- * | **Semi-stateful** | {@link TileClient} | Single connector, tile bounds cache | Application sharing one connector but varying sources per request (e.g. dynamic layer selection). |
- * | **Stateless** | {@link tile} | Module-level tile bounds cache only | One-off or ad-hoc tile generation. Everything is provided per call. |
+ * | **Stateful** | {@link TileServer} | Connectors, sources, header and index page cache | Long-running server with a fixed source set. Maximum throughput -- all per-source overhead is amortized across requests. |
+ * | **Semi-stateful** | {@link TileClient} | Single connector, header and index page cache | Application sharing one connector but varying sources per request (e.g. dynamic layer selection). |
+ * | **Stateless** | {@link tile} | Shared module-level page cache only (or none with `cache: false`) | One-off or ad-hoc tile generation. Everything is provided per call. |
  *
  * ---
  *
@@ -65,10 +65,31 @@ export { S3Connector } from './connectors/s3.js';
 
 // == Types ==================================================================
 
-export type { Connector } from './connectors/connector.js';
+export type { Connector, ReadOptions, ReadHeadResult, ConnectorHints } from './connectors/connector.js';
 export type { LocalConnectorOptions } from './connectors/local.js';
 export type { HttpConnectorOptions } from './connectors/http.js';
-export type { S3ConnectorOptions } from './connectors/s3.js';
+export type { S3ConnectorOptions, S3ClientLike, S3SdkModule } from './connectors/s3.js';
 export type { Source, SourceOptions, TileOptions } from './source.js';
-export type { TileServerLayer } from './server.js';
+export type { Projection, SourceCrs } from './geometry/crs.js';
+export type { TileServerLayer, TileJSONOptions } from './server.js';
 export type { TileJSON, BBox } from './types.js';
+export type { ByteCache, MemoryCacheOptions } from './cache.js';
+export type { IoOptions } from './fgb/reader.js';
+export type { OpenOptions } from './client.js';
+export type { RequestOptions, TileStats, SourceStats } from './pipeline.js';
+export type { PropertySelection } from './schema.js';
+export type { LimitKind } from './errors.js';
+
+// == Caching & errors =======================================================
+
+export { MemoryCache } from './cache.js';
+export {
+  FgbVtError,
+  FormatError,
+  IndexMismatchError,
+  UnsupportedFormatError,
+  ConnectorError,
+  RangeNotSupportedError,
+  SourceChangedError,
+  LimitExceededError,
+} from './errors.js';

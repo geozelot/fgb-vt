@@ -260,29 +260,25 @@ export class FlatBufferReader {
   // == Typed array reads ================================================
 
   /**
-   * Read a contiguous sequence of `float64` values into a `Float64Array`.
+   * Read a contiguous sequence of `float64` values into a new `Float64Array`.
    *
-   * When the source data is 8-byte aligned, a direct typed array view is
-   * returned (zero-copy). Otherwise, values are copied element-by-element
-   * through a `DataView` to guarantee correct decoding regardless of
-   * alignment.
-   *
-   * **Note:** callers that mutate the returned array in-place (e.g.
-   * {@link projectToMercator}) will modify the underlying buffer when the
-   * fast path is taken. This is intentional — it avoids an allocation for
-   * coordinate arrays that are projected once and then discarded.
+   * The result always owns its memory: callers project coordinates in
+   * place, and mutating a view would corrupt the source buffer, which a
+   * {@link Connector} may cache and hand out again. When the source data is
+   * 8-byte aligned the copy is a single block copy; otherwise values are
+   * copied element-by-element through a `DataView` (FlatGeobuf 3.0.0 files
+   * are not guaranteed to be aligned).
    *
    * @param offset - Byte offset of the first `float64`, relative to the view.
    * @param count - Number of `float64` elements to read.
-   * @returns A `Float64Array` of length `count` — either a zero-copy view
-   *   (when aligned) or a freshly allocated copy.
+   * @returns A freshly allocated `Float64Array` of length `count`.
    */
   readFloat64Array(offset: number, count: number): Float64Array {
     const byteOffset = this.bytes.byteOffset + (this.view.byteOffset - this.bytes.byteOffset) + offset;
 
-    // Fast path: direct view when 8-byte aligned
+    // Fast path: block copy when 8-byte aligned
     if (byteOffset % 8 === 0) {
-      return new Float64Array(this.bytes.buffer, byteOffset, count);
+      return new Float64Array(this.bytes.buffer, byteOffset, count).slice();
     }
 
     // Slow path: unaligned — copy element-by-element via DataView

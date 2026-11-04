@@ -1,4 +1,5 @@
 [![npm version](https://img.shields.io/npm/v/@geozelot/fgb-vt)](https://www.npmjs.com/package/@geozelot/fgb-vt)
+[![CI](https://github.com/geozelot/fgb-vt/actions/workflows/ci.yml/badge.svg)](https://github.com/geozelot/fgb-vt/actions/workflows/ci.yml)
 [![license](https://img.shields.io/npm/l/@geozelot/fgb-vt)](LICENSE)
 [![node](https://img.shields.io/node/v/@geozelot/fgb-vt)](package.json)
 [![types](https://img.shields.io/npm/types/@geozelot/fgb-vt)](https://www.npmjs.com/package/@geozelot/fgb-vt)
@@ -6,295 +7,408 @@
 
 # fgb-vt
 
-Native _Node/TypeScript_ library for high-performance [_Vector Tile_](https://github.com/mapbox/vector-tile-spec) layering, encoding and serving - directly from [_FlatGeobuf_](https://flatgeobuf.org/) files. Fully utilizes _FlatGeobuf's_ _Packed Hilbert R-tree_ for tile-sized byte-range reads over the main feature storage.
+**Mapbox Vector Tiles on the fly, straight from [FlatGeobuf](https://flatgeobuf.org/) files: local, over HTTP(S) or in S3.**
 
-`fgb-vt` attempts to conceptually close the gap between full tile pyramid creation on the backend, database-driven tile servers and processing static datasets on the client. It is specifically designed to access large, single-file objects on cloud storage via load-efficient _(HTTP) Range Requests_ and stateless deployment (e.g. via _AWS Lambda_) - targeting highly dynamic geospatial big-data mapping requirements.
+`fgb-vt` turns a FlatGeobuf file into a [vector tile](https://github.com/mapbox/vector-tile-spec) source without a tile pyramid, a database or a GeoJSON detour. It uses the file's packed Hilbert R-tree to read only the bytes a tile needs, through range requests. That makes a large single file in object storage directly servable, from a long-running server, from a stateless function such as AWS Lambda, or from the browser.
 
-Under the hood it's binary all the way down - no _GeoJSON_ detour, no intermediate format, just _FlatBuffers_ in and _Protobuf_ out, with projection, clipping and simplification natively implemented at the lowest level the types allow.
+It is binary all the way: FlatBuffers in, Protocol Buffers out, with projection, clipping, simplification and encoding implemented on flat coordinate arrays.
 
-`fgb-vt` supports multi-layered tiles via concurrent access to different sources - even across different storage backends. It follows a slim, three-tier API layer approach for different use cases:
-- `TileServer` - a semi-stateful, lazy-caching tile server over an initially configured set of sources
-- `TileClient` - semi-stateful, connection-optimized tile client middleware with dynamic source selection
-- `tile()` - semi-stateless, request-scoped, one-off tile generation function, suitable for Lambda-driven setups
+### Highlights
 
-and includes a Browser bundle for client-side _HTTP(S)_ source access.
+- **Reads only what a tile needs.** The header and the top of the spatial index come in one request. The index is searched level by level, and whole subtrees inside the tile are resolved without descending. Features are fetched in merged range requests. Header and index pages are cached, so a warm process typically needs a single read per tile and source.
+- **Built for serverless.** Module-scope caching, `open()` warm-up during init, per-tile budgets, cancellation and deadlines, change detection through ETags, and an `onTile` metrics hook.
+- **All of FlatGeobuf 3.x.** All 17 geometry types (curves are linearised per zoom), mixed-geometry layers, per-feature column schemas, and files without an index. WGS 84 and Web Mercator are built in; any other CRS works through a projection hook.
+- **Spec-valid output.** MVT 2.1 with correct ring winding and no degenerate geometry, checked by a strict validator across all test files at several zooms. Also exact 64-bit integers, lossless float values, world copies at the antimeridian, and optional seam-free simplification.
+- **Fails loudly, not wrongly.** Typed errors with stable codes for corrupt files, inconsistent indexes, unsupported data and exceeded budgets (checked before feature data is read). The decoders are fuzzed against corrupted input.
+- **Three API tiers, three connectors.** `TileServer`, `TileClient` and `tile()` over `LocalConnector`, `HttpConnector` and `S3Connector`, plus a browser bundle.
 
-Shipped with three concurrency-optimized connectors:
-- `LocalConnector` - for local filesystem access
-- `HttpConnector` - for _HTTP(S)_ with _Range Requests_
-- `S3Connector` - for Amazon S3 / compatible storage backends with _Byte Range_ reads
+### Contents
 
+[Quick start](#quick-start) · [API tiers](#api-tiers) · [Browser](#browser) · [Connectors](#connectors) · [Options](#options) · [Sources](#sources) · [Data support](#data-support) · [I/O and caching](#io-and-caching) · [Errors](#errors) · [Guides](#guides) · [Development](#development) · [API docs](https://geozelot.github.io/fgb-vt/) · [Example app](examples/single-file-server)
 
-##
-### Quick Start
+---
 
-#### [Examples](examples) | [API Docs](https://geozelot.github.io/fgb-vt/)
-
+## Quick start
 
 ```bash
 npm install @geozelot/fgb-vt
+# for S3, add the optional peer dependency:
+npm install @aws-sdk/client-s3
 ```
+
+`fgb-vt` is an ES module for Node.js 18 and later.
 
 ```typescript
 import { TileClient, LocalConnector } from '@geozelot/fgb-vt';
 
-// set up a client with a filesystem connector
 const client = new TileClient(new LocalConnector());
 
-// request tile z=4, x=4, y=6 - sources are passed per call
-const pbf = await client.tile(4, 4, 6, {
-  name: 'counties',
-  path: './data/us_counties.fgb',
-});
+// Tile 4/3/6 of one layer; sources are given per call
+const pbf = await client.tile(4, 3, 6, { name: 'counties', path: './data/us_counties.fgb' });
 
-// pbf is a ready-to-serve Uint8Array (MVT/PBF encoded)
+// pbf: a ready-to-serve Uint8Array (MVT, Protocol Buffers)
 await client.close();
 ```
-<br>
 
-***
+A complete tile endpoint:
 
-### Installation  
+```typescript
+import { createServer } from 'node:http';
+import { gzipSync } from 'node:zlib';
+import { TileServer, LocalConnector } from '@geozelot/fgb-vt';
 
-    ```bash
-    npm install @geozelot/fgb-vt
-    ```
-    
-    For S3 support, add the optional peer dependency:
-    
-    ```bash
-    npm install @aws-sdk/client-s3
-    ```
+const tiles = new TileServer(
+  { connector: new LocalConnector(), sources: { name: 'counties', path: './data/us_counties.fgb' } },
+  { omitEmptyLayers: true }, // tiles without features encode to zero bytes
+);
+await tiles.open(); // read headers and upper index levels up front
 
-**Browser**
-     
-    ```html
-    <!-- UMD -->
-    <script src="https://unpkg.com/@geozelot/fgb-vt/dist/fgb-vt.umd.min.js"></script>
-    
-    <!-- ESM -->
-    <script type="module">
-      import { tile, HttpConnector } from 'https://unpkg.com/@geozelot/fgb-vt/dist/fgb-vt.esm.min.js';
-    </script>
-    ```
-
-  **Note:** Browser builds ship with `HttpConnector` only!
+createServer(async (req, res) => {
+  const m = /^\/(\d+)\/(\d+)\/(\d+)\.mvt$/.exec(req.url ?? '');
+  if (!m) return void res.writeHead(404).end();
+  try {
+    const pbf = await tiles.tile(Number(m[1]), Number(m[2]), Number(m[3]));
+    if (pbf.length === 0) return void res.writeHead(204).end();
+    res.writeHead(200, { 'content-type': 'application/vnd.mapbox-vector-tile', 'content-encoding': 'gzip' });
+    res.end(gzipSync(pbf));
+  } catch (err) {
+    res.writeHead(err instanceof RangeError ? 400 : 500).end();
+  }
+}).listen(8080);
+```
 
 ---
 
-### Usage
+## API tiers
 
-#### `TileServer`
+| Tier | Bound at construction | Per call | Use it for |
+|------|----------------------|----------|-----------|
+| `TileServer` | connectors and sources | `z/x/y` | long-running servers with a fixed set of layers |
+| `TileClient` | one connector | `z/x/y` and sources | middleware choosing sources per request |
+| `tile()` | nothing | connector, `z/x/y`, sources | one-off tiles, functions |
 
-Bind connectors and sources once; call `tile()` for the life of the process. Headers and spatial index metadata are lazily cached on first access - maximum throughput after warm-up.
+All three cache file headers and index pages (`TileServer` and `TileClient` per instance, `tile()` in a shared 64 MiB module-level cache), accept the same [options](#options), and take an abort `signal` and an `onTile` hook per call.
 
-- **Single connector:**
+### `TileServer`
 
-    ```typescript
-    import { TileServer, LocalConnector } from '@geozelot/fgb-vt';
+```typescript
+import { TileServer, LocalConnector, HttpConnector } from '@geozelot/fgb-vt';
 
-    const server = new TileServer({
-      connector: new LocalConnector(),
-      sources: { name: 'counties', path: './data/us_counties.fgb' },
-    });
+// One connector, layered tiles
+const server = new TileServer({
+  connector: new LocalConnector(),
+  sources: [
+    { name: 'buildings', path: './data/buildings.fgb' },
+    { name: 'roads', path: './data/roads.fgb', options: { maxZoom: 16 } },
+  ],
+});
 
-    const pbf = await server.tile(4, 4, 6);
-    const meta = await server.tileJSON();   // TileJSON 3.0.0
-    await server.close();
-    ```
+// Several connectors in one tile stack
+const mixed = new TileServer([
+  { connector: new LocalConnector(), sources: { name: 'local', path: './local.fgb' } },
+  { connector: new HttpConnector(), sources: { name: 'remote', path: 'https://cdn.example.com/remote.fgb' } },
+]);
 
-- **Multi source (layered tiles):**
+const pbf = await server.tile(14, 8192, 5461);
+const meta = await server.tileJSON({ tiles: ['https://tiles.example.com/{z}/{x}/{y}.mvt'] }); // TileJSON 3.0.0
+await server.close();
+```
 
-    ```typescript
-    const server = new TileServer({
-      connector: new LocalConnector(),
-      sources: [
-        { name: 'buildings', path: './data/buildings.fgb' },
-        { name: 'roads', path: './data/roads.fgb', options: { maxZoom: 16 } },
-      ],
-    });
-    ```
+Sources are opened on first use; `open()` preloads them.
 
-- **Multi connector:**
+### `TileClient`
 
-    ```typescript
-    const server = new TileServer([
-      { connector: new LocalConnector(), sources: { name: 'local', path: './local.fgb' } },
-      { connector: new HttpConnector(), sources: { name: 'remote', path: 'https://cdn.example.com/remote.fgb' } },
-    ]);
-    ```
-##
-#### `TileClient`
+```typescript
+import { TileClient, HttpConnector } from '@geozelot/fgb-vt';
 
-Connector bound at construction; sources provided per call. One connector, varying datasets - well suited for middleware or request-scoped source selection.
+const client = new TileClient(new HttpConnector({ headers: { Authorization: 'Bearer ...' } }));
 
-- **Single source:**
+const pbf = await client.tile(12, 2048, 1365, [
+  { name: 'water', path: 'https://data.example.com/water.fgb' },
+  { name: 'roads', path: 'https://data.example.com/roads.fgb' },
+]);
+await client.close();
+```
 
-    ```typescript
-    import { TileClient, HttpConnector } from '@geozelot/fgb-vt';
+### `tile()`
 
-    const client = new TileClient(
-      new HttpConnector({ headers: { Authorization: 'Bearer ...' } }),
-    );
+```typescript
+import { tile, S3Connector } from '@geozelot/fgb-vt';
 
-    const pbf = await client.tile(14, 8192, 5461, {
-      name: 'parcels', path: 'https://data.example.com/parcels.fgb',
-    });
-    await client.close();
-    ```
+const connector = new S3Connector({ region: 'us-east-1' }); // module scope: reused by warm invocations
 
-- **Multi source (layered tiles):**
+const pbf = await tile(connector, 14, 8192, 5461, { name: 'poi', path: 's3://bucket/poi.fgb' }, {
+  signal: AbortSignal.timeout(3000),
+});
+```
 
-    ```typescript
-    const pbf = await client.tile(12, 2048, 1365, [
-      { name: 'water', path: '/data/water.fgb' },
-      { name: 'roads', path: '/data/roads.fgb' },
-    ]);
-    ```
+Pass `{ cache: false }` for no state at all. See the [serverless guide](guide/serverless.md) for a complete Lambda setup.
 
-##
-#### `tile()`
+---
 
-Everything per call - connector, coordinates, sources. No instance state beyond a module-level tile bounds cache. Drop it into a Lambda and call it a day.
+## Browser
 
-- **Single source:**
-
-    ```typescript
-    import { tile, LocalConnector } from '@geozelot/fgb-vt';
-
-    const connector = new LocalConnector();
-    const pbf = await tile(connector, 14, 8192, 5461, {
-      name: 'poi', path: './data/poi.fgb',
-    });
-    await connector.close();
-    ```
-
-- **Multi source:**
-
-    ```typescript
-    const pbf = await tile(connector, 14, 8192, 5461, [
-      { name: 'buildings', path: './data/buildings.fgb' },
-      { name: 'roads', path: './data/roads.fgb' },
-    ]);
-    ```
-
-##
-##### Browser bundle
-
-Use the browser bundle to turn any hosted `.fgb` into a vector tile source - no tile server required:
+The browser bundle includes everything except `LocalConnector` and `S3Connector`, and turns any hosted `.fgb` into a tile source without a tile server. With [MapLibre GL](https://maplibre.org/):
 
 ```html
-<script src="https://unpkg.com/@geozelot/fgb-vt/dist/fgb-vt.umd.min.js"></script>
-<script>
-  const client = new fgbvt.TileClient(new fgbvt.HttpConnector());
+<script type="module">
+  import { TileClient, HttpConnector } from 'https://unpkg.com/@geozelot/fgb-vt@1/dist/fgb-vt.esm.min.js';
 
-  // generate tiles on demand, client-side
-  const pbf = await client.tile(14, 8192, 5461, {
-    name: 'counties', path: 'https://data.example.com/counties.fgb',
+  const client = new TileClient(new HttpConnector());
+  const counties = { name: 'counties', path: 'https://data.example.com/counties.fgb' };
+
+  maplibregl.addProtocol('fgb', async (params, abort) => {
+    const [z, x, y] = params.url.split('/').slice(-3).map(Number);
+    const pbf = await client.tile(z, x, y, counties, { signal: abort.signal });
+    return { data: pbf.slice().buffer };
   });
+  // in the style: { type: 'vector', tiles: ['fgb://counties/{z}/{x}/{y}'] }
 </script>
 ```
 
+The UMD build (`dist/fgb-vt.umd.min.js`) exposes the same API as the global `fgbvt`. The file's server must answer range requests. For cross-origin files, CORS must allow the `Range` header and should expose `Content-Range` and `ETag` (`Access-Control-Expose-Headers`) for size and change detection.
+
 ---
 
-### API Reference
-
-#### Connectors
-
-Connectors abstract concurrent byte-range I/O across storage backends. Each implements the `Connector` interface.
+## Connectors
 
 | Connector | Reads from | Path format |
 |-----------|-----------|-------------|
 | `LocalConnector` | filesystem | `./data/buildings.fgb` |
-| `HttpConnector` | HTTP(S) with Range Requests | `https://cdn.example.com/roads.fgb` |
-| `S3Connector` | Amazon S3 / compatible | `s3://bucket/key.fgb` |
+| `HttpConnector` | HTTP(S) with range requests | `https://cdn.example.com/roads.fgb` |
+| `S3Connector` | Amazon S3 and compatible stores | `s3://bucket/key.fgb` |
 
 ```typescript
-new LocalConnector({ maxOpenFiles: 64 })
+new LocalConnector({ maxOpenFiles: 64 });
 
 new HttpConnector({
   headers: { Authorization: 'Bearer ...' },
   timeout: 30_000,
-  maxConcurrency: 6,
+  maxConcurrency: 32,
   retry: { attempts: 3, backoff: 200 },
-})
+});
 
 new S3Connector({
-  region: 'us-east-1', 
-  credentials: { accessKeyId: '...', secretAccessKey: '...' }, 
-  maxConcurrency: 6,
-  endpoint: 'http://localhost:9000'   // for S3-compatible storage backends
-})
+  region: 'us-east-1',
+  credentials: { accessKeyId: '...', secretAccessKey: '...' },
+  endpoint: 'http://localhost:9000', // MinIO, R2, ... (with forcePathStyle if needed)
+});
+
+// Reuse the application's client; pass the SDK module when bundling it
+import * as s3 from '@aws-sdk/client-s3';
+new S3Connector({ client: existingS3Client, sdk: s3 });
 ```
 
-##
-#### Options
+- **`maxConcurrency`** bounds the requests in flight across all reads through a connector (every tile and source sharing it); further requests wait in arrival order, and waiting does not count towards `timeout`. Defaults: 32 for HTTP in Node.js (6 in browsers), 50 for S3 (the SDK's socket pool). When one range of a multi-range read fails, the others are cancelled.
+- **`@aws-sdk/client-s3`** is imported on first use unless `sdk` is given. A `client` passed in is not destroyed by `close()`.
+- **Custom connectors** implement `Connector` (`read`, `readRanges`, `close`); the optional `readHead`, `hints` and `ReadOptions` (`ifMatch`, `signal`) add single-request opens, change detection and cancellation.
 
-Options cascade through three levels - **source** overrides **tile-level defaults** overrides **built-in defaults**:
+---
+
+## Options
+
+Options cascade: **source** `options` override **tile-level** options (constructor or `tile()` call), which override the built-in defaults.
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `extent` | `4096` | Tile coordinate extent |
-| `buffer` | `64` | Buffer around tile in tile-coordinate pixels |
-| `tolerance` | `3` | Douglas-Peucker simplification tolerance |
-| `minZoom` | `0` | Skip source below this zoom |
-| `maxZoom` | `24` | Skip source above this zoom |
+| `buffer` | `64` | Buffer around the tile, in tile units |
+| `tolerance` | `3` | Douglas-Peucker simplification tolerance, in tile units (`0` = off) |
+| `minZoom` / `maxZoom` | `0` / `24` | Zoom range in which the source contributes |
+| `simplifyBeforeClip` | `false` | Simplify whole features before clipping, so adjacent tiles match exactly along their edges (costs simplifying every feature in full) |
+| `pointGrid` | `0` | Keep at most one point per cell of this size in tile units (`0` = off); use a divisor of `extent` |
+| `maxFeatures` | `Infinity` | Most features a source may contribute to one tile |
+| `maxReadBytes` | `256 MiB` | Most feature bytes read from a source for one tile |
+| `maxTileBytes` | `Infinity` | Largest encoded tile (tile level only) |
+| `omitEmptyLayers` | `false` | Leave out layers without features (tile level only); a tile without any features encodes to **zero bytes**, e.g. for `204 No Content` |
 
 ```typescript
 const server = new TileServer(
   {
     connector: new LocalConnector(),
     sources: [
-      { name: 'detail', path: './detail.fgb', options: { tolerance: 1 } },  // tolerance=1
-      { name: 'overview', path: './overview.fgb' },                         // tolerance=5 (from tile defaults)
+      { name: 'detail', path: './detail.fgb', options: { tolerance: 1 } }, // tolerance 1
+      { name: 'overview', path: './overview.fgb' },                        // tolerance 5, from the tile level
     ],
   },
-  { tolerance: 5, maxZoom: 18 },  // tile-level defaults
+  { tolerance: 5, maxZoom: 18 },
 );
 ```
-##
-#### Types
+
+**Budgets** (`maxFeatures`, `maxReadBytes`, `maxTileBytes`) are checked against the spatial index before any feature data is read, and raise `LimitExceededError` (with `limit`, `max` and `actual`). For dense data at low zooms, an overview file serves better than larger budgets: `pointGrid` bounds the tile size, but every point is still read. Sources sharing a name are merged into one layer, so a dataset can be split by zoom:
 
 ```typescript
-import type {
-  Connector,
-  Source, SourceOptions, TileOptions,
-  TileServerLayer, TileJSON, BBox,
-  LocalConnectorOptions, HttpConnectorOptions, S3ConnectorOptions,
-} from '@geozelot/fgb-vt';
+sources: [
+  { name: 'poi', path: 'poi-overview.fgb', options: { maxZoom: 9 } },
+  { name: 'poi', path: 'poi.fgb', options: { minZoom: 10 } },
+]
 ```
 
-***
+---
 
-### Testing
+## Sources
 
-#### Unit Tests
+| Field | Default | Description |
+|-------|---------|-------------|
+| `name` | required | Layer name; sources sharing a name form one layer |
+| `path` | required | File path, URL or S3 URI, as the connector expects |
+| `options` | | Per-source [options](#options) |
+| `crs` | `'auto'` | Coordinate reference system: from the header, `'lonlat'`, `'webmercator'` or a `Projection` (see [Data support](#data-support)) |
+| `properties` | all | Names to keep (`['name', 'class']`, `[]` for none), or `{ exclude: [...] }`. Dropped strings are never decoded |
+| `idColumn` | auto-detected | Integer column providing the MVT feature id, or `false` for none. By default the first integer column named `id`, `fid`, `gid` or `ogc_fid` |
+| `keepIdProperty` | `false` | Also write the id column as a property |
+| `useIndex` | `true` | `false` ignores the spatial index and scans the file (within `maxScanBytes`), e.g. for files whose index is broken |
+
+```typescript
+{ name: 'roads', path: 's3://bucket/roads.fgb', properties: ['name', 'class'], idColumn: 'osm_id', options: { minZoom: 8 } }
+```
+
+---
+
+## Data support
+
+**Format** — FlatGeobuf 3.x of any patch level, with or without a spatial index (files without one are scanned, up to `maxScanBytes`). Versions 1.x and 2.x raise `UnsupportedFormatError`.
+
+**Geometry** — all 17 FlatGeobuf types, including layers that mix types:
+
+| FlatGeobuf | MVT |
+|------------|-----|
+| Point, MultiPoint | `POINT` |
+| LineString, MultiLineString | `LINESTRING` |
+| Polygon, MultiPolygon, Triangle | `POLYGON` |
+| CircularString, CompoundCurve, MultiCurve | `LINESTRING`, arcs linearised |
+| CurvePolygon, MultiSurface | `POLYGON`, arcs linearised |
+| TIN, PolyhedralSurface | `POLYGON`, one polygon per face |
+| GeometryCollection | one feature per geometry family (polygons, lines, points), sharing id and properties |
+
+Arcs are linearised per tile so that no chord deviates from the curve by more than one tile unit (up to 128 chords per arc). Z, M, T and TM values are ignored. Features of unknown or abstract geometry types are skipped.
+
+**Antimeridian** — tiles at the world's east and west edges include features from the other side in their buffer, and data stored with longitudes beyond ±180° (such as a polygon from 170° to 190°) appears on both sides. A ring that jumps from 179° to -179° is indistinguishable from one spanning the globe: split such data at ±180° or store it beyond 180°.
+
+**Properties** — all 15 column types. Binary columns are dropped (MVT has no binary values), and a feature's own column schema overrides the header's. 64-bit integers are written exactly (as `bigint` beyond 2^53); fractional numbers become MVT `float` when a 32-bit float holds them exactly, `double` otherwise.
+
+**Coordinate reference systems** — built in:
+
+- WGS 84 longitude/latitude: EPSG:4326, OGC:CRS84, or no CRS declared;
+- geographic CRSs on datums within about 2 m of WGS 84: NAD83, ETRS89, GDA94, GDA2020, NZGD2000, SIRGAS 2000, JGD2000/2011;
+- Web Mercator: EPSG:3857 and its aliases.
+
+Any other CRS raises `UnsupportedFormatError` unless the source sets `crs`, for example with [proj4](https://github.com/proj4js/proj4js):
+
+```typescript
+import proj4 from 'proj4';
+
+const utm = proj4('EPSG:25832', 'WGS84');
+const parcels = {
+  name: 'parcels',
+  path: 's3://bucket/parcels-utm32.fgb',
+  crs: {
+    toWgs84: (x: number, y: number) => utm.forward([x, y]),
+    fromWgs84: (lon: number, lat: number) => utm.inverse([lon, lat]),
+  },
+};
+```
+
+`crs: 'lonlat'` reads coordinates as longitude/latitude whatever the header says.
+
+---
+
+## I/O and caching
+
+I/O options are accepted alongside the [options](#options) by `tile()`, `TileClient` and `TileServer`:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `cache` | shared 64 MiB `MemoryCache` (`tile()`), one per instance (`TileClient`, `TileServer`) | Header and index page cache: any `ByteCache` (`get`/`set`/`delete`), or `false` |
+| `prefetch` | connector hint: 64 KiB local, 256 KiB HTTP/S3 (16 KiB HTTP in browsers) | Size of the first read of each file |
+| `coalesceGap` | connector hint: 4 KiB local, 64 KiB HTTP/S3 | Merge byte ranges at most this far apart |
+| `maxScanBytes` | 32 MiB | Largest feature section scanned for files **without** a spatial index |
+| `maxFeatureBytes` | 256 MiB | Largest single feature read (guards against corrupt size prefixes) |
+
+```typescript
+import { TileClient, S3Connector, MemoryCache } from '@geozelot/fgb-vt';
+
+const client = new TileClient(new S3Connector({ region: 'us-east-1' }), {
+  cache: new MemoryCache({ maxBytes: 128 * 1024 * 1024 }),
+});
+
+// e.g. during a function's init phase: headers and upper index levels
+await client.open({ name: 'parcels', path: 's3://bucket/parcels.fgb' });
+```
+
+**Cancellation** — every tile call accepts an `AbortSignal`, e.g. `{ signal: AbortSignal.timeout(3000) }` for a deadline. Pending reads are cancelled and the call rejects with the signal's reason.
+
+**Metrics** — an `onTile` hook (per call, or as a `TileClient` / `TileServer` default) receives the tile size and duration and, per source, the features read and encoded, range requests, and index and feature bytes:
+
+```typescript
+const server = new TileServer(layers, {
+  onTile: ({ z, tileBytes, durationMs, sources }) => {
+    for (const s of sources) metrics.record(z, s.name, s.requests, s.indexBytes + s.featureBytes);
+  },
+});
+```
+
+**Changing files** — cache entries are keyed by path and version tag (ETag, or inode, size and modification time locally). Every read carries the version tag; when a file is replaced, its source is reopened automatically. With custom connectors that report no version tag, cached files must not change in place.
+
+**TileJSON** — `server.tileJSON({ tiles, name, description, attribution, version })` returns TileJSON 3.0.0. Bounds come from the file headers (or index roots) in WGS 84, fields list the properties actually written, and names and descriptions default to the file headers.
+
+---
+
+## Errors
+
+Data and I/O problems raise subclasses of `FgbVtError` with a stable `code` and the source `path`:
+
+| Class | `code` | Raised when |
+|-------|--------|-------------|
+| `FormatError` | `FGB_FORMAT` | The file is not valid FlatGeobuf (corrupt, truncated, inconsistent) |
+| `IndexMismatchError` | `FGB_FORMAT` | A `FormatError`: the spatial index does not match the feature data (a faulty writer). Rewrite the file, or set `useIndex: false` |
+| `UnsupportedFormatError` | `FGB_UNSUPPORTED` | Valid FlatGeobuf that cannot be read: major version other than 3, unknown column type, or an unsupported CRS without `crs` on the source |
+| `ConnectorError` | `FGB_IO` | Storage access failed (`retryable`, `status`) |
+| `RangeNotSupportedError` | `FGB_RANGE_UNSUPPORTED` | An HTTP server ignores range requests |
+| `SourceChangedError` | `FGB_SOURCE_CHANGED` | A file kept changing between reads |
+| `LimitExceededError` | `FGB_LIMIT` | A budget was exceeded: `limit` names it (`features`, `readBytes`, `tileBytes`, `scanBytes`, `featureBytes`) |
+
+Invalid tile coordinates, and an `idColumn` that is not an integer column of the file, raise `RangeError`.
+
+All option and result types are exported for TypeScript, e.g. `Source`, `TileOptions`, `IoOptions`, `RequestOptions`, `TileStats`, `Projection`, `TileJSON`; see the [API docs](https://geozelot.github.io/fgb-vt/).
+
+---
+
+## Guides
+
+- [Serverless deployment](guide/serverless.md): Lambda and S3 setup, caching, budgets, error mapping, metrics
+- [Producing files](guide/producing-files.md): writing FlatGeobuf for fast tiles, overviews, CRS, other writers
+
+---
+
+## Development
 
 ```bash
-npm test
+npm test          # unit, golden-file, validity and fuzz tests (Vitest)
+npm run build     # Node build and browser bundles
+npm run bench     # benchmarks; --json <file> and --summary <file> for machine-readable output
+npm run docs      # API docs (TypeDoc), including the guides
 ```
 
-Runs the full test suite via [Vitest](https://vitest.dev/).
+- **Golden files** in `test/fixtures` are written by GDAL (`python3 test/fixtures/generate.py`) and by gogama/flatgeobuf (`cd test/fixtures/writers/gogama && go run . ../..`).
+- **Validity sweep:** every tile in the tests is checked by a strict MVT 2.1 validator (`test/helpers/mvt-validate.ts`).
+- **Fuzzing:** `test/fuzz.test.ts` tiles randomly corrupted files and requires a valid tile or a typed error. Run longer with `FUZZ_ITERATIONS=20000`, and reproduce a failure with its `FUZZ_SEED`. A weekly CI workflow runs the long version.
 
-##
-#### Benchmarks
+Tile generation from the test files, measured locally (Node 24, warm cache):
 
-```bash
-npm run bench
-```
+| File | Tile | Time per tile |
+|------|------|--------------:|
+| 5,000 points | z8 | 0.05 ms |
+| 5,000 points | z0 (all points) | 4.6 ms |
+| detailed polygons (600–1,500 vertices per ring) | z7 | 0.19 ms |
+| detailed polygons | z3 | 0.47 ms |
+| curves, linearised | z5 | 0.10 ms |
+| 5,000 points, no cache (header and index read per tile) | z8 | 0.15 ms |
 
-| Stage | Input | Throughput |
-|-------|-------|-----------|
-| Projection | 1,000 coord pairs | ~38k ops/s |
-| Clipping | 50 polygons (20v) | ~22k ops/s |
-| Simplification | 200-point line | ~91k ops/s |
-| MVT Encoding | 100-point line | ~1.6M ops/s |
-| PBF Encoding | 100-feature layer | ~17k ops/s |
-| Full Pipeline | 100 mixed features | ~2.6k ops/s |
+CI publishes the full benchmark results for every commit in the job summary.
 
+---
 
-
-***
-### License
+## License
 
 [MIT](LICENSE)

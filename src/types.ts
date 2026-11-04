@@ -21,9 +21,10 @@
 /**
  * FlatGeobuf geometry type constants.
  *
- * These match the FlatGeobuf specification's `GeometryType` enum and are used
- * throughout the pipeline to dispatch type-specific logic (clipping, winding
- * order correction, MVT command encoding).
+ * These match the FlatGeobuf specification's `GeometryType` enum. The
+ * feature decoder normalises types 7–17 to the six basic types (1–6), so the
+ * geometry pipeline (clipping, winding order correction, MVT command
+ * encoding) only ever sees those.
  */
 export const enum GeomType {
   Unknown = 0,
@@ -33,6 +34,17 @@ export const enum GeomType {
   MultiPoint = 4,
   MultiLineString = 5,
   MultiPolygon = 6,
+  GeometryCollection = 7,
+  CircularString = 8,
+  CompoundCurve = 9,
+  CurvePolygon = 10,
+  MultiCurve = 11,
+  MultiSurface = 12,
+  Curve = 13,
+  Surface = 14,
+  PolyhedralSurface = 15,
+  TIN = 16,
+  Triangle = 17,
 }
 
 /**
@@ -75,9 +87,11 @@ export interface BBox {
  *
  * Maps to the FlatGeobuf column types: numeric types → `number`,
  * string/json/datetime → `string`, bool → `boolean`, binary → `Uint8Array`.
- * Nullable columns may produce `null`.
+ * 64-bit integers (`Long`/`ULong`) outside the safe-integer range decode to
+ * `bigint` so they survive to the tile exactly. Nullable columns may
+ * produce `null`.
  */
-export type PropertyValue = string | number | boolean | Uint8Array | null;
+export type PropertyValue = string | number | bigint | boolean | Uint8Array | null;
 
 /**
  * A decoded FlatGeobuf feature with flat coordinate arrays.
@@ -87,7 +101,11 @@ export type PropertyValue = string | number | boolean | Uint8Array | null;
  * mercator [0, 1] space in-place during the pipeline.
  */
 export interface RawFeature {
-  /** Geometry type from the FGB header or per-feature override. */
+  /**
+   * Geometry type, always one of the six basic types (`Point` through
+   * `MultiPolygon`): curves are linearised, and surfaces and collections
+   * are split by the decoder.
+   */
   type: GeomType;
   /**
    * Flat interleaved coordinate array: `[x0, y0, x1, y1, ...]`.
@@ -121,8 +139,11 @@ export interface RawFeature {
   parts: Uint32Array | null;
   /** Decoded property key-value pairs. */
   properties: Map<string, PropertyValue>;
-  /** FGB feature ID, or `null` if the feature has no ID. */
-  id: number | null;
+  /**
+   * Feature ID taken from the detected ID column: a non-negative safe
+   * integer or a non-negative `bigint` (MVT ids are `uint64`), or `null`.
+   */
+  id: number | bigint | null;
 }
 
 // == FGB Column Schema ======================================================
@@ -183,7 +204,10 @@ export interface FgbHeader {
   featuresCount: number;
   /** Hilbert R-tree node fan-out size (0 = no spatial index). */
   indexNodeSize: number;
-  /** Dataset bounding box in WGS84, or `null` if not present in the header. */
+  /**
+   * Dataset envelope in the file's coordinate system, or `null` if the
+   * header has none or an invalid one (non-finite, or min > max).
+   */
   bbox: BBox | null;
   /** Byte offset where the packed Hilbert R-tree spatial index starts. */
   indexOffset: number;
@@ -201,6 +225,33 @@ export interface FgbHeader {
    * case-insensitively and only accepts integer column types.
    */
   idColumnIndex: number;
+  /** Coordinate reference system, or `null` if the header declares none. */
+  crs: CrsInfo | null;
+  /** Dataset name (`name`), or `null`. */
+  name: string | null;
+  /** Human-readable title (`title`), or `null`. */
+  title: string | null;
+  /** Human-readable description (`description`), or `null`. */
+  description: string | null;
+  /** Free-form metadata (`metadata`, by convention JSON), or `null`. */
+  metadata: string | null;
+}
+
+/**
+ * Coordinate reference system as declared in a FlatGeobuf header (`Crs`
+ * table). Every field is optional in the format.
+ */
+export interface CrsInfo {
+  /** Defining organisation, e.g. `EPSG` (case-insensitive; `null` means EPSG). */
+  org: string | null;
+  /** Numeric code assigned by the organisation (`0` = unknown). */
+  code: number;
+  /** Textual code for codes that are not integers, e.g. `CRS84` for OGC. */
+  codeString: string | null;
+  /** Human-readable name. */
+  name: string | null;
+  /** WKT definition. */
+  wkt: string | null;
 }
 
 // == MVT Types ==============================================================
@@ -209,22 +260,24 @@ export interface FgbHeader {
  * A tagged MVT property value.
  *
  * MVT stores values in a typed oneof: string, double, float, int64, uint64,
- * sint64, or bool. We collapse float/double into `double` and all integer
- * variants into `int` (signed) or `uint` (unsigned).
+ * sint64, or bool. Fractional numbers use `float` when a 32-bit float
+ * represents them exactly (always the case for FlatGeobuf `Float` columns)
+ * and `double` otherwise; integers use `int` (signed) or `uint` (unsigned).
  */
 export type MvtValue =
   | { type: 'string'; value: string }
+  | { type: 'float'; value: number }
   | { type: 'double'; value: number }
-  | { type: 'int'; value: number }
-  | { type: 'uint'; value: number }
+  | { type: 'int'; value: number | bigint }
+  | { type: 'uint'; value: number | bigint }
   | { type: 'bool'; value: boolean };
 
 /**
  * A single feature within an MVT layer, ready for PBF encoding.
  */
 export interface MvtFeature {
-  /** Feature ID, or `null` if absent. Written as `uint64` in the PBF. */
-  id: number | null;
+  /** Feature ID (non-negative), or `null` if absent. Written as `uint64` in the PBF. */
+  id: number | bigint | null;
   /** MVT geometry type (POINT, LINESTRING, or POLYGON). */
   type: MvtGeomType;
   /** Command-encoded geometry integers per the MVT 2.1 spec. */
@@ -265,8 +318,16 @@ export interface MvtLayer {
 export interface TileJSON {
   /** Specification version — always `"3.0.0"`. */
   tilejson: '3.0.0';
+  /** Tile URL templates (from `tileJSON({ tiles })`). */
+  tiles: string[];
   /** Human-readable tileset name. */
   name?: string;
+  /** Human-readable tileset description. */
+  description?: string;
+  /** Attribution (HTML). */
+  attribution?: string;
+  /** Tileset version (semver). */
+  version?: string;
   /** WGS84 bounding box: `[west, south, east, north]`. */
   bounds: [number, number, number, number];
   /** Minimum zoom level with tile coverage. */
@@ -277,6 +338,8 @@ export interface TileJSON {
   vector_layers: Array<{
     /** Layer identifier (matches the source `name`). */
     id: string;
+    /** Layer description (from the file header's description or title). */
+    description?: string;
     /** Map of property names to type strings (`"Number"`, `"String"`, `"Boolean"`). */
     fields: Record<string, string>;
     /** Minimum zoom at which this layer appears. */

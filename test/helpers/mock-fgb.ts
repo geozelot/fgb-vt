@@ -1,3 +1,5 @@
+import { calcTreeSize } from '../../src/fgb/index.js';
+
 /**
  * Build a minimal valid FGB file as a Uint8Array.
  * This constructs raw FlatBuffer bytes for the header so that
@@ -258,18 +260,12 @@ export function buildMockFgb(opts: MockFgbOptions = {}): Uint8Array {
 }
 
 /**
- * Compute spatial index size (same algorithm as in header.ts).
+ * Compute spatial index size (the reader's packed R-tree layout; 0 when
+ * there is no index).
  */
 export function calcMockIndexSize(featuresCount: number, nodeSize: number): number {
   if (featuresCount === 0 || nodeSize === 0) return 0;
-  const NODE_ITEM_BYTE_SIZE = 40;
-  let n = featuresCount;
-  let totalNodes = n;
-  while (n > 1) {
-    n = Math.ceil(n / nodeSize);
-    totalNodes += n;
-  }
-  return totalNodes * NODE_ITEM_BYTE_SIZE;
+  return calcTreeSize(featuresCount, nodeSize);
 }
 
 /**

@@ -6,8 +6,8 @@
  *
  * The per-feature pipeline applies the following stages in order:
  *
- * 1. **Project** -- WGS84 longitude/latitude to Web Mercator [0, 1] space
- *    ({@link projectToMercator}).
+ * 1. **Project** -- source coordinates (WGS84 longitude/latitude by
+ *    default) to Web Mercator [0, 1] space ({@link projectToMercator}).
  * 2. **Clip** -- discard or cut geometry to the tile's bounding box, with an
  *    optional buffer for line/label overshoot ({@link clipFeatures}).
  * 3. **Simplify** -- reduce vertex count using squared-distance tolerance
@@ -58,6 +58,10 @@ import type { BBox } from '../types.js';
  * @param extent - Tile coordinate extent (typically 4096).
  * @param tolerance - Simplification tolerance in tile coordinate units.
  *   Set to 0 to disable simplification entirely.
+ * @param toMercator - Converts the features' coordinates to mercator
+ *   [0, 1] space in place. Defaults to the WGS 84 longitude/latitude
+ *   projection.
+ * @param options - Simplification mode and point thinning.
  * @returns A fully assembled {@link MvtLayer} with deduplicated keys/values
  *   and encoded geometry commands for every surviving feature.
  */
@@ -70,6 +74,8 @@ export function buildMvtLayer(
   clipBounds: BBox,
   extent: number,
   tolerance: number,
+  toMercator: (xy: Float64Array) => void = projectToMercator,
+  options: LayerOptions = {},
 ): MvtLayer {
   const keys: string[] = [];
   const keyIndex = new Map<string, number>();
@@ -78,97 +84,47 @@ export function buildMvtLayer(
   const mvtFeatures: MvtFeature[] = [];
 
   const sqTol = tolerance > 0 ? sqToleranceForZoom(tolerance, z, extent) : 0;
+  const before = options.simplifyBeforeClip === true && sqTol > 0;
+  const grid = options.pointGrid !== undefined && options.pointGrid > 0 ? options.pointGrid : 0;
+  const occupied = grid > 0 ? new Set<number>() : null;
 
   // Project all features to mercator in-place
   for (const f of features) {
-    projectToMercator(f.xy);
+    toMercator(f.xy);
   }
 
-  // Clip features to tile bounds
-  const clipped = clipFeatures(features, clipBounds);
-
-  for (const feature of clipped) {
-    // Simplify (for line/polygon types)
-    let xy = feature.xy;
-    let ends = feature.ends;
-    let parts = feature.parts;
-
-    const isPoint = feature.type === GeomType.Point || feature.type === GeomType.MultiPoint;
-
-    if (!isPoint && sqTol > 0) {
-      if (ends && ends.length > 1) {
-        // Multi-ring: simplify each ring independently, dropping small rings.
-        // Track which original ring index each surviving ring came from so we
-        // can rebuild `parts` (MultiPolygon exterior ring tracking).
-        const simplifiedRings: Float64Array[] = [];
-        const newEnds: number[] = [];
-        const ringOriginMap: number[] = [];
-        let start = 0;
-        let pairOffset = 0;
-        for (let i = 0; i < ends.length; i++) {
-          const end = ends[i] * 2; // to element index
-          const ringXy = xy.subarray(start, end);
-
-          // Drop small rings
-          if (ringTooSmall(ringXy, 0, ringXy.length, sqTol)) {
-            start = end;
-            continue;
-          }
-
-          const simplified = simplify(ringXy, sqTol);
-          if (simplified.length >= 4) { // at least 2 points
-            simplifiedRings.push(simplified);
-            pairOffset += simplified.length / 2;
-            newEnds.push(pairOffset);
-            ringOriginMap.push(i);
-          }
-          start = end;
-        }
-
-        if (simplifiedRings.length === 0) continue;
-
-        // Reassemble
-        const totalLen = simplifiedRings.reduce((s, r) => s + r.length, 0);
-        xy = new Float64Array(totalLen);
-        let off = 0;
-        for (const ring of simplifiedRings) {
-          xy.set(ring, off);
-          off += ring.length;
-        }
-        ends = new Uint32Array(newEnds);
-
-        // Rebuild parts: map original exterior ring indices to new positions
-        if (parts) {
-          const exteriorOrigSet = new Set<number>();
-          for (let j = 0; j < parts.length; j++) {
-            exteriorOrigSet.add(parts[j]);
-          }
-          const newPartStarts: number[] = [];
-          for (let i = 0; i < ringOriginMap.length; i++) {
-            if (exteriorOrigSet.has(ringOriginMap[i])) {
-              newPartStarts.push(i);
-            }
-          }
-          parts = newPartStarts.length > 1 ? new Uint32Array(newPartStarts) : null;
-        }
-      } else {
-        xy = simplify(xy, sqTol);
-        if (xy.length < 4 && !isPoint) continue; // degenerate
-      }
+  // Simplify whole features before clipping (same result in every tile),
+  // or the clipped parts after
+  let input = features;
+  if (before) {
+    input = [];
+    for (const f of features) {
+      const simplified = simplifyFeature(f, sqTol);
+      if (simplified) input.push(simplified);
     }
+  }
+  const clipped = clipFeatures(input, clipBounds);
 
-    if (xy.length === 0) continue;
+  for (const clippedFeature of clipped) {
+    const feature = before || sqTol === 0 ? clippedFeature : simplifyFeature(clippedFeature, sqTol);
+    if (!feature || feature.xy.length === 0) continue;
 
     // Transform to tile coordinates
-    const tileCoords = transformToTile(xy, z, x, y, extent);
+    let tileCoords = transformToTile(feature.xy, z, x, y, extent);
+
+    // Thin points: at most one per grid cell, the first in file order
+    if (occupied && (feature.type === GeomType.Point || feature.type === GeomType.MultiPoint)) {
+      tileCoords = thinPoints(tileCoords, grid, occupied);
+      if (tileCoords.length === 0) continue;
+    }
 
     // Correct polygon winding order (parts tracks which rings are exterior
     // for MultiPolygon geometries with multiple polygon parts)
-    correctWinding(tileCoords, ends, feature.type, parts);
+    correctWinding(tileCoords, feature.ends, feature.type, feature.parts);
 
     // Encode geometry commands
     const mvtType = toMvtGeomType(feature.type);
-    const geometry = encodeGeometry(tileCoords, ends, mvtType);
+    const geometry = encodeGeometry(tileCoords, feature.ends, mvtType);
     if (geometry.length === 0) continue;
 
     // Build tags
@@ -189,6 +145,209 @@ export function buildMvtLayer(
     keys,
     values,
   };
+}
+
+/**
+ * Options for {@link buildMvtLayer}.
+ */
+export interface LayerOptions {
+  /**
+   * Simplify each feature as a whole before clipping it to the tile, so
+   * that every tile showing it gets identical vertices along shared
+   * edges. Costs the full simplification of every feature reaching the
+   * tile, however little of it is visible. @defaultValue false
+   */
+  simplifyBeforeClip?: boolean;
+  /**
+   * Keep at most one point per cell of this size (in tile units); `0`
+   * disables thinning. @defaultValue 0
+   */
+  pointGrid?: number;
+}
+
+// == Simplification =========================================================
+
+/**
+ * Simplify the lines and rings of a feature in mercator space, dropping
+ * rings that collapse below the tolerance.
+ *
+ * @param feature - Feature in mercator [0, 1] space.
+ * @param sqTol - Squared simplification tolerance in mercator units.
+ * @returns The simplified feature (the input itself for points), or
+ *   `null` if nothing remains.
+ */
+function simplifyFeature(feature: RawFeature, sqTol: number): RawFeature | null {
+  if (feature.type === GeomType.Point || feature.type === GeomType.MultiPoint) return feature;
+  const { xy, ends, parts } = feature;
+
+  if (!ends || ends.length <= 1) {
+    const simplified = simplify(xy, sqTol);
+    if (simplified.length < 4) return null; // degenerate
+    // A single ring/part needs no ends; any existing ends indexed the
+    // unsimplified coordinates and would now point past the array.
+    return { ...feature, xy: simplified, ends: null };
+  }
+
+  // Multi-ring: simplify each ring independently, dropping small rings.
+  // Track which original ring index each surviving ring came from so we
+  // can rebuild `parts` (MultiPolygon exterior ring tracking).
+  const simplifiedRings: Float64Array[] = [];
+  const newEnds: number[] = [];
+  const ringOriginMap: number[] = [];
+  let start = 0;
+  let pairOffset = 0;
+  for (let i = 0; i < ends.length; i++) {
+    const end = ends[i] * 2; // to element index
+    const ringXy = xy.subarray(start, end);
+    start = end;
+
+    // Drop small rings
+    if (ringTooSmall(ringXy, 0, ringXy.length, sqTol)) continue;
+
+    const simplified = simplify(ringXy, sqTol);
+    if (simplified.length >= 4) { // at least 2 points
+      simplifiedRings.push(simplified);
+      pairOffset += simplified.length / 2;
+      newEnds.push(pairOffset);
+      ringOriginMap.push(i);
+    }
+  }
+
+  if (simplifiedRings.length === 0) return null;
+
+  // Reassemble
+  const totalLen = simplifiedRings.reduce((s, r) => s + r.length, 0);
+  const out = new Float64Array(totalLen);
+  let off = 0;
+  for (const ring of simplifiedRings) {
+    out.set(ring, off);
+    off += ring.length;
+  }
+
+  // Rebuild parts: map original exterior ring indices to new positions
+  let newParts: Uint32Array | null = null;
+  if (parts) {
+    const exteriorOrigSet = new Set<number>();
+    for (let j = 0; j < parts.length; j++) {
+      exteriorOrigSet.add(parts[j]);
+    }
+    const newPartStarts: number[] = [];
+    for (let i = 0; i < ringOriginMap.length; i++) {
+      if (exteriorOrigSet.has(ringOriginMap[i])) {
+        newPartStarts.push(i);
+      }
+    }
+    newParts = newPartStarts.length > 1 ? new Uint32Array(newPartStarts) : null;
+  }
+
+  return { ...feature, xy: out, ends: new Uint32Array(newEnds), parts: newParts };
+}
+
+// == Point thinning =========================================================
+
+/** Offset making cell indices non-negative for the numeric cell key. */
+const CELL_OFFSET = 0x100000;
+
+/**
+ * Drop points whose grid cell is already occupied, marking the cells of
+ * the points kept.
+ *
+ * @param coords - Tile coordinates of one (multi)point feature.
+ * @param grid - Cell size in tile units.
+ * @param occupied - Cells taken by earlier points of the layer.
+ * @returns The kept points (the input when all are kept).
+ */
+function thinPoints(coords: Int32Array, grid: number, occupied: Set<number>): Int32Array {
+  let kept: number[] | null = null;
+  for (let i = 0; i < coords.length; i += 2) {
+    const cell = (Math.floor(coords[i] / grid) + CELL_OFFSET) * 0x200000 +
+      (Math.floor(coords[i + 1] / grid) + CELL_OFFSET);
+    if (occupied.has(cell)) {
+      if (!kept) kept = Array.from(coords.subarray(0, i));
+      continue;
+    }
+    occupied.add(cell);
+    if (kept) kept.push(coords[i], coords[i + 1]);
+  }
+  return kept ? Int32Array.from(kept) : coords;
+}
+
+// == Layer merging ==========================================================
+
+/**
+ * Merge layers that share a name into one, in order of first appearance.
+ *
+ * The MVT spec forbids two layers with the same name in a tile. Sources
+ * with the same name (e.g. a detailed file and an overview file with
+ * disjoint zoom ranges, or one dataset split into several files) are
+ * therefore combined: features are concatenated and their tags re-indexed
+ * against the merged key and value tables.
+ *
+ * @param layers - Layers in tile order.
+ * @returns Layers with unique names.
+ * @throws {RangeError} If layers with the same name have different extents.
+ */
+export function mergeLayers(layers: MvtLayer[]): MvtLayer[] {
+  const out: MvtLayer[] = [];
+  const byName = new Map<string, number>();
+  for (const layer of layers) {
+    const at = byName.get(layer.name);
+    if (at === undefined) {
+      byName.set(layer.name, out.length);
+      out.push(layer);
+      continue;
+    }
+    const target = out[at];
+    if (target.extent !== layer.extent) {
+      throw new RangeError(
+        `Sources named "${layer.name}" use different extents (${target.extent} and ${layer.extent})`,
+      );
+    }
+    if (layer.features.length === 0) continue;
+    if (target.features.length === 0) {
+      out[at] = layer;
+      continue;
+    }
+    out[at] = appendLayer(target, layer);
+  }
+  return out;
+}
+
+/** A new layer with the features of `a` followed by those of `b`. */
+function appendLayer(a: MvtLayer, b: MvtLayer): MvtLayer {
+  const keys = [...a.keys];
+  const keyIndex = new Map(keys.map((k, i) => [k, i]));
+  const values = [...a.values];
+  const valueIndex = new Map(values.map((v, i) => [mvtValueKey(v), i]));
+  const keyMap = b.keys.map((k) => {
+    let i = keyIndex.get(k);
+    if (i === undefined) {
+      i = keys.length;
+      keys.push(k);
+      keyIndex.set(k, i);
+    }
+    return i;
+  });
+  const valueMap = b.values.map((v) => {
+    const key = mvtValueKey(v);
+    let i = valueIndex.get(key);
+    if (i === undefined) {
+      i = values.length;
+      values.push(v);
+      valueIndex.set(key, i);
+    }
+    return i;
+  });
+  const features = [...a.features];
+  for (const f of b.features) {
+    const tags = new Array<number>(f.tags.length);
+    for (let i = 0; i < f.tags.length; i += 2) {
+      tags[i] = keyMap[f.tags[i]];
+      tags[i + 1] = valueMap[f.tags[i + 1]];
+    }
+    features.push({ ...f, tags });
+  }
+  return { name: a.name, extent: a.extent, features, keys, values };
 }
 
 // == Tag building ===========================================================
@@ -253,8 +412,12 @@ function buildTags(
 /**
  * Convert a decoded FGB property value to a typed {@link MvtValue}.
  *
- * Numeric values are classified as `uint` (non-negative integers), `int`
- * (negative integers), or `double` (fractional). Booleans map directly.
+ * Integers that are exactly representable (safe-integer `number`s and
+ * `bigint`s) are classified as `uint` (non-negative) or `int` (negative).
+ * Fractional numbers, and integral doubles beyond the safe range (which
+ * carry no exact integer value), become `float` when a 32-bit float
+ * represents them exactly (every value of a FlatGeobuf `Float` column) and
+ * `double` otherwise, so no precision is lost. Booleans map directly.
  * All other types (including unexpected ones) are coerced to strings.
  *
  * @param value - Raw property value from the FGB feature.
@@ -268,13 +431,14 @@ function toMvtValue(value: PropertyValue): MvtValue {
     return { type: 'bool', value };
   }
   if (typeof value === 'number') {
-    if (Number.isInteger(value)) {
-      if (value >= 0) {
-        return { type: 'uint', value };
-      }
-      return { type: 'int', value };
+    if (Number.isSafeInteger(value)) {
+      return value >= 0 ? { type: 'uint', value } : { type: 'int', value };
     }
-    return { type: 'double', value };
+    // Lossless and 4 bytes smaller when a 32-bit float holds the value exactly
+    return Math.fround(value) === value ? { type: 'float', value } : { type: 'double', value };
+  }
+  if (typeof value === 'bigint') {
+    return value >= 0n ? { type: 'uint', value } : { type: 'int', value };
   }
   return { type: 'string', value: String(value) };
 }

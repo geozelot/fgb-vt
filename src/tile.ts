@@ -5,15 +5,15 @@
  *
  * This is the lowest-ceremony entry point in the fgb-vt API. Every
  * dependency — connector, sources, and options — is provided per call.
- * The **only** state held at module level is a shared
- * {@link globalTileBoundsCache | tile bounds cache}, which stores purely
- * mathematical tile-to-mercator bounding box mappings (no I/O, no source
- * dependency). This makes the function safe to call from stateless
- * request handlers where no persistent context is desired.
  *
- * For use cases that benefit from binding a connector or caching FGB
- * headers across calls, see the {@link TileClient} and {@link TileServer}
- * tiers instead.
+ * The only state is a bounded module-level {@link MemoryCache} (64 MiB) of
+ * file headers and spatial index pages, shared by all calls. In a
+ * serverless function it survives warm invocations, so repeat requests
+ * against the same files skip most index reads. Pass `cache: false` for
+ * fully stateless operation, or your own {@link ByteCache}.
+ *
+ * For binding a connector or a fixed set of sources, see the
+ * {@link TileClient} and {@link TileServer} tiers.
  *
  * @example
  * ```typescript
@@ -34,8 +34,12 @@
 
 import type { Connector } from './connectors/connector.js';
 import type { Source, TileOptions } from './source.js';
-import { globalTileBoundsCache } from './tiles.js';
-import { processTile } from './pipeline.js';
+import { processTile, type RequestOptions } from './pipeline.js';
+import { MemoryCache } from './cache.js';
+import { createIoContext, type IoOptions } from './fgb/reader.js';
+
+/** Module-level header and index cache shared by all `tile()` calls. */
+const sharedCache = new MemoryCache({ maxBytes: 64 * 1024 * 1024 });
 
 /**
  * Generate a vector tile from multiple FlatGeobuf sources.
@@ -48,7 +52,9 @@ import { processTile } from './pipeline.js';
  * @param x - Tile column.
  * @param y - Tile row.
  * @param sources - Array of source descriptors; each becomes one MVT layer.
- * @param options - Tile-level tiling option defaults (overridden by per-source options).
+ * @param options - Tile-level tiling option defaults and budgets (overridden
+ *   by per-source options), I/O options (cache, prefetch, range merging, scan
+ *   budget) and an optional abort `signal`.
  * @returns PBF-encoded Mapbox Vector Tile containing one layer per source.
  *
  * @example
@@ -65,7 +71,7 @@ export async function tile(
   x: number,
   y: number,
   sources: Source[],
-  options?: TileOptions,
+  options?: TileOptions & IoOptions & RequestOptions,
 ): Promise<Uint8Array>;
 
 /**
@@ -79,7 +85,9 @@ export async function tile(
  * @param x - Tile column.
  * @param y - Tile row.
  * @param source - Single source descriptor; produces one MVT layer.
- * @param options - Tile-level tiling option defaults (overridden by per-source options).
+ * @param options - Tile-level tiling option defaults and budgets (overridden
+ *   by per-source options), I/O options (cache, prefetch, range merging, scan
+ *   budget) and an optional abort `signal`.
  * @returns PBF-encoded Mapbox Vector Tile containing one layer.
  *
  * @example
@@ -96,7 +104,7 @@ export async function tile(
   x: number,
   y: number,
   source: Source,
-  options?: TileOptions,
+  options?: TileOptions & IoOptions & RequestOptions,
 ): Promise<Uint8Array>;
 
 // Implementation
@@ -106,7 +114,7 @@ export async function tile(
   x: number,
   y: number,
   sourceOrSources: Source | Source[],
-  options?: TileOptions,
+  options?: TileOptions & IoOptions & RequestOptions,
 ): Promise<Uint8Array> {
   const sources = Array.isArray(sourceOrSources)
     ? sourceOrSources
@@ -117,6 +125,7 @@ export async function tile(
     z, x, y,
     sources,
     options,
-    globalTileBoundsCache,
+    createIoContext(options, sharedCache),
+    options,
   );
 }

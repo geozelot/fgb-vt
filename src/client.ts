@@ -4,9 +4,10 @@
  * Semi-stateful tile client for FlatGeobuf vector tile generation.
  *
  * The {@link TileClient} binds a single {@link Connector} at construction
- * time while leaving source selection to each `tile()` call. An
- * instance-level {@link TileBoundsCache} is shared across calls, amortizing
- * tile-bound computation for repeated zoom levels.
+ * time while leaving source selection to each `tile()` call. File headers
+ * and spatial index pages are cached per instance (a bounded
+ * {@link MemoryCache} by default), so repeated requests against the same
+ * files skip most index reads; {@link TileClient.open} preloads them.
  *
  * This tier sits between the fully stateless {@link tile} function (where
  * everything is provided per call) and the fully stateful {@link TileServer}
@@ -33,16 +34,40 @@
 
 import type { Connector } from './connectors/connector.js';
 import type { Source, TileOptions } from './source.js';
-import { TileBoundsCache } from './tiles.js';
-import { processTile } from './pipeline.js';
+import { processTile, type RequestOptions } from './pipeline.js';
+import { MemoryCache } from './cache.js';
+import { createIoContext, getSource, type IoContext, type IoOptions } from './fgb/reader.js';
+import { resolveFrame } from './geometry/crs.js';
+import { featureSchema, validateSchema } from './schema.js';
+import { withPath } from './errors.js';
+
+/**
+ * Options for {@link TileClient.open} and {@link TileServer.open}.
+ */
+export interface OpenOptions {
+  /**
+   * Also read every spatial index level above the leaves, in one request
+   * per file, when it is at most this many bytes. Later tiles then need at
+   * most one index read. `false` reads only the header and the top of the
+   * index.
+   *
+   * @defaultValue 4194304 (4 MiB)
+   */
+  warmIndex?: number | false;
+  /** Aborts opening. Opens shared with concurrent requests keep running. */
+  signal?: AbortSignal;
+}
+
+/** Default budget for {@link OpenOptions.warmIndex}. */
+export const DEFAULT_WARM_INDEX_BYTES = 4 * 1024 * 1024;
 
 /**
  * Semi-stateful tile client.
  *
  * A single {@link Connector} is bound at construction; {@link Source}
- * descriptors are provided per `tile()` call. An instance-level tile bounds
- * cache is shared across calls, avoiding redundant tile-to-mercator
- * calculations.
+ * descriptors are provided per `tile()` call. File headers and spatial
+ * index pages are cached per instance (see {@link IoOptions.cache}), so
+ * repeated tiles from the same files skip most index reads.
  *
  * Use case: application sharing one HTTP connector (with auth headers) but
  * querying different FGB sources depending on request context.
@@ -64,7 +89,8 @@ import { processTile } from './pipeline.js';
 export class TileClient {
   private readonly connector: Connector;
   private readonly options: TileOptions | undefined;
-  private readonly boundsCache = new TileBoundsCache();
+  private readonly context: IoContext;
+  private readonly onTile: RequestOptions['onTile'];
 
   /**
    * Create a new tile client bound to the given connector.
@@ -72,11 +98,33 @@ export class TileClient {
    * @param connector - Byte-range reader for accessing FGB files. Shared
    *   across all subsequent `tile()` calls.
    * @param options - Tile-level tiling option defaults applied to every call
-   *   unless overridden by per-source options.
+   *   unless overridden by per-source options, plus I/O options (cache,
+   *   prefetch, range merging, scan budget) and a default `onTile` hook.
    */
-  constructor(connector: Connector, options?: TileOptions) {
+  constructor(connector: Connector, options?: TileOptions & IoOptions & Pick<RequestOptions, 'onTile'>) {
     this.connector = connector;
     this.options = options;
+    this.context = createIoContext(options, new MemoryCache());
+    this.onTile = options?.onTile;
+  }
+
+  /**
+   * Open sources ahead of the first tile request: read each file's header
+   * and the top of its spatial index and, within the
+   * {@link OpenOptions.warmIndex} budget, all upper index levels.
+   *
+   * Useful during the init phase of a serverless function or at server
+   * start-up. Opening is otherwise lazy.
+   *
+   * @param sources - Sources (or a single source) to open.
+   * @param options - Index warm-up budget.
+   * @returns Resolves when every source is open.
+   * @throws {FgbVtError} If a source cannot be opened (annotated with its path),
+   *   including `UnsupportedFormatError` for a CRS without a configured projection.
+   * @throws {RangeError} If a source's `idColumn` is not an integer column of its file.
+   */
+  async open(sources: Source | Source[], options?: OpenOptions): Promise<void> {
+    await openSources(this.connector, Array.isArray(sources) ? sources : [sources], this.context, options);
   }
 
   /**
@@ -89,6 +137,7 @@ export class TileClient {
    * @param x - Tile column.
    * @param y - Tile row.
    * @param sources - Array of source descriptors; each becomes one MVT layer.
+   * @param request - Optional abort `signal` and `onTile` hook (overrides the constructor's).
    * @returns PBF-encoded Mapbox Vector Tile containing one layer per source.
    *
    * @example
@@ -104,6 +153,7 @@ export class TileClient {
     x: number,
     y: number,
     sources: Source[],
+    request?: RequestOptions,
   ): Promise<Uint8Array>;
 
   /**
@@ -116,6 +166,7 @@ export class TileClient {
    * @param x - Tile column.
    * @param y - Tile row.
    * @param source - Single source descriptor; produces one MVT layer.
+   * @param request - Optional abort `signal` and `onTile` hook (overrides the constructor's).
    * @returns PBF-encoded Mapbox Vector Tile containing one layer.
    *
    * @example
@@ -131,6 +182,7 @@ export class TileClient {
     x: number,
     y: number,
     source: Source,
+    request?: RequestOptions,
   ): Promise<Uint8Array>;
 
   // Implementation
@@ -139,6 +191,7 @@ export class TileClient {
     x: number,
     y: number,
     sourceOrSources: Source | Source[],
+    request?: RequestOptions,
   ): Promise<Uint8Array> {
     const sources = Array.isArray(sourceOrSources)
       ? sourceOrSources
@@ -149,7 +202,8 @@ export class TileClient {
       z, x, y,
       sources,
       this.options,
-      this.boundsCache,
+      this.context,
+      { onTile: this.onTile, ...request },
     );
   }
 
@@ -163,4 +217,32 @@ export class TileClient {
   async close(): Promise<void> {
     await this.connector.close();
   }
+}
+
+/**
+ * Open sources and optionally warm their upper index levels.
+ *
+ * @param connector - Connector for all sources.
+ * @param sources - Sources to open.
+ * @param context - I/O context (its cache receives the warmed pages).
+ * @param options - Warm-up budget.
+ */
+export async function openSources(
+  connector: Connector,
+  sources: Source[],
+  context: IoContext,
+  options?: OpenOptions,
+): Promise<void> {
+  const budget = options?.warmIndex === false ? 0 : (options?.warmIndex ?? DEFAULT_WARM_INDEX_BYTES);
+  await Promise.all(sources.map(async (source) => {
+    try {
+      const fgb = await getSource(connector, source.path, context, options?.signal);
+      // Fail now rather than on the first tile if the CRS or id column do not fit
+      resolveFrame(fgb.header.crs, source.crs, source.path);
+      validateSchema(featureSchema(source), fgb.header, source.path);
+      if (budget > 0) await fgb.warmIndex(budget, options?.signal);
+    } catch (err) {
+      throw withPath(err, source.path);
+    }
+  }));
 }

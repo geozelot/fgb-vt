@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { tileId, tileBBox, tileClipBounds, TileBoundsCache } from '../../src/tiles.js';
+import { tileBBox, tileClipBounds } from '../../src/tiles.js';
 
 describe('Tile coordinate edge cases', () => {
   // == Zoom 0: single world tile ======================================
@@ -13,12 +13,6 @@ describe('Tile coordinate edge cases', () => {
     expect(bbox.maxY).toBeGreaterThan(80);
   });
 
-  it('should produce a tile ID of 0 at z=0,x=0,y=0', () => {
-    const id = tileId(0, 0, 0);
-    // (((1 << 0) * 0 + 0) * 32) + 0 = 0
-    expect(id).toBe(0);
-  });
-
   // == High zoom levels ===============================================
 
   it('should produce very small bbox at z=20', () => {
@@ -30,15 +24,6 @@ describe('Tile coordinate edge cases', () => {
     expect(lngSpan).toBeCloseTo(360 / (1 << 20), 6);
     expect(latSpan).toBeGreaterThan(0);
     expect(latSpan).toBeLessThan(0.001);
-  });
-
-  it('should produce unique tile IDs at high zoom', () => {
-    const id1 = tileId(20, 100, 200);
-    const id2 = tileId(20, 100, 201);
-    const id3 = tileId(20, 101, 200);
-    expect(id1).not.toBe(id2);
-    expect(id1).not.toBe(id3);
-    expect(id2).not.toBe(id3);
   });
 
   // == Clip bounds with buffer =========================================
@@ -95,26 +80,4 @@ describe('Tile coordinate edge cases', () => {
     expect(clip.maxX).toBeGreaterThan(1);
   });
 
-  // == TileBoundsCache ==================================================
-
-  it('should return identical objects from cache on repeated calls', () => {
-    const cache = new TileBoundsCache();
-    const a = cache.getWgs84(5, 10, 10);
-    const b = cache.getWgs84(5, 10, 10);
-    expect(a).toBe(b); // same reference
-  });
-
-  it('should return different objects for different tiles', () => {
-    const cache = new TileBoundsCache();
-    const a = cache.getWgs84(5, 10, 10);
-    const b = cache.getWgs84(5, 10, 11);
-    expect(a).not.toBe(b);
-  });
-
-  it('should cache clip bounds with different buffer/extent independently', () => {
-    const cache = new TileBoundsCache();
-    const a = cache.getClip(5, 10, 10, 64, 4096);
-    const b = cache.getClip(5, 10, 10, 128, 4096);
-    expect(a.minX).not.toBe(b.minX);
-  });
 });

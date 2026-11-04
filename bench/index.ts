@@ -2,9 +2,14 @@
  * Performance benchmarks for fgb-vt.
  *
  * These benchmarks exercise the internal pipeline stages independently and
- * end-to-end, measuring throughput in features/sec and tiles/sec.
+ * end-to-end, measuring throughput in features/sec and tiles/sec, and tile
+ * generation from the real files in test/fixtures.
  *
  * Run: npm run bench
+ *      npm run bench -- --json results.json --summary summary.md
+ *
+ * `--json` writes all results as JSON; `--summary` appends a Markdown table
+ * (e.g. to $GITHUB_STEP_SUMMARY in CI).
  */
 
 import { projectToMercator } from '../src/geometry/project.js';
@@ -16,8 +21,38 @@ import { encodePbf } from '../src/pbf/encode.js';
 import { tileClipBounds, tileBBox } from '../src/tiles.js';
 import type { RawFeature, BBox } from '../src/types.js';
 import { GeomType } from '../src/types.js';
+import { TileClient } from '../src/client.js';
+import { tile } from '../src/tile.js';
+import { LocalConnector } from '../src/connectors/local.js';
+import { appendFileSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 // == Helpers ================================================================
+
+/** One benchmark result. */
+interface Result {
+  group: string;
+  name: string;
+  opsPerSec: number;
+  usPerOp: number;
+}
+
+const results: Result[] = [];
+let group = '';
+
+function section(title: string): void {
+  group = title;
+  console.log(`\n== ${title} ==`);
+}
+
+function report(name: string, iterations: number, elapsed: number): void {
+  const opsPerSec = (iterations / elapsed) * 1000;
+  const usPerOp = (elapsed / iterations) * 1000;
+  results.push({ group, name, opsPerSec, usPerOp });
+  console.log(
+    `  ${name.padEnd(45)} ${fmt(opsPerSec, 0).padStart(12)} ops/s  ${fmt(usPerOp, 1).padStart(10)} µs/op`,
+  );
+}
 
 function bench(name: string, fn: () => void, iterations: number): void {
   // Warmup
@@ -25,14 +60,14 @@ function bench(name: string, fn: () => void, iterations: number): void {
 
   const start = performance.now();
   for (let i = 0; i < iterations; i++) fn();
-  const elapsed = performance.now() - start;
+  report(name, iterations, performance.now() - start);
+}
 
-  const opsPerSec = (iterations / elapsed) * 1000;
-  const usPerOp = (elapsed / iterations) * 1000;
-
-  console.log(
-    `  ${name.padEnd(45)} ${fmt(opsPerSec, 0).padStart(12)} ops/s  ${fmt(usPerOp, 1).padStart(10)} µs/op`,
-  );
+async function benchAsync(name: string, fn: () => Promise<unknown>, iterations: number): Promise<void> {
+  for (let i = 0; i < Math.min(iterations, 20); i++) await fn();
+  const start = performance.now();
+  for (let i = 0; i < iterations; i++) await fn();
+  report(name, iterations, performance.now() - start);
 }
 
 function fmt(n: number, decimals: number): string {
@@ -137,7 +172,7 @@ function cloneFeatures(features: RawFeature[]): RawFeature[] {
 // == Benchmark suites =======================================================
 
 function benchProjection() {
-  console.log('\n== Projection (WGS84 → Mercator) ==');
+  section('Projection (WGS84 → Mercator)');
 
   const coords100 = new Float64Array(200);
   const coords1000 = new Float64Array(2000);
@@ -166,7 +201,7 @@ function benchProjection() {
 }
 
 function benchClipping() {
-  console.log('\n== Clipping (Sutherland-Hodgman) ==');
+  section('Clipping (Sutherland-Hodgman)');
 
   const z = 12, x = 2048, y = 1360;
   const wgs84 = tileBBox(z, x, y);
@@ -187,7 +222,7 @@ function benchClipping() {
 }
 
 function benchSimplification() {
-  console.log('\n== Simplification (Douglas-Peucker) ==');
+  section('Simplification (Douglas-Peucker)');
 
   const sqTol = sqToleranceForZoom(3, 12, 4096);
 
@@ -203,7 +238,7 @@ function benchSimplification() {
 }
 
 function benchMvtEncoding() {
-  console.log('\n== MVT Geometry Encoding ==');
+  section('MVT Geometry Encoding');
 
   for (const n of [10, 100, 500]) {
     const coords = new Int32Array(n * 2);
@@ -218,7 +253,7 @@ function benchMvtEncoding() {
 }
 
 function benchPbfEncoding() {
-  console.log('\n== PBF Encoding ==');
+  section('PBF Encoding');
 
   const z = 12, x = 2048, y = 1360;
   const wgs84 = tileBBox(z, x, y);
@@ -235,7 +270,7 @@ function benchPbfEncoding() {
 }
 
 function benchFullPipeline() {
-  console.log('\n== Full Pipeline (features → PBF) ==');
+  section('Full Pipeline (features → PBF)');
 
   const z = 12, x = 2048, y = 1360;
   const wgs84 = tileBBox(z, x, y);
@@ -260,7 +295,7 @@ function benchFullPipeline() {
 }
 
 function benchMultiLayer() {
-  console.log('\n== Multi-Layer Tile ==');
+  section('Multi-Layer Tile');
 
   const z = 12, x = 2048, y = 1360;
   const wgs84 = tileBBox(z, x, y);
@@ -278,6 +313,73 @@ function benchMultiLayer() {
   }
 }
 
+// == Real files =============================================================
+
+const FIXTURES = fileURLToPath(new URL('../test/fixtures/', import.meta.url));
+
+/** Slippy tile containing a lon/lat. */
+function tileAt(lon: number, lat: number, z: number): [number, number, number] {
+  const n = 2 ** z;
+  const r = (lat * Math.PI) / 180;
+  return [
+    z,
+    Math.floor(((lon + 180) / 360) * n),
+    Math.floor(((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2) * n),
+  ];
+}
+
+async function benchFiles() {
+  section('Tiles from files (warm cache, local)');
+  const client = new TileClient(new LocalConnector());
+  const cases: Array<[string, string, [number, number, number], number]> = [
+    ['5k points, z0', 'grid-5k.fgb', [0, 0, 0], 100],
+    ['5k points, z4', 'grid-5k.fgb', tileAt(-100, 40, 4), 300],
+    ['5k points, z8', 'grid-5k.fgb', tileAt(-100, 40, 8), 2000],
+    ['detailed polygons, z3', 'multipolygons.fgb', tileAt(-80, 40, 3), 500],
+    ['detailed polygons, z7', 'multipolygons.fgb', tileAt(-80, 40, 7), 1000],
+    ['lines, z6', 'lines.fgb', tileAt(-97, 44, 6), 1000],
+    ['curves (linearised), z5', 'curves.fgb', tileAt(-96, 38, 5), 1000],
+    ['Web Mercator points, z5', 'points-3857.fgb', tileAt(-96, 32, 5), 1000],
+  ];
+  for (const [label, file, [z, x, y], iterations] of cases) {
+    const source = { name: 'l', path: FIXTURES + file };
+    await benchAsync(label, () => client.tile(z, x, y, source), iterations);
+  }
+  await client.close();
+}
+
+async function benchColdOpen() {
+  section('Tiles from files (cold: header and index read per tile)');
+  const connector = new LocalConnector();
+  const [z, x, y] = tileAt(-100, 40, 8);
+  await benchAsync('5k points, z8, no cache', () => tile(connector, z, x, y, { name: 'l', path: FIXTURES + 'grid-5k.fgb' }, { cache: false }), 1000);
+  await connector.close();
+}
+
+// == Output =================================================================
+
+function argument(name: string): string | undefined {
+  const i = process.argv.indexOf(name);
+  return i >= 0 ? process.argv[i + 1] : undefined;
+}
+
+function writeOutputs(): void {
+  const json = argument('--json');
+  if (json) writeFileSync(json, JSON.stringify({ node: process.version, date: new Date().toISOString(), results }, null, 2));
+  const summary = argument('--summary');
+  if (summary) {
+    const rows = results.map(r => `| ${r.group} | ${r.name} | ${fmt(r.opsPerSec, 0)} | ${fmt(r.usPerOp, 1)} |`);
+    appendFileSync(summary, [
+      `### fgb-vt benchmarks (Node ${process.version})`,
+      '',
+      '| Group | Benchmark | ops/s | µs/op |',
+      '|-------|-----------|------:|------:|',
+      ...rows,
+      '',
+    ].join('\n'));
+  }
+}
+
 // == Main ===================================================================
 
 console.log('╔══════════════════════════════════════════════════════════════════════╗');
@@ -291,5 +393,8 @@ benchMvtEncoding();
 benchPbfEncoding();
 benchFullPipeline();
 benchMultiLayer();
+await benchFiles();
+await benchColdOpen();
 
+writeOutputs();
 console.log('\nDone.');

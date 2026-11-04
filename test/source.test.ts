@@ -46,6 +46,12 @@ describe('resolveOptions', () => {
       tolerance: 3,
       maxZoom: 24,
       minZoom: 0,
+      maxFeatures: Infinity,
+      maxReadBytes: 256 * 1024 * 1024,
+      simplifyBeforeClip: false,
+      pointGrid: 0,
+      maxTileBytes: Infinity,
+      omitEmptyLayers: false,
     });
   });
 });

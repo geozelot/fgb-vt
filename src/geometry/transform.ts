@@ -163,12 +163,13 @@ function ensureWinding(
 }
 
 /**
- * Compute the signed area of a polygon ring using the shoelace formula.
+ * Compute the signed area of a polygon ring using the surveyor's (shoelace)
+ * formula, as defined by the MVT 2.1 specification.
  *
  * The sign indicates winding direction in a Y-down (screen / tile)
  * coordinate system:
- * - **Positive** = clockwise
- * - **Negative** = counter-clockwise
+ * - **Positive** = clockwise = exterior ring per the MVT spec
+ * - **Negative** = counter-clockwise = interior ring (hole)
  * - **Zero** = degenerate (collinear or empty)
  *
  * Accepts both `Int32Array` (tile-space) and plain `number[]` for
@@ -177,20 +178,20 @@ function ensureWinding(
  * @param coords - Flat interleaved coordinates containing the ring.
  * @param start - Start element index (inclusive) of the ring.
  * @param end - End element index (exclusive) of the ring.
- * @returns Signed area of the ring (not divided by 2, since only the sign
- *   and relative magnitude matter for winding detection).
+ * @returns Twice the signed area of the ring (only the sign and relative
+ *   magnitude matter for winding detection).
  *
  * @example
  * ```ts
- * // A clockwise unit square in Y-down coordinates:
+ * // A clockwise unit square in Y-down coordinates (right, down, left):
  * const cw = [0, 0, 1, 0, 1, 1, 0, 1, 0, 0];
- * signedArea(cw, 0, cw.length); // => positive (clockwise)
+ * signedArea(cw, 0, cw.length); // => positive (clockwise, exterior)
  * ```
  */
 export function signedArea(coords: Int32Array | number[], start: number, end: number): number {
   let area = 0;
   for (let i = start, j = end - 2; i < end; j = i, i += 2) {
-    area += (coords[i] - coords[j]) * (coords[i + 1] + coords[j + 1]);
+    area += (coords[j] - coords[i]) * (coords[i + 1] + coords[j + 1]);
   }
   return area;
 }

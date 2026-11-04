@@ -1,0 +1,43 @@
+name: Fuzz
+
+# Long mutation-fuzzing runs of the decoders (the regular test suite runs a
+# short one). A failure prints its seed; reproduce it locally with
+#   FUZZ_SEED=<seed> FUZZ_ITERATIONS=<n> npx vitest run test/fuzz.test.ts
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: Mutations per fixture
+        default: '20000'
+      seed:
+        description: Seed (default the run id)
+        default: ''
+
+jobs:
+  fuzz:
+    name: Fuzz decoders
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fuzz
+        run: |
+          echo "FUZZ_SEED=$FUZZ_SEED FUZZ_ITERATIONS=$FUZZ_ITERATIONS"
+          npx vitest run test/fuzz.test.ts
+        env:
+          FUZZ_ITERATIONS: ${{ inputs.iterations || '20000' }}
+          FUZZ_SEED: ${{ inputs.seed || github.run_id }}
