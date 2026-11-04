@@ -15,7 +15,7 @@
 
 import { FlatBufferReader } from './flatbuffers.js';
 import { calcTreeSize } from './index.js';
-import type { FgbHeader, ColumnMeta, BBox } from '../types.js';
+import type { FgbHeader, ColumnMeta, BBox, CrsInfo } from '../types.js';
 import { ColumnType, GeomType } from '../types.js';
 import { FgbVtError, FormatError, UnsupportedFormatError } from '../errors.js';
 
@@ -174,7 +174,9 @@ function parseHeaderUnchecked(bytes: Uint8Array): FgbHeader {
     throw new FormatError('Invalid FlatGeobuf header: index_node_size must be 0 or at least 2');
   }
 
-  // Envelope / bbox (field 1) — vector of doubles: [minX, minY, maxX, maxY]
+  // Envelope / bbox (field 1) — vector of doubles: [minX, minY, maxX, maxY].
+  // Writers may leave it out or fill it with NaN for empty datasets; an
+  // unusable envelope is dropped (callers fall back to the index root).
   let bbox: BBox | null = null;
   const envOff = fb.fieldOffset(rootOffset, 1);
   if (envOff) {
@@ -182,28 +184,23 @@ function parseHeaderUnchecked(bytes: Uint8Array): FgbHeader {
     const envLen = fb.vectorLen(envVecOffset);
     if (envLen >= 4) {
       const dataStart = fb.vectorStart(envVecOffset);
-      bbox = {
+      const envelope = {
         minX: fb.readFloat64(dataStart),
         minY: fb.readFloat64(dataStart + 8),
         maxX: fb.readFloat64(dataStart + 16),
         maxY: fb.readFloat64(dataStart + 24),
       };
+      if (isValidBBox(envelope)) bbox = envelope;
     }
   }
 
   // Columns (field 7) — vector of Column tables
-  const columns: ColumnMeta[] = [];
   const colsOff = fb.fieldOffset(rootOffset, 7);
-  if (colsOff) {
-    const colsVecOffset = fb.indirect(colsOff);
-    const colsLen = fb.vectorLen(colsVecOffset);
-    const colsDataStart = fb.vectorStart(colsVecOffset);
+  const columns = colsOff ? parseColumns(fb, fb.indirect(colsOff)) : [];
 
-    for (let i = 0; i < colsLen; i++) {
-      const colOffset = fb.indirect(colsDataStart + i * 4);
-      columns.push(parseColumn(fb, colOffset));
-    }
-  }
+  // CRS (field 10) — Crs table
+  const crsOff = fb.fieldOffset(rootOffset, 10);
+  const crs = crsOff ? parseCrs(fb, fb.indirect(crsOff)) : null;
 
   // Detect an ID column among the parsed columns
   const idColumnIndex = detectIdColumn(columns);
@@ -227,7 +224,20 @@ function parseHeaderUnchecked(bytes: Uint8Array): FgbHeader {
     featuresOffset,
     headerSize: totalHeaderSize,
     idColumnIndex,
+    crs,
   };
+}
+
+/**
+ * Whether a bounding box has finite coordinates with min ≤ max on both axes.
+ *
+ * @param b - Box to check.
+ * @returns `true` for a usable box.
+ */
+export function isValidBBox(b: BBox): boolean {
+  return Number.isFinite(b.minX) && Number.isFinite(b.minY) &&
+    Number.isFinite(b.maxX) && Number.isFinite(b.maxY) &&
+    b.minX <= b.maxX && b.minY <= b.maxY;
 }
 
 /**
@@ -285,11 +295,12 @@ function isIntegerColumnType(type: ColumnType): boolean {
 /**
  * Scan the column schema for a well-known integer ID column.
  *
- * @param columns - Parsed column metadata from the FGB header.
+ * @param columns - Parsed column metadata from the FGB header (or a
+ *   feature's own column schema).
  * @returns Index into `columns` of the best-matching ID column, or `-1`
  *   if no suitable column was found.
  */
-function detectIdColumn(columns: ColumnMeta[]): number {
+export function detectIdColumn(columns: ColumnMeta[]): number {
   for (const candidateName of ID_COLUMN_NAMES) {
     for (let i = 0; i < columns.length; i++) {
       if (columns[i].name.toLowerCase() === candidateName && isIntegerColumnType(columns[i].type)) {
@@ -304,6 +315,26 @@ function detectIdColumn(columns: ColumnMeta[]): number {
 
 /** Highest {@link ColumnType} value defined by the FlatGeobuf 3.x schema. */
 const MAX_COLUMN_TYPE = ColumnType.Binary;
+
+/**
+ * Parse a vector of Column tables (the header schema, or a feature's own
+ * schema overriding it).
+ *
+ * @param fb - FlatBuffer reader over the header or feature buffer.
+ * @param vecOffset - Absolute byte offset of the `[Column]` vector.
+ * @returns Decoded column metadata in schema order.
+ * @throws {UnsupportedFormatError} If a column type is not defined by the
+ *   3.x specification.
+ */
+export function parseColumns(fb: FlatBufferReader, vecOffset: number): ColumnMeta[] {
+  const columns: ColumnMeta[] = [];
+  const count = fb.vectorLen(vecOffset);
+  const dataStart = fb.vectorStart(vecOffset);
+  for (let i = 0; i < count; i++) {
+    columns.push(parseColumn(fb, fb.indirect(dataStart + i * 4)));
+  }
+  return columns;
+}
 
 /**
  * Parse a single Column table from the header FlatBuffer.
@@ -321,7 +352,7 @@ const MAX_COLUMN_TYPE = ColumnType.Binary;
  *   3.x specification (its values could not be decoded, so the property
  *   stream would be misread).
  */
-function parseColumn(fb: FlatBufferReader, tablePos: number): ColumnMeta {
+export function parseColumn(fb: FlatBufferReader, tablePos: number): ColumnMeta {
   // Name (field 0)
   const nameOff = fb.fieldOffset(tablePos, 0);
   const name = nameOff ? fb.readString(fb.indirect(nameOff)) : '';
@@ -338,6 +369,36 @@ function parseColumn(fb: FlatBufferReader, tablePos: number): ColumnMeta {
   const nullable = nullOff ? fb.readUint8(nullOff) !== 0 : true;
 
   return { name, type, nullable };
+}
+
+// == CRS parsing ============================================================
+
+/**
+ * Parse the Crs table (`header.fbs`):
+ * - `0`: org (string; `null` means EPSG)
+ * - `1`: code (int; `0` = unknown)
+ * - `2`: name (string)
+ * - `3`: description (string, not kept)
+ * - `4`: wkt (string)
+ * - `5`: code_string (string)
+ *
+ * @param fb - FlatBuffer reader over the header buffer.
+ * @param tablePos - Absolute byte offset of the Crs table.
+ * @returns The declared CRS.
+ */
+function parseCrs(fb: FlatBufferReader, tablePos: number): CrsInfo {
+  const str = (field: number): string | null => {
+    const off = fb.fieldOffset(tablePos, field);
+    return off ? fb.readString(fb.indirect(off)) : null;
+  };
+  const codeOff = fb.fieldOffset(tablePos, 1);
+  return {
+    org: str(0),
+    code: codeOff ? fb.readInt32(codeOff) : 0,
+    codeString: str(5),
+    name: str(2),
+    wkt: str(4),
+  };
 }
 
 /**

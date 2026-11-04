@@ -21,9 +21,10 @@
 /**
  * FlatGeobuf geometry type constants.
  *
- * These match the FlatGeobuf specification's `GeometryType` enum and are used
- * throughout the pipeline to dispatch type-specific logic (clipping, winding
- * order correction, MVT command encoding).
+ * These match the FlatGeobuf specification's `GeometryType` enum. The
+ * feature decoder normalises types 7–17 to the six basic types (1–6), so the
+ * geometry pipeline (clipping, winding order correction, MVT command
+ * encoding) only ever sees those.
  */
 export const enum GeomType {
   Unknown = 0,
@@ -33,6 +34,17 @@ export const enum GeomType {
   MultiPoint = 4,
   MultiLineString = 5,
   MultiPolygon = 6,
+  GeometryCollection = 7,
+  CircularString = 8,
+  CompoundCurve = 9,
+  CurvePolygon = 10,
+  MultiCurve = 11,
+  MultiSurface = 12,
+  Curve = 13,
+  Surface = 14,
+  PolyhedralSurface = 15,
+  TIN = 16,
+  Triangle = 17,
 }
 
 /**
@@ -89,7 +101,11 @@ export type PropertyValue = string | number | bigint | boolean | Uint8Array | nu
  * mercator [0, 1] space in-place during the pipeline.
  */
 export interface RawFeature {
-  /** Geometry type from the FGB header or per-feature override. */
+  /**
+   * Geometry type, always one of the six basic types (`Point` through
+   * `MultiPolygon`): curves are linearised, and surfaces and collections
+   * are split by the decoder.
+   */
   type: GeomType;
   /**
    * Flat interleaved coordinate array: `[x0, y0, x1, y1, ...]`.
@@ -188,7 +204,10 @@ export interface FgbHeader {
   featuresCount: number;
   /** Hilbert R-tree node fan-out size (0 = no spatial index). */
   indexNodeSize: number;
-  /** Dataset bounding box in WGS84, or `null` if not present in the header. */
+  /**
+   * Dataset envelope in the file's coordinate system, or `null` if the
+   * header has none or an invalid one (non-finite, or min > max).
+   */
   bbox: BBox | null;
   /** Byte offset where the packed Hilbert R-tree spatial index starts. */
   indexOffset: number;
@@ -206,6 +225,25 @@ export interface FgbHeader {
    * case-insensitively and only accepts integer column types.
    */
   idColumnIndex: number;
+  /** Coordinate reference system, or `null` if the header declares none. */
+  crs: CrsInfo | null;
+}
+
+/**
+ * Coordinate reference system as declared in a FlatGeobuf header (`Crs`
+ * table). Every field is optional in the format.
+ */
+export interface CrsInfo {
+  /** Defining organisation, e.g. `EPSG` (case-insensitive; `null` means EPSG). */
+  org: string | null;
+  /** Numeric code assigned by the organisation (`0` = unknown). */
+  code: number;
+  /** Textual code for codes that are not integers, e.g. `CRS84` for OGC. */
+  codeString: string | null;
+  /** Human-readable name. */
+  name: string | null;
+  /** WKT definition. */
+  wkt: string | null;
 }
 
 // == MVT Types ==============================================================

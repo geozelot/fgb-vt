@@ -51,6 +51,7 @@ import {
 import { resolveOptions } from './source.js';
 import { MemoryCache } from './cache.js';
 import { createIoContext, getSource, type IoContext, type IoOptions } from './fgb/reader.js';
+import { resolveFrame } from './geometry/crs.js';
 import { openSources, type OpenOptions } from './client.js';
 import { withPath } from './errors.js';
 
@@ -219,16 +220,24 @@ export class TileServer {
    * listing each source's layer name, field schema, and zoom range.
    * Sources are opened (headers read) if not already open.
    *
+   * Bounds come from each file's header envelope or, when that is absent
+   * or invalid, from the root of its spatial index, converted to WGS 84.
+   * Without either (an unindexed file without envelope) the world is
+   * assumed.
+   *
    * @returns TileJSON metadata object conforming to the 3.0.0 specification.
    * @throws {FgbVtError} If a source cannot be opened (annotated with its path).
    */
   async tileJSON(): Promise<TileJSON> {
     this.assertOpen();
 
-    const headers = await Promise.all(this.groups.flatMap(group =>
+    const opened = await Promise.all(this.groups.flatMap(group =>
       group.sources.map(async (source) => {
         try {
-          return (await getSource(group.connector, source.path, this.context)).header;
+          const fgb = await getSource(group.connector, source.path, this.context);
+          const frame = resolveFrame(fgb.header.crs, source.crs, source.path);
+          const extent = await fgb.bounds();
+          return { header: fgb.header, bounds: extent ? frame.toWgs84BBox(extent) : null };
         } catch (err) {
           throw withPath(err, source.path);
         }
@@ -243,7 +252,7 @@ export class TileServer {
     let index = 0;
     for (const group of this.groups) {
       for (const source of group.sources) {
-        const header = headers[index++];
+        const { header, bounds } = opened[index++];
         const opts = resolveOptions(source.options, this.options);
 
         // Build field map from header columns
@@ -263,9 +272,10 @@ export class TileServer {
         globalMinZoom = Math.min(globalMinZoom, opts.minZoom);
         globalMaxZoom = Math.max(globalMaxZoom, opts.maxZoom);
 
-        // Update global bounds from header bbox
-        if (header.bbox) {
-          const b = header.bbox;
+        // Update global bounds from the source extent (header envelope or
+        // index root, in WGS 84)
+        if (bounds) {
+          const b = bounds;
           globalBounds = [
             Math.min(globalBounds[0], b.minX),
             Math.min(globalBounds[1], b.minY),

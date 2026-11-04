@@ -40,6 +40,7 @@ export { HttpConnector } from './connectors/http.js';
 export type { Connector, ReadOptions, ReadHeadResult, ConnectorHints } from './connectors/connector.js';
 export type { HttpConnectorOptions } from './connectors/http.js';
 export type { Source, SourceOptions, TileOptions } from './source.js';
+export type { Projection, SourceCrs } from './geometry/crs.js';
 export type { TileServerLayer } from './server.js';
 export type { TileJSON, BBox } from './types.js';
 export type { ByteCache, MemoryCacheOptions } from './cache.js';

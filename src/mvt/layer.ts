@@ -6,8 +6,8 @@
  *
  * The per-feature pipeline applies the following stages in order:
  *
- * 1. **Project** -- WGS84 longitude/latitude to Web Mercator [0, 1] space
- *    ({@link projectToMercator}).
+ * 1. **Project** -- source coordinates (WGS84 longitude/latitude by
+ *    default) to Web Mercator [0, 1] space ({@link projectToMercator}).
  * 2. **Clip** -- discard or cut geometry to the tile's bounding box, with an
  *    optional buffer for line/label overshoot ({@link clipFeatures}).
  * 3. **Simplify** -- reduce vertex count using squared-distance tolerance
@@ -58,6 +58,9 @@ import type { BBox } from '../types.js';
  * @param extent - Tile coordinate extent (typically 4096).
  * @param tolerance - Simplification tolerance in tile coordinate units.
  *   Set to 0 to disable simplification entirely.
+ * @param toMercator - Converts the features' coordinates to mercator
+ *   [0, 1] space in place. Defaults to the WGS 84 longitude/latitude
+ *   projection.
  * @returns A fully assembled {@link MvtLayer} with deduplicated keys/values
  *   and encoded geometry commands for every surviving feature.
  */
@@ -70,6 +73,7 @@ export function buildMvtLayer(
   clipBounds: BBox,
   extent: number,
   tolerance: number,
+  toMercator: (xy: Float64Array) => void = projectToMercator,
 ): MvtLayer {
   const keys: string[] = [];
   const keyIndex = new Map<string, number>();
@@ -81,7 +85,7 @@ export function buildMvtLayer(
 
   // Project all features to mercator in-place
   for (const f of features) {
-    projectToMercator(f.xy);
+    toMercator(f.xy);
   }
 
   // Clip features to tile bounds

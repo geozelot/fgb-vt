@@ -37,6 +37,7 @@ import type { Source, TileOptions } from './source.js';
 import { processTile, type RequestOptions } from './pipeline.js';
 import { MemoryCache } from './cache.js';
 import { createIoContext, getSource, type IoContext, type IoOptions } from './fgb/reader.js';
+import { resolveFrame } from './geometry/crs.js';
 import { withPath } from './errors.js';
 
 /**
@@ -115,7 +116,8 @@ export class TileClient {
    * @param sources - Sources (or a single source) to open.
    * @param options - Index warm-up budget.
    * @returns Resolves when every source is open.
-   * @throws {FgbVtError} If a source cannot be opened (annotated with its path).
+   * @throws {FgbVtError} If a source cannot be opened (annotated with its path),
+   *   including `UnsupportedFormatError` for a CRS without a configured projection.
    */
   async open(sources: Source | Source[], options?: OpenOptions): Promise<void> {
     await openSources(this.connector, Array.isArray(sources) ? sources : [sources], this.context, options);
@@ -231,6 +233,8 @@ export async function openSources(
   await Promise.all(sources.map(async (source) => {
     try {
       const fgb = await getSource(connector, source.path, context, options?.signal);
+      // Fail now rather than on the first tile if the CRS is unsupported
+      resolveFrame(fgb.header.crs, source.crs, source.path);
       if (budget > 0) await fgb.warmIndex(budget, options?.signal);
     } catch (err) {
       throw withPath(err, source.path);

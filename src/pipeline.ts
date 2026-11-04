@@ -9,13 +9,14 @@
  *
  * 1. **Open** — read (or take from cache) the FGB header and the top of the
  *    spatial index via an {@link FgbSource}.
- * 2. **Spatial query** — walk the packed Hilbert R-tree level by level,
- *    reading only the index pages the buffered tile box reaches.
+ * 2. **Spatial query** — convert the buffered tile box to the source CRS and
+ *    walk the packed Hilbert R-tree level by level, reading only the index
+ *    pages it reaches.
  * 3. **Feature read** — issue coalesced byte-range reads through the
  *    Connector for the matching features only.
  * 4. **Decode** — deserialize FlatGeobuf features into {@link RawFeature}
  *    objects with flat coordinate arrays and typed properties.
- * 5. **MVT build** — project WGS84 coordinates to Mercator, clip to tile
+ * 5. **MVT build** — project source coordinates to Mercator, clip to tile
  *    bounds, simplify with Douglas-Peucker, and encode as MVT command
  *    geometry with deduplicated key/value tables.
  * 6. **PBF encode** — serialize one or more {@link MvtLayer} objects into a
@@ -39,7 +40,8 @@ import type { MvtLayer, BBox, RawFeature } from './types.js';
 import { getSource, invalidateSource, type IoContext } from './fgb/reader.js';
 import { buildMvtLayer } from './mvt/layer.js';
 import { encodePbf } from './pbf/encode.js';
-import { tileClipBounds, mercatorToWgs84BBox, validateTile } from './tiles.js';
+import { tileClipBounds, validateTile } from './tiles.js';
+import { resolveFrame, type CoordinateFrame } from './geometry/crs.js';
 import { LimitExceededError, SourceChangedError, withPath } from './errors.js';
 
 /**
@@ -90,70 +92,99 @@ export async function processSource(
 
   // Query with the buffered tile box, so features in the buffer zone are read
   const clipBounds = tileClipBounds(z, x, y, tileOpts.buffer, tileOpts.extent);
-  const queryBBox = mercatorToWgs84BBox(clipBounds);
 
-  let features: RawFeature[];
+  let read: { features: RawFeature[]; frame: CoordinateFrame };
   try {
-    features = await readSourceFeatures(connector, source.path, queryBBox, context, {
-      maxFeatures: tileOpts.maxFeatures,
-      maxReadBytes: tileOpts.maxReadBytes,
-      signal,
-    });
+    read = await readSourceFeatures(connector, source, clipBounds, tileOpts, context, signal);
   } catch (err) {
     throw withPath(err, source.path);
   }
   signal?.throwIfAborted();
 
-  if (features.length === 0) {
+  if (read.features.length === 0) {
     return emptyLayer(source.name, tileOpts.extent);
   }
 
   // Build MVT layer (includes project → clip → simplify → transform → encode)
   return buildMvtLayer(
-    features,
+    read.features,
     source.name,
     z, x, y,
     clipBounds,
     tileOpts.extent,
     tileOpts.tolerance,
+    read.frame.toMercator,
   );
 }
 
 /**
- * Read the features of one source intersecting `bbox`. If the file changed
- * since its header was cached, forget the cached state and retry once.
+ * Read the features of one source intersecting a tile's clip box. If the
+ * file changed since its header was cached, forget the cached state and
+ * retry once.
  *
  * @param connector - Connector to read through.
- * @param path - Source path.
- * @param bbox - WGS84 query box.
+ * @param source - Source descriptor (path and CRS setting).
+ * @param clipBounds - Buffered tile box in mercator [0, 1] space.
+ * @param tileOpts - Resolved options (extent, buffer and budgets).
  * @param context - I/O settings.
- * @param request - Per-tile budgets and abort signal.
- * @returns Decoded features.
+ * @param signal - Optional abort signal.
+ * @returns Decoded features in source coordinates, and the frame that
+ *   converts them.
+ * @throws {UnsupportedFormatError} If the source CRS is not supported.
  */
 async function readSourceFeatures(
   connector: Connector,
-  path: string,
-  bbox: BBox,
+  source: Source,
+  clipBounds: BBox,
+  tileOpts: Required<TileOptions>,
   context: IoContext,
-  request: { maxFeatures: number; maxReadBytes: number; signal?: AbortSignal },
-): Promise<RawFeature[]> {
+  signal: AbortSignal | undefined,
+): Promise<{ features: RawFeature[]; frame: CoordinateFrame }> {
   for (let attempt = 0; ; attempt++) {
     try {
-      const fgb = await getSource(connector, path, context, request.signal);
-      return await fgb.readFeatures(bbox, {
+      const fgb = await getSource(connector, source.path, context, signal);
+      const frame = resolveFrame(fgb.header.crs, source.crs, source.path);
+      const query = frame.queryBBox(clipBounds);
+      const features = await fgb.readFeatures(query, {
         coalesceGap: context.coalesceGap,
         maxScanBytes: context.maxScanBytes,
         maxFeatureBytes: context.maxFeatureBytes,
-        ...request,
+        maxFeatures: tileOpts.maxFeatures,
+        maxReadBytes: tileOpts.maxReadBytes,
+        curveTolerance: unitsPerTileUnit(query, tileOpts) * CURVE_TOLERANCE,
+        signal,
       });
+      return { features, frame };
     } catch (err) {
       if (err instanceof SourceChangedError && attempt === 0) {
-        await invalidateSource(connector, path, context);
+        await invalidateSource(connector, source.path, context);
         continue;
       }
       throw err;
     }
   }
+}
+
+/**
+ * Largest deviation of linearised arcs from the true curve, in tile
+ * coordinate units: below what an MVT can represent.
+ */
+const CURVE_TOLERANCE = 1;
+
+/**
+ * Size of one tile coordinate unit in source coordinate units, from the
+ * query box covering the buffered tile.
+ *
+ * @param query - Query box in source coordinates.
+ * @param tileOpts - Extent and buffer the box was derived from.
+ * @returns Source units per tile unit (the smaller of both axes; an axis
+ *   that is open-ended at the poles is ignored).
+ */
+function unitsPerTileUnit(query: BBox, tileOpts: Required<TileOptions>): number {
+  const span = tileOpts.extent + 2 * tileOpts.buffer;
+  const sx = (query.maxX - query.minX) / span;
+  const sy = (query.maxY - query.minY) / span;
+  return Math.min(Number.isFinite(sx) ? sx : Infinity, Number.isFinite(sy) ? sy : Infinity);
 }
 
 // == Multi-source pipeline ==================================================

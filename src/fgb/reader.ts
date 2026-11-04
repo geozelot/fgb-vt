@@ -33,7 +33,7 @@
 import type { Connector, ReadOptions } from '../connectors/connector.js';
 import type { ByteCache } from '../cache.js';
 import type { BBox, FgbHeader, RawFeature } from '../types.js';
-import { headerByteSize, parseHeader } from './header.js';
+import { headerByteSize, isValidBBox, parseHeader } from './header.js';
 import { computeLevelBounds } from './index.js';
 import { decodeFeatureChunk } from './feature.js';
 import { FormatError, LimitExceededError } from '../errors.js';
@@ -157,6 +157,8 @@ export interface QueryOptions {
   maxReadBytes?: number;
   /** Largest single feature that may be read. */
   maxFeatureBytes?: number;
+  /** Chord tolerance for circular arcs, in the file's coordinate units. */
+  curveTolerance?: number;
   /** Aborts the reads when signalled. */
   signal?: AbortSignal;
 }
@@ -274,6 +276,25 @@ export class FgbSource {
   }
 
   /**
+   * Extent of the data in the file's coordinate system: the header
+   * envelope, or the bounding box of the index root when the envelope is
+   * absent or invalid.
+   *
+   * @param signal - Optional abort signal for the index read.
+   * @returns The extent, or `null` for an unindexed file without envelope
+   *   (or an empty one).
+   * @throws {FormatError} If the index is truncated.
+   */
+  async bounds(signal?: AbortSignal): Promise<BBox | null> {
+    if (this.header.bbox) return this.header.bbox;
+    if (!this.hasIndex) return null;
+    const nodes = new NodeReader(this.pageNodes);
+    await this.loadNodes([[0, 1]], nodes, { signal });
+    const root = { minX: nodes.f64(0, 0), minY: nodes.f64(0, 8), maxX: nodes.f64(0, 16), maxY: nodes.f64(0, 24) };
+    return isValidBBox(root) ? root : null;
+  }
+
+  /**
    * Read and decode the features whose index entries intersect `bbox`, or
    * all features of an unindexed file (bounded by `maxScanBytes`).
    *
@@ -312,7 +333,9 @@ export class FgbSource {
         while (run < runs.length && runs[run].offset + runs[run].length <= at) run++;
         return run < runs.length && at >= runs[run].offset;
       };
-      const chunk = decodeFeatureChunk(chunks[c], this.header, accept, base);
+      const chunk = decodeFeatureChunk(chunks[c], this.header, {
+        accept, fileOffset: base, curveTolerance: options.curveTolerance,
+      });
       for (const f of chunk.features) features.push(f);
       if (chunk.truncatedAt >= 0) {
         // Only the last feature's length can be an estimate (unknown file size)
@@ -606,7 +629,7 @@ export class FgbSource {
       const bytes = await this.connector.read(this.path, pos, want, this.readOptions(signal));
       if (bytes.length === 0) break;
 
-      const chunk = decodeFeatureChunk(bytes, this.header, undefined, pos);
+      const chunk = decodeFeatureChunk(bytes, this.header, { fileOffset: pos, curveTolerance: options.curveTolerance });
       for (const f of chunk.features) features.push(f);
       this.checkBudget('features', features.length, options.maxFeatures);
 
@@ -655,7 +678,9 @@ export class FgbSource {
     }
     const length = 4 + size;
     const bytes = await this.connector.read(this.path, offset, length, options);
-    const { features, truncatedAt } = decodeFeatureChunk(bytes, this.header, undefined, offset);
+    const { features, truncatedAt } = decodeFeatureChunk(bytes, this.header, {
+      fileOffset: offset, curveTolerance: query.curveTolerance,
+    });
     if (truncatedAt >= 0 || bytes.length < length) {
       throw new FormatError(
         `Truncated FlatGeobuf feature: expected ${length} bytes, got ${bytes.length}`,

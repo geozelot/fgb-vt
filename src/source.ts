@@ -23,6 +23,8 @@
  * ```
  */
 
+import type { SourceCrs } from './geometry/crs.js';
+
 /**
  * Per-source tiling option overrides.
  *
@@ -73,6 +75,14 @@ export interface Source {
   path: string;
   /** Per-source tiling option overrides. */
   options?: SourceOptions;
+  /**
+   * Coordinate reference system of the file's coordinates. By default
+   * (`'auto'`) it is taken from the file header: WGS 84 longitude/latitude
+   * and Web Mercator are built in, and any other CRS raises
+   * `UnsupportedFormatError` unless a `Projection` is given here.
+   * @defaultValue 'auto'
+   */
+  crs?: SourceCrs;
 }
 
 /**

@@ -266,6 +266,49 @@ const server = new TileServer(
 ```
 ---
 
+### Data support
+
+`fgb-vt` reads FlatGeobuf 3.x files of any patch level (1.x and 2.x raise `UnsupportedFormatError`), with or without a spatial index (files without one are scanned, up to `maxScanBytes`).
+
+**Geometry types** — all 17 FlatGeobuf types, including layers that mix types (header type `Unknown`):
+
+| FlatGeobuf | MVT |
+|------------|-----|
+| Point, MultiPoint | `POINT` |
+| LineString, MultiLineString | `LINESTRING` |
+| Polygon, MultiPolygon, Triangle | `POLYGON` |
+| CircularString, CompoundCurve, MultiCurve | `LINESTRING`, arcs linearised |
+| CurvePolygon, MultiSurface | `POLYGON`, arcs linearised |
+| TIN, PolyhedralSurface | `POLYGON`, one polygon per face |
+| GeometryCollection | one feature per geometry family (polygons, lines, points), sharing id and properties |
+
+Arcs are linearised per tile, so that no chord deviates from the true curve by more than one tile unit (up to 128 chords per arc): curves get smoother as you zoom in. Z, M, T and TM values are ignored (MVT is two-dimensional). Features with an unknown or abstract geometry type are skipped.
+
+**Properties** — all 15 column types; a feature's own column schema overrides the header schema. An integer column named `id`, `fid`, `gid` or `ogc_fid` becomes the MVT feature id.
+
+**Coordinate reference systems** — WGS 84 longitude/latitude (EPSG:4326, OGC:CRS84, or no CRS declared) and Web Mercator (EPSG:3857 and its aliases) are built in. Other CRSs raise `UnsupportedFormatError` unless the source sets `crs`:
+
+```typescript
+import proj4 from 'proj4';
+
+const utm = proj4('EPSG:25832', 'WGS84');
+const source = {
+  name: 'parcels',
+  path: 's3://bucket/parcels-utm32.fgb',
+  crs: {
+    toWgs84: (x, y) => utm.forward([x, y]),
+    fromWgs84: (lon, lat) => utm.inverse([lon, lat]),
+  },
+};
+
+// or, for geographic CRSs close enough to WGS 84 (e.g. ETRS89, NAD83):
+const roads = { name: 'roads', path: './roads-etrs89.fgb', crs: 'lonlat' as const };
+```
+
+`crs` accepts `'auto'` (default: from the header), `'lonlat'`, `'webmercator'` or a `Projection`. TileJSON `bounds` come from the header envelope or, if that is missing or invalid, from the root of the spatial index, converted to WGS 84.
+
+---
+
 ### I/O and caching
 
 Tiles read only what they need: one initial request returns the header and the top of the spatial index, the index is searched level by level (whole subtrees inside the tile are resolved without descending), and matching features are fetched with merged range requests. Headers and index pages are cached, so repeated requests against the same files — including requests to a warm serverless container — typically need a single feature read.
@@ -305,7 +348,7 @@ Data and I/O problems raise subclasses of `FgbVtError` with a stable `code` and 
 | Class | `code` | Raised when |
 |-------|--------|-------------|
 | `FormatError` | `FGB_FORMAT` | The file is not valid FlatGeobuf (corrupt, truncated, inconsistent) |
-| `UnsupportedFormatError` | `FGB_UNSUPPORTED` | Valid FlatGeobuf this reader does not support (major versions other than 3) |
+| `UnsupportedFormatError` | `FGB_UNSUPPORTED` | Valid FlatGeobuf this reader cannot read: major versions other than 3, unknown column types, or a CRS other than WGS 84 / Web Mercator without a `crs` projection on the source |
 | `ConnectorError` | `FGB_IO` | Storage access failed |
 | `RangeNotSupportedError` | `FGB_RANGE_UNSUPPORTED` | An HTTP server ignores `Range` requests |
 | `SourceChangedError` | `FGB_SOURCE_CHANGED` | A file kept changing between reads |
@@ -321,6 +364,7 @@ Invalid tile coordinates raise `RangeError`.
 import type {
   Connector, ReadOptions, ReadHeadResult, ConnectorHints,
   Source, SourceOptions, TileOptions, IoOptions, OpenOptions, RequestOptions, LimitKind,
+  Projection, SourceCrs,
   ByteCache, MemoryCacheOptions,
   TileServerLayer, TileJSON, BBox,
   LocalConnectorOptions, HttpConnectorOptions, S3ConnectorOptions,

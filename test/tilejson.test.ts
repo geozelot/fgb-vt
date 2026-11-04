@@ -79,9 +79,10 @@ describe('TileJSON metadata generation', () => {
 
   // == Default bounds when no bbox ==================================
 
-  it('should use world bounds when no FGB bbox available', async () => {
+  it('should use world bounds when neither envelope nor index is available', async () => {
     addMockFgb('/data/nobbox.fgb', {
-      // No bbox specified
+      // No bbox, no index
+      indexNodeSize: 0,
     });
 
     const source: Source = { name: 'nobbox', path: '/data/nobbox.fgb' };

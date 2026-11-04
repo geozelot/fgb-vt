@@ -138,3 +138,110 @@ write("grid-5k.fgb", fc(grid))
 
 # The same 200 points as points.fgb, written without a spatial index.
 write("no-index.fgb", fc(points), "SPATIAL_INDEX=NO")
+
+
+# == Extended geometry types, dimensions and CRSs ===========================
+# GeoJSON cannot carry curves, surfaces or measures, so these are written
+# through the OGR API from WKT.
+
+ogr.UseExceptions()
+
+
+def write_wkt(name, geom_type, rows, epsg=4326):
+    """Write `rows` of (properties, WKT) to a FlatGeobuf layer of `geom_type`."""
+    from osgeo import osr
+    out = os.path.join(HERE, name)
+    if os.path.exists(out):
+        os.remove(out)
+    srs = None
+    if epsg is not None:
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(epsg)
+        srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    ds = ogr.GetDriverByName("FlatGeobuf").CreateDataSource(out)
+    layer = ds.CreateLayer(os.path.splitext(name)[0], srs, geom_type)
+    for key, value in rows[0][0].items():
+        layer.CreateField(ogr.FieldDefn(key, ogr.OFTInteger if isinstance(value, int) else ogr.OFTString))
+    for props, wkt in rows:
+        f = ogr.Feature(layer.GetLayerDefn())
+        for key, value in props.items():
+            f.SetField(key, value)
+        f.SetGeometry(ogr.CreateGeometryFromWkt(wkt))
+        layer.CreateFeature(f)
+    ds = None
+    print(f"wrote {name} ({os.path.getsize(out)} bytes)")
+    return out
+
+
+# Curves in a mixed layer (header geometry type Unknown, per-feature types).
+write_wkt("curves.fgb", ogr.wkbUnknown, [
+    ({"id": 1, "kind": "arc"}, "CIRCULARSTRING(-101 40, -100 41, -99 40)"),
+    ({"id": 2, "kind": "compound"}, "COMPOUNDCURVE((-103 38, -102 38), CIRCULARSTRING(-102 38, -101 39, -100 38))"),
+    ({"id": 3, "kind": "disc"},
+     "CURVEPOLYGON(CIRCULARSTRING(-96 40, -94 40, -96 40), (-95.5 40, -95 40.5, -94.5 40, -95.5 40))"),
+    ({"id": 4, "kind": "half-disc"},
+     "CURVEPOLYGON(COMPOUNDCURVE(CIRCULARSTRING(-91 40, -90 41, -89 40), (-89 40, -91 40)))"),
+    ({"id": 5, "kind": "multicurve"}, "MULTICURVE((-100 35, -99 35), CIRCULARSTRING(-98 35, -97 36, -96 35))"),
+    ({"id": 6, "kind": "multisurface"},
+     "MULTISURFACE(((-100 30, -99 30, -99 31, -100 30)), CURVEPOLYGON(CIRCULARSTRING(-97 30, -95 30, -97 30)))"),
+])
+
+# A typed CurvePolygon layer: parts may rely on the header type.
+write_wkt("curvepolygons.fgb", ogr.wkbCurvePolygon, [
+    ({"id": 1}, "CURVEPOLYGON(CIRCULARSTRING(-101 40, -99 40, -101 40))"),
+    ({"id": 2}, "CURVEPOLYGON(CIRCULARSTRING(-91 40, -89 40, -91 40))"),
+])
+
+# Surfaces: TIN, PolyhedralSurface and Triangle in a mixed layer, and a
+# typed 3D TIN.
+write_wkt("surfaces.fgb", ogr.wkbUnknown, [
+    ({"id": 1, "kind": "tin"}, "TIN(((-101 40, -100 40, -101 41, -101 40)), ((-100 40, -100 41, -101 41, -100 40)))"),
+    ({"id": 2, "kind": "polyhedral"},
+     "POLYHEDRALSURFACE(((-96 40, -95 40, -95 41, -96 40)), ((-96 40, -96 41, -95 41, -96 40)))"),
+    ({"id": 3, "kind": "triangle"}, "TRIANGLE((-91 40, -90 40, -91 41, -91 40))"),
+])
+write_wkt("tin-z.fgb", ogr.wkbTINZ, [
+    ({"id": 1}, "TIN Z(((-101 40 1, -100 40 2, -101 41 3, -101 40 1)), ((-100 40 2, -100 41 4, -101 41 3, -100 40 2)))"),
+])
+
+# Geometry collections, including nested multi-geometries and curves.
+write_wkt("collections.fgb", ogr.wkbGeometryCollection, [
+    ({"id": 1, "kind": "mixed"},
+     "GEOMETRYCOLLECTION(POINT(-100 40), LINESTRING(-101 39, -99 39), POLYGON((-101 41, -99 41, -100 42, -101 41)))"),
+    ({"id": 2, "kind": "nested"},
+     "GEOMETRYCOLLECTION(MULTIPOLYGON(((-95 40, -94 40, -94 41, -95 40)), ((-93 40, -92 40, -92 41, -93 40))), "
+     "MULTIPOINT((-95 39), (-94 39)), CIRCULARSTRING(-95 38, -94 39, -93 38))"),
+    ({"id": 3, "kind": "points"}, "GEOMETRYCOLLECTION(POINT(-90 40), POINT(-89 40))"),
+])
+
+# Basic types in a mixed layer (header Unknown, per-feature types).
+write_wkt("mixed.fgb", ogr.wkbUnknown, [
+    ({"id": 1, "kind": "point"}, "POINT(-100 40)"),
+    ({"id": 2, "kind": "line"}, "LINESTRING(-101 39, -99 39)"),
+    ({"id": 3, "kind": "polygon"}, "POLYGON((-101 41, -99 41, -100 42, -101 41))"),
+    ({"id": 4, "kind": "multipoint"}, "MULTIPOINT((-95 39), (-94 39))"),
+    ({"id": 5, "kind": "multiline"}, "MULTILINESTRING((-95 38, -94 38), (-93 38, -92 38))"),
+    ({"id": 6, "kind": "multipolygon"}, "MULTIPOLYGON(((-95 40, -94 40, -94 41, -95 40)), ((-93 40, -92 40, -92 41, -93 40)))"),
+])
+
+# The same geometries with XY, XYZ, XYM and XYZM coordinates.
+DIMS = [("xy", "", 0, 0), ("xyz", " Z", 1, 0), ("xym", " M", 0, 1), ("xyzm", " ZM", 1, 1)]
+for suffix, tag, has_z, has_m in DIMS:
+    def c(x, y):
+        return f"{x} {y}" + (" 7" if has_z else "") + (" 9" if has_m else "")
+    write_wkt(f"dims-{suffix}.fgb", ogr.GT_SetModifier(ogr.wkbUnknown, has_z, has_m), [
+        ({"id": 1}, f"POINT{tag}({c(-100, 40)})"),
+        ({"id": 2}, f"LINESTRING{tag}({c(-101, 39)}, {c(-100, 39.5)}, {c(-99, 39)})"),
+        ({"id": 3}, f"POLYGON{tag}(({c(-96, 39)}, {c(-94, 39)}, {c(-94, 41)}, {c(-96, 41)}, {c(-96, 39)}), "
+                    f"({c(-95.5, 39.5)}, {c(-95.5, 40.5)}, {c(-94.5, 40.5)}, {c(-94.5, 39.5)}, {c(-95.5, 39.5)}))"),
+    ])
+
+# points.fgb in Web Mercator and in World Equidistant Cylindrical (a CRS
+# that needs a projection hook; its math is x = R·lon, y = R·lat).
+for epsg in (3857, 4087):
+    out = os.path.join(HERE, f"points-{epsg}.fgb")
+    if os.path.exists(out):
+        os.remove(out)
+    subprocess.run(["ogr2ogr", "-f", "FlatGeobuf", out, os.path.join(HERE, "points.fgb"),
+                    "-t_srs", f"EPSG:{epsg}", "-nln", f"points-{epsg}"], check=True)
+    print(f"wrote points-{epsg}.fgb ({os.path.getsize(out)} bytes)")

@@ -61,8 +61,9 @@ export function zigzag(n: number): number {
  * Map a FlatGeobuf geometry type to the corresponding MVT geometry type.
  *
  * MVT collapses multi-geometry variants into their single counterparts
- * (e.g. both `Point` and `MultiPoint` become `MvtGeomType.POINT`).
- * Unknown or unsupported types fall back to `POINT`.
+ * (e.g. both `Point` and `MultiPoint` become `MvtGeomType.POINT`). The
+ * feature decoder only produces the six basic types; anything else falls
+ * back to `POINT`.
  *
  * @param fgbType - FlatGeobuf `GeomType` enum value.
  * @returns The corresponding `MvtGeomType` enum value.

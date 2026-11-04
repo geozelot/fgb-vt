@@ -70,6 +70,7 @@ export type { LocalConnectorOptions } from './connectors/local.js';
 export type { HttpConnectorOptions } from './connectors/http.js';
 export type { S3ConnectorOptions } from './connectors/s3.js';
 export type { Source, SourceOptions, TileOptions } from './source.js';
+export type { Projection, SourceCrs } from './geometry/crs.js';
 export type { TileServerLayer } from './server.js';
 export type { TileJSON, BBox } from './types.js';
 export type { ByteCache, MemoryCacheOptions } from './cache.js';
