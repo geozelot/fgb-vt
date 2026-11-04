@@ -242,6 +242,8 @@ new S3Connector({ client: existingS3Client, sdk: s3 })
 ```
 
 `@aws-sdk/client-s3` is an optional peer dependency, imported on first use unless `sdk` is given. A `client` passed in is not destroyed by `close()`.
+
+`maxConcurrency` bounds the requests in flight across **all** reads through a connector (every tile and source sharing it); further requests queue in arrival order, and time spent waiting does not count towards `timeout`. Defaults: 32 for `HttpConnector` in Node.js (6 in browsers), 50 for `S3Connector` (the SDK's socket pool). When one range of a multi-range read fails, the others are cancelled.
 ---
 
 ### Options

@@ -6,8 +6,8 @@
  * Reads FlatGeobuf byte ranges via `GetObject` with the `Range` header.
  * The `@aws-sdk/client-s3` package is loaded lazily at first use so that
  * applications not using S3 pay no import cost; alternatively an existing
- * `S3Client` and/or the SDK module can be passed in. Multi-range reads are
- * throttled to a configurable concurrency limit.
+ * `S3Client` and/or the SDK module can be passed in. Requests are limited
+ * to a configurable number in flight across all reads of the connector.
  *
  * Compatible with any S3-compatible object store (MinIO, Cloudflare R2,
  * Backblaze B2, etc.) via the `endpoint` and `forcePathStyle` options.
@@ -15,6 +15,7 @@
 
 import type { Connector, ConnectorHints, ReadHeadResult, ReadOptions } from './connector.js';
 import { ConnectorError, SourceChangedError } from '../errors.js';
+import { RequestLimiter, readAll } from './limiter.js';
 
 /**
  * Configuration options for {@link S3Connector}.
@@ -92,10 +93,13 @@ export interface S3ConnectorOptions {
    */
   forcePathStyle?: boolean;
   /**
-   * Maximum number of concurrent `GetObject` calls within a single
-   * {@link S3Connector.readRanges} invocation.
+   * Most `GetObject` requests in flight at once across all reads through
+   * this connector (every tile and source sharing it); further requests
+   * wait in arrival order. Matches the SDK's default socket pool (50) so
+   * that requests queue here, where they can be cancelled, rather than in
+   * the HTTP agent. `Infinity` disables the limit.
    *
-   * @defaultValue 10
+   * @defaultValue 50
    */
   maxConcurrency?: number;
   /**
@@ -222,7 +226,7 @@ async function loadS3Sdk(): Promise<S3SdkModule> {
 export class S3Connector implements Connector {
   readonly hints: ConnectorHints;
 
-  private readonly maxConcurrency: number;
+  private readonly limiter: RequestLimiter;
   private client: S3ClientLike | null = null;
   private sdk: S3SdkModule | null = null;
   private clientPromise: Promise<{ client: S3ClientLike; sdk: S3SdkModule }> | null = null;
@@ -239,7 +243,7 @@ export class S3Connector implements Connector {
    * @param options - S3 client configuration. See {@link S3ConnectorOptions}.
    */
   constructor(options: S3ConnectorOptions = {}) {
-    this.maxConcurrency = options.maxConcurrency ?? 10;
+    this.limiter = new RequestLimiter(options.maxConcurrency ?? 50);
     this.hints = {
       prefetch: options.prefetch ?? 256 * 1024,
       coalesceGap: options.coalesceGap ?? 64 * 1024,
@@ -286,8 +290,9 @@ export class S3Connector implements Connector {
    * Read multiple byte ranges from the same S3 object.
    *
    * Each range is fetched as a separate `GetObject` call with a `Range`
-   * header. Calls are dispatched through a worker pool limited to
-   * {@link S3ConnectorOptions.maxConcurrency} concurrent requests.
+   * header, subject to the connector-wide
+   * {@link S3ConnectorOptions.maxConcurrency} limit. When one range fails,
+   * the others are cancelled.
    * Results are returned in the same order as the input ranges.
    *
    * @param path - S3 path in `s3://bucket/key` or `bucket/key` format.
@@ -309,26 +314,11 @@ export class S3Connector implements Connector {
       return [await this.read(path, r.offset, r.length, options)];
     }
 
-    // Throttled parallel GetObject calls
-    const results = new Array<Uint8Array>(ranges.length);
-    const queue = ranges.map((r, i) => ({ ...r, index: i }));
-    let cursor = 0;
-
-    const worker = async () => {
-      while (cursor < queue.length) {
-        const idx = cursor++;
-        const item = queue[idx];
-        results[item.index] = await this.read(path, item.offset, item.length, options);
-      }
-    };
-
-    const workers = Array.from(
-      { length: Math.min(this.maxConcurrency, queue.length) },
-      () => worker(),
+    return readAll(
+      ranges.length,
+      (i, signal) => this.read(path, ranges[i].offset, ranges[i].length, { ...options, signal }),
+      options?.signal,
     );
-
-    await Promise.all(workers);
-    return results;
   }
 
   /**
@@ -376,24 +366,27 @@ export class S3Connector implements Connector {
       ...(options?.ifMatch !== undefined ? { IfMatch: options.ifMatch } : {}),
     });
 
-    let response: any;
-    try {
-      response = await client.send(command, options?.signal ? { abortSignal: options.signal } : undefined);
-    } catch (err) {
-      // Range starting at or beyond the end of the object: nothing to read
-      if (isInvalidRange(err)) return { bytes: new Uint8Array(0), size: null, etag: null };
-      if (isPreconditionFailed(err)) {
-        throw new SourceChangedError(`${path} changed since it was opened`, { path, status: 412 });
+    // The slot is held until the body is read: it occupies the connection
+    const result = await this.limiter.run(async () => {
+      let response: any;
+      try {
+        response = await client.send(command, options?.signal ? { abortSignal: options.signal } : undefined);
+      } catch (err) {
+        // Range starting at or beyond the end of the object: nothing to read
+        if (isInvalidRange(err)) return null;
+        if (isPreconditionFailed(err)) {
+          throw new SourceChangedError(`${path} changed since it was opened`, { path, status: 412 });
+        }
+        throw err;
       }
-      throw err;
-    }
-    const body = response.Body;
+      if (!response.Body) {
+        throw new ConnectorError(`Empty response body for ${path} [${offset}-${end}]`, { path });
+      }
+      return { response, bytes: await streamToUint8Array(response.Body) };
+    }, options?.signal);
+    if (!result) return { bytes: new Uint8Array(0), size: null, etag: null };
 
-    if (!body) {
-      throw new ConnectorError(`Empty response body for ${path} [${offset}-${end}]`, { path });
-    }
-
-    const bytes = await streamToUint8Array(body);
+    const { response, bytes } = result;
     const total = /\/(\d+)\s*$/.exec(response.ContentRange ?? '');
     return {
       bytes: bytes.length > length ? bytes.subarray(0, length) : bytes,

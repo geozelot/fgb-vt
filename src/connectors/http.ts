@@ -15,6 +15,7 @@
 
 import type { Connector, ConnectorHints, ReadHeadResult, ReadOptions } from './connector.js';
 import { ConnectorError, RangeNotSupportedError, SourceChangedError } from '../errors.js';
+import { RequestLimiter, readAll } from './limiter.js';
 
 /**
  * Configuration options for {@link HttpConnector}.
@@ -37,13 +38,14 @@ export interface HttpConnectorOptions {
    */
   timeout?: number;
   /**
-   * Maximum number of concurrent HTTP Range Requests issued by a single
-   * {@link HttpConnector.readRanges} call.
+   * Most HTTP requests in flight at once across all reads through this
+   * connector (every tile and source sharing it); further requests wait
+   * in arrival order. Waiting does not count towards `timeout`.
    *
    * Limits parallelism to avoid overwhelming the origin server or
-   * exhausting local socket resources.
+   * exhausting local socket resources. `Infinity` disables the limit.
    *
-   * @defaultValue 6
+   * @defaultValue 32 in Node.js, 6 in browsers (their per-host connection limit)
    */
   maxConcurrency?: number;
   /**
@@ -81,8 +83,8 @@ export interface HttpConnectorOptions {
  *
  * Suitable for any HTTP endpoint that supports partial content responses:
  * static file servers, CDNs, cloud storage with pre-signed URLs, etc.
- * Multi-range reads are throttled to {@link HttpConnectorOptions.maxConcurrency}
- * concurrent requests to avoid overwhelming the origin.
+ * Requests are limited to {@link HttpConnectorOptions.maxConcurrency} in
+ * flight across all reads of the connector, to avoid overwhelming the origin.
  *
  * @example
  * ```typescript
@@ -109,7 +111,7 @@ export class HttpConnector implements Connector {
 
   private readonly headers: Record<string, string>;
   private readonly timeout: number;
-  private readonly maxConcurrency: number;
+  private readonly limiter: RequestLimiter;
   private readonly retryAttempts: number;
   private readonly retryBackoff: number;
 
@@ -121,7 +123,7 @@ export class HttpConnector implements Connector {
   constructor(options?: HttpConnectorOptions) {
     this.headers = options?.headers ?? {};
     this.timeout = options?.timeout ?? 30_000;
-    this.maxConcurrency = options?.maxConcurrency ?? 6;
+    this.limiter = new RequestLimiter(options?.maxConcurrency ?? (isNode() ? 32 : 6));
     this.retryAttempts = Math.max(1, options?.retry?.attempts ?? 3);
     this.retryBackoff = options?.retry?.backoff ?? 200;
     this.hints = {
@@ -177,10 +179,10 @@ export class HttpConnector implements Connector {
   /**
    * Read multiple byte ranges from the same HTTP(S) URL.
    *
-   * Each range is fetched as a separate HTTP Range Request. Requests are
-   * dispatched through a worker pool limited to
-   * {@link HttpConnectorOptions.maxConcurrency} concurrent fetches.
-   * Results are returned in the same order as the input ranges.
+   * Each range is fetched as a separate HTTP Range Request, subject to the
+   * connector-wide {@link HttpConnectorOptions.maxConcurrency} limit. When
+   * one range fails, the others are cancelled. Results are returned in the
+   * same order as the input ranges.
    *
    * @param path - Fully qualified HTTP(S) URL to the FGB resource.
    * @param ranges - Array of `{ offset, length }` byte-range descriptors.
@@ -200,26 +202,11 @@ export class HttpConnector implements Connector {
       return [await this.read(path, r.offset, r.length, options)];
     }
 
-    // Throttled parallel fetches
-    const results = new Array<Uint8Array>(ranges.length);
-    const queue = ranges.map((r, i) => ({ ...r, index: i }));
-    let cursor = 0;
-
-    const worker = async () => {
-      while (cursor < queue.length) {
-        const idx = cursor++;
-        const item = queue[idx];
-        results[item.index] = await this.read(path, item.offset, item.length, options);
-      }
-    };
-
-    const workers = Array.from(
-      { length: Math.min(this.maxConcurrency, queue.length) },
-      () => worker(),
+    return readAll(
+      ranges.length,
+      (i, signal) => this.read(path, ranges[i].offset, ranges[i].length, { ...options, signal }),
+      options?.signal,
     );
-
-    await Promise.all(workers);
-    return results;
   }
 
   /**
@@ -316,9 +303,10 @@ export class HttpConnector implements Connector {
   }
 
   /**
-   * Run one complete request attempt — fetch plus body read — under a
-   * per-attempt timeout, retrying transient failures with exponential
-   * backoff.
+   * Run one complete request attempt — fetch plus body read — in a
+   * connector slot and under a per-attempt timeout, retrying transient
+   * failures with exponential backoff. The slot is taken before the
+   * timeout starts and freed during backoff.
    *
    * Retries are triggered by HTTP 5xx, 408 and 429, network errors, body
    * read failures, and timeouts. Errors marked non-retryable (client
@@ -341,6 +329,7 @@ export class HttpConnector implements Connector {
 
     for (let i = 0; i < this.retryAttempts; i++) {
       callerSignal?.throwIfAborted();
+      const release = await this.limiter.acquire(callerSignal);
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), this.timeout);
       const onAbort = () => controller.abort(callerSignal?.reason);
@@ -356,9 +345,10 @@ export class HttpConnector implements Connector {
       } finally {
         clearTimeout(timer);
         callerSignal?.removeEventListener('abort', onAbort);
+        release();
       }
       if (i < this.retryAttempts - 1) {
-        await sleep(this.retryBackoff * Math.pow(2, i));
+        await sleep(this.retryBackoff * Math.pow(2, i), callerSignal);
       }
     }
 
@@ -390,11 +380,23 @@ function isNode(): boolean {
 }
 
 /**
- * Sleep for the specified duration.
+ * Sleep for the specified duration, unless aborted first.
  *
  * @param ms - Duration in milliseconds.
+ * @param signal - Ends the sleep early, rejecting with its reason.
  * @returns Resolves after `ms` milliseconds.
  */
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal!.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
