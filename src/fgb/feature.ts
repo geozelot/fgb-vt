@@ -109,6 +109,11 @@ export interface FeatureChunk {
    */
   skipped: number;
   /**
+   * Stored features decoded (accepted by the filter and complete), whether
+   * they produced features or were skipped.
+   */
+  stored: number;
+  /**
    * Byte offset (within the buffer) of a feature whose size prefix says it
    * extends past the end of the buffer, or `-1` if the buffer ended on a
    * feature boundary. The caller can re-read `truncatedLength` bytes from
@@ -167,6 +172,7 @@ export function decodeFeatureChunk(
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let offset = 0;
   let skipped = 0;
+  let stored = 0;
 
   while (offset + 4 <= bytes.length) {
     // Read feature size prefix (uint32 LE)
@@ -174,10 +180,11 @@ export function decodeFeatureChunk(
     if (featureSize === 0) break;
 
     if (offset + 4 + featureSize > bytes.length) {
-      return { features, skipped, truncatedAt: offset, truncatedLength: 4 + featureSize, end: offset };
+      return { features, skipped, stored, truncatedAt: offset, truncatedLength: 4 + featureSize, end: offset };
     }
 
     if (!accept || accept(offset)) {
+      stored++;
       const featureBytes = bytes.subarray(offset + 4, offset + 4 + featureSize);
       try {
         if (!decodeSingleFeature(featureBytes, ctx, features)) skipped++;
@@ -196,9 +203,9 @@ export function decodeFeatureChunk(
 
   if (offset < bytes.length && offset + 4 > bytes.length) {
     // The buffer ended inside a size prefix
-    return { features, skipped, truncatedAt: offset, truncatedLength: 0, end: offset };
+    return { features, skipped, stored, truncatedAt: offset, truncatedLength: 0, end: offset };
   }
-  return { features, skipped, truncatedAt: -1, truncatedLength: 0, end: offset };
+  return { features, skipped, stored, truncatedAt: -1, truncatedLength: 0, end: offset };
 }
 
 /**

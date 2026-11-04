@@ -37,7 +37,7 @@ import { headerByteSize, isValidBBox, parseHeader } from './header.js';
 import { computeLevelBounds } from './index.js';
 import { decodeFeatureChunk } from './feature.js';
 import type { FeatureSchema } from '../schema.js';
-import { FormatError, LimitExceededError } from '../errors.js';
+import { FormatError, IndexMismatchError, LimitExceededError } from '../errors.js';
 
 /** Byte size of one packed R-tree node (4 x f64 bbox + u64 offset). */
 const NODE_BYTES = 40;
@@ -162,6 +162,8 @@ export interface QueryOptions {
   curveTolerance?: number;
   /** Property selection and id column for decoding. */
   schema?: FeatureSchema;
+  /** `false` scans the features instead of searching the index. */
+  useIndex?: boolean;
   /** Receives counts of the reads this query issues. */
   stats?: ReadStats;
   /** Aborts the reads when signalled. */
@@ -327,7 +329,7 @@ export class FgbSource {
    */
   async readFeatures(bbox: BBox, options: QueryOptions = {}): Promise<RawFeature[]> {
     const { signal } = options;
-    if (!this.hasIndex) return this.scan(options);
+    if (!this.hasIndex || options.useIndex === false) return this.scan(options);
 
     const { runs, featureCount } = await this.searchRuns(bbox, options);
     if (runs.length === 0) return [];
@@ -341,28 +343,46 @@ export class FgbSource {
     const chunks = await this.connector.readRanges(this.path, ranges, this.readOptions(signal));
     count(options.stats, 'featureBytes', chunks);
     const features: RawFeature[] = [];
-    const rereads: Array<Promise<RawFeature[]>> = [];
+    const rereads: Array<Promise<{ features: RawFeature[]; stored: number }>> = [];
+    let stored = 0;
     let run = 0;
-    for (let c = 0; c < chunks.length; c++) {
-      // Decode only features inside requested runs, not those read because
-      // they sit in a gap between two runs. Offsets increase monotonically.
-      const base = ranges[c].offset;
-      const accept = (offset: number) => {
-        const at = base + offset;
-        while (run < runs.length && runs[run].offset + runs[run].length <= at) run++;
-        return run < runs.length && at >= runs[run].offset;
-      };
-      const chunk = decodeFeatureChunk(chunks[c], this.header, {
-        accept, fileOffset: base, curveTolerance: options.curveTolerance, schema: options.schema,
-      });
-      for (const f of chunk.features) features.push(f);
-      if (chunk.truncatedAt >= 0) {
-        // Only the last feature's length can be an estimate (unknown file size)
-        rereads.push(this.readFeatureAt(base + chunk.truncatedAt, options));
+    try {
+      for (let c = 0; c < chunks.length; c++) {
+        // Decode only features inside requested runs, not those read because
+        // they sit in a gap between two runs. Offsets increase monotonically.
+        const base = ranges[c].offset;
+        const accept = (offset: number) => {
+          const at = base + offset;
+          while (run < runs.length && runs[run].offset + runs[run].length <= at) run++;
+          return run < runs.length && at >= runs[run].offset;
+        };
+        const chunk = decodeFeatureChunk(chunks[c], this.header, {
+          accept, fileOffset: base, curveTolerance: options.curveTolerance, schema: options.schema,
+        });
+        for (const f of chunk.features) features.push(f);
+        stored += chunk.stored;
+        if (chunk.truncatedAt >= 0) {
+          // Only the last feature's length can be an estimate (unknown file size)
+          rereads.push(this.readFeatureAt(base + chunk.truncatedAt, options));
+        }
       }
+      for (const more of await Promise.all(rereads)) {
+        for (const f of more.features) features.push(f);
+        stored += more.stored;
+      }
+    } catch (err) {
+      // Garbage at an indexed offset means corrupt features or a wrong index
+      if (err instanceof FormatError && !(err instanceof IndexMismatchError)) {
+        throw new FormatError(
+          `${err.message} (read through the spatial index of ${this.path}; if the features themselves ` +
+          'are intact, the index does not match them: set useIndex: false on the source to scan the file)',
+          { path: this.path, offset: err.offset, cause: err },
+        );
+      }
+      throw err;
     }
-    for (const more of await Promise.all(rereads)) {
-      for (const f of more) features.push(f);
+    if (stored !== featureCount) {
+      throw this.indexMismatch(`the index lists ${featureCount} features in the requested area, the data holds ${stored}`);
     }
     return features;
   }
@@ -413,6 +433,8 @@ export class FgbSource {
       }
       if (needed.length === 0) continue;
       await this.loadNodes(needed, nodes, options);
+      if (level === levels.length - 1) this.checkRoot(nodes);
+      if (level === 0) this.checkLeafOrder(needed, nodes, leafStart);
 
       const next: Array<[number, number]> = [];
       for (const [a, b] of frontier) {
@@ -473,10 +495,7 @@ export class FgbSource {
         end = start + LAST_FEATURE_GUESS; // corrected via the size prefix if short
       }
       if (end <= start) {
-        throw new FormatError(
-          `Corrupt FlatGeobuf index: feature ${a} does not precede feature ${b} in the file`,
-          { path: this.path },
-        );
+        throw this.indexMismatch(`feature ${a} is stored after feature ${b}`);
       }
       ranges.push({ offset: start, length: end - start });
     }
@@ -668,7 +687,7 @@ export class FgbSource {
         if (bytes.length < want) {
           throw new FormatError('Truncated FlatGeobuf feature', { path: this.path, offset: pos });
         }
-        for (const f of await this.readFeatureAt(pos, options)) features.push(f);
+        for (const f of (await this.readFeatureAt(pos, options)).features) features.push(f);
         pos += new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, true) + 4;
         continue;
       }
@@ -684,11 +703,12 @@ export class FgbSource {
    *
    * @param offset - Absolute file offset of the feature's size prefix.
    * @param query - Feature size limit and abort signal.
-   * @returns The decoded feature (empty if its geometry is unusable).
+   * @returns The decoded features (none if its geometry is unusable) and
+   *   the number of stored features decoded (1).
    * @throws {FormatError} If the file ends before the feature does.
    * @throws {LimitExceededError} If the feature exceeds `maxFeatureBytes`.
    */
-  private async readFeatureAt(offset: number, query: QueryOptions): Promise<RawFeature[]> {
+  private async readFeatureAt(offset: number, query: QueryOptions): Promise<{ features: RawFeature[]; stored: number }> {
     const options = this.readOptions(query.signal);
     const prefix = await this.connector.read(this.path, offset, 4, options);
     count(query.stats, 'featureBytes', [prefix]);
@@ -706,7 +726,7 @@ export class FgbSource {
     const length = 4 + size;
     const bytes = await this.connector.read(this.path, offset, length, options);
     count(query.stats, 'featureBytes', [bytes]);
-    const { features, truncatedAt } = decodeFeatureChunk(bytes, this.header, {
+    const { features, truncatedAt, stored } = decodeFeatureChunk(bytes, this.header, {
       fileOffset: offset, curveTolerance: query.curveTolerance, schema: query.schema,
     });
     if (truncatedAt >= 0 || bytes.length < length) {
@@ -715,7 +735,55 @@ export class FgbSource {
         { path: this.path, offset },
       );
     }
-    return features;
+    return { features, stored };
+  }
+
+  /**
+   * Reject an index whose root box is not a valid box although the file
+   * has features: every query would silently find nothing (e.g. a writer
+   * that left feature boxes empty).
+   */
+  private checkRoot(nodes: NodeReader): void {
+    const root = { minX: nodes.f64(0, 0), minY: nodes.f64(0, 8), maxX: nodes.f64(0, 16), maxY: nodes.f64(0, 24) };
+    if (!isValidBBox(root)) {
+      throw this.indexMismatch(`its root box [${root.minX}, ${root.minY}, ${root.maxX}, ${root.maxY}] is empty`);
+    }
+  }
+
+  /**
+   * Check that the leaf nodes read for a query point at features in index
+   * order: offsets strictly increasing within each range, and the first
+   * leaf at the start of the data. Readers rely on this to compute feature
+   * lengths and byte runs.
+   *
+   * @param ranges - Leaf node ranges `[start, end)` loaded for the query.
+   * @param nodes - Loaded pages.
+   * @param leafStart - Index of the first leaf node.
+   */
+  private checkLeafOrder(ranges: Array<[number, number]>, nodes: NodeReader, leafStart: number): void {
+    if (nodes.hasNode(leafStart) && nodes.u64(leafStart, 32) !== 0) {
+      throw this.indexMismatch(`the first feature in index order is at byte ${nodes.u64(leafStart, 32)}, not 0`);
+    }
+    for (const [a, b] of ranges) {
+      let prev = nodes.u64(a, 32);
+      for (let i = a + 1; i < b; i++) {
+        const offset = nodes.u64(i, 32);
+        if (offset <= prev) {
+          throw this.indexMismatch(`feature ${i - leafStart} is stored before feature ${i - leafStart - 1}`);
+        }
+        prev = offset;
+      }
+    }
+  }
+
+  /** Error for an index that does not describe the feature data. */
+  private indexMismatch(detail: string): IndexMismatchError {
+    return new IndexMismatchError(
+      `The spatial index of ${this.path} does not match its feature data: ${detail}. ` +
+      'The file was probably written by a faulty writer; rewrite it (e.g. ogr2ogr -f FlatGeobuf out.fgb in.fgb), ' +
+      'or set useIndex: false on the source to scan it instead',
+      { path: this.path },
+    );
   }
 
   /**
@@ -924,6 +992,11 @@ class NodeReader {
 
   has(page: number): boolean {
     return this.pages.has(page);
+  }
+
+  /** Whether the page holding node `i` is loaded. */
+  hasNode(i: number): boolean {
+    return this.pages.has(Math.floor(i / this.pageNodes));
   }
 
   add(page: number, bytes: Uint8Array): void {

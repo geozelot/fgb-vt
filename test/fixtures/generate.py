@@ -9,6 +9,10 @@ index_node_size = 16), which is exactly what readers must handle.
 
 Requires GDAL >= 3.1 with the FlatGeobuf driver and its Python bindings.
 Usage: python3 test/fixtures/generate.py
+
+The gogama-*.fgb fixtures come from a second, independent writer
+(github.com/gogama/flatgeobuf); regenerate them with Go:
+    cd test/fixtures/writers/gogama && go run . ../..
 """
 
 import json

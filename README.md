@@ -207,6 +207,11 @@ Use the browser bundle to turn any hosted `.fgb` into a vector tile source - no 
 
 ---
 
+## Guides
+
+- [Serverless deployment](guide/serverless.md): Lambda and S3 setup, caching, budgets, error mapping, metrics
+- [Producing files](guide/producing-files.md): writing FlatGeobuf for fast tiles, overviews, CRS, other writers
+
 ## API Reference
 
 ### Connectors
@@ -316,6 +321,7 @@ Arcs are linearised per tile, so that no chord deviates from the true curve by m
 | `properties` | all | Names to keep (`['name', 'class']`, `[]` for none), or `{ exclude: [...] }`. Dropped strings are never decoded |
 | `idColumn` | auto-detected | Integer column providing the feature id, or `false` for none. Negative or missing values give no id |
 | `keepIdProperty` | `false` | Also write the id column as a property |
+| `useIndex` | `true` | `false` ignores the spatial index and scans the file (within `maxScanBytes`), e.g. for files with a broken index |
 
 ```typescript
 { name: 'roads', path: './roads.fgb', properties: ['name', 'class'], idColumn: 'osm_id' }
@@ -393,6 +399,7 @@ Data and I/O problems raise subclasses of `FgbVtError` with a stable `code` and 
 | Class | `code` | Raised when |
 |-------|--------|-------------|
 | `FormatError` | `FGB_FORMAT` | The file is not valid FlatGeobuf (corrupt, truncated, inconsistent) |
+| `IndexMismatchError` | `FGB_FORMAT` | A `FormatError`: the spatial index does not match the feature data (faulty writer); rewrite the file or set `useIndex: false` on the source |
 | `UnsupportedFormatError` | `FGB_UNSUPPORTED` | Valid FlatGeobuf this reader cannot read: major versions other than 3, unknown column types, or a CRS other than WGS 84 / Web Mercator without a `crs` projection on the source |
 | `ConnectorError` | `FGB_IO` | Storage access failed |
 | `RangeNotSupportedError` | `FGB_RANGE_UNSUPPORTED` | An HTTP server ignores `Range` requests |

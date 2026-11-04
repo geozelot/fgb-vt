@@ -10,6 +10,7 @@
  * | Class | `code` | Meaning |
  * |-------|--------|---------|
  * | {@link FormatError} | `FGB_FORMAT` | The file is not valid FlatGeobuf (corrupt, truncated, inconsistent). |
+ * | {@link IndexMismatchError} | `FGB_FORMAT` | A `FormatError`: the spatial index does not match the feature data. |
  * | {@link UnsupportedFormatError} | `FGB_UNSUPPORTED` | Valid FlatGeobuf that this reader does not support (e.g. major version 2). |
  * | {@link ConnectorError} | `FGB_IO` | Reading from storage failed. |
  * | {@link RangeNotSupportedError} | `FGB_RANGE_UNSUPPORTED` | The server ignores byte-range requests. |
@@ -45,6 +46,14 @@ export class FormatError extends FgbVtError {
     if (options?.offset !== undefined) this.offset = options.offset;
   }
 }
+
+/**
+ * The spatial index does not describe the feature data: offsets that do not
+ * point at features, features not stored in index order, or an index
+ * without a valid extent. Such files read correctly only without their
+ * index (`useIndex: false` on the source).
+ */
+export class IndexMismatchError extends FormatError {}
 
 /** Valid FlatGeobuf that uses a feature this reader does not support. */
 export class UnsupportedFormatError extends FgbVtError {

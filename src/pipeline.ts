@@ -225,6 +225,7 @@ async function readSourceFeatures(
           curveTolerance: unitsPerTileUnit(query, tileOpts) * CURVE_TOLERANCE,
           schema,
           stats,
+          useIndex: source.useIndex,
           signal,
         });
       };
@@ -235,7 +236,7 @@ async function readSourceFeatures(
       if (shifts.length === 0) return features;
 
       const out = [...features];
-      if (!fgb.hasIndex) {
+      if (!fgb.hasIndex || source.useIndex === false) {
         // A scan already returned every feature: copy those reaching the tile
         for (const shift of shifts) {
           for (const f of features) {

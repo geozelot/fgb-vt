@@ -121,6 +121,12 @@ export interface Source {
    * @defaultValue false
    */
   keepIdProperty?: boolean;
+  /**
+   * `false` ignores the file's spatial index and scans its features
+   * (bounded by `maxScanBytes`), e.g. for a file whose index does not match
+   * its data (`IndexMismatchError`). @defaultValue true
+   */
+  useIndex?: boolean;
 }
 
 /**

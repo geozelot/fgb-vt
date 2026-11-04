@@ -56,6 +56,7 @@ export { MemoryCache } from './cache.js';
 export {
   FgbVtError,
   FormatError,
+  IndexMismatchError,
   UnsupportedFormatError,
   ConnectorError,
   RangeNotSupportedError,
