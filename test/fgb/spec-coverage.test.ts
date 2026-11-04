@@ -326,10 +326,10 @@ describe('coordinate reference systems', () => {
   it('lets a source declare its coordinates as lon/lat', async () => {
     const path = file({
       geometryType: GeomType.Point,
-      crs: { org: 'EPSG', code: 4258, name: 'ETRS89' },
-      features: [{ geometry: { xy: [10, 50] } }],
+      crs: { org: 'EPSG', code: 4267, name: 'NAD27' },
+      features: [{ geometry: { xy: [-100, 40] } }],
     });
-    await expect(tile(connector, 0, 0, 0, { name: 'l', path })).rejects.toThrow(/EPSG:4258/);
+    await expect(tile(connector, 0, 0, 0, { name: 'l', path })).rejects.toThrow(/EPSG:4267/);
     const layer = await layerOf({ name: 'l', path, crs: 'lonlat' }, 0, 0, 0);
     expect(layer?.length).toBe(1);
   });

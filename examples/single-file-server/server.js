@@ -59,11 +59,11 @@ class MockS3Client {
 
 /** Create an S3Connector backed by the local-filesystem mock SDK. */
 function createMockS3Connector() {
-  const connector = new S3Connector({ region: 'us-east-1' });
-  // Inject mock SDK — bypasses the lazy dynamic import of @aws-sdk/client-s3
-  connector.sdk    = { S3Client: MockS3Client, GetObjectCommand: MockGetObjectCommand };
-  connector.client = new MockS3Client();
-  return connector;
+  // Pass the mock SDK module instead of the dynamic import of @aws-sdk/client-s3
+  return new S3Connector({
+    region: 'us-east-1',
+    sdk: { S3Client: MockS3Client, GetObjectCommand: MockGetObjectCommand },
+  });
 }
 
 // == Sources =========================================================
@@ -177,7 +177,9 @@ const server = createServer(async (req, res) => {
   // --- TileJSON ---
   if (url.pathname === '/tilejson.json') {
     try {
-      const tj = await tileServers.us_counties_local.tileJSON();
+      const tj = await tileServers.us_counties_local.tileJSON({
+        tiles: [`http://localhost:${PORT}/tiles/us_counties_local/server/{z}/{x}/{y}.pbf`],
+      });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(tj));
     } catch (err) {

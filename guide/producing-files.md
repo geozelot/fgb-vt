@@ -18,7 +18,7 @@ The index node size (GDAL's default 16) rarely needs changing. Larger nodes make
 
 ## Coordinate reference system
 
-Write WGS 84 longitude/latitude (EPSG:4326) or Web Mercator (EPSG:3857); both are read natively. Any other CRS needs a projection on every source (`crs: { toWgs84, fromWgs84 }`), which costs a conversion per vertex and per tile. Geographic CRSs within a metre or two of WGS 84 (ETRS89, NAD83) can be read with `crs: 'lonlat'`.
+Write WGS 84 longitude/latitude (EPSG:4326) or Web Mercator (EPSG:3857); both are read natively. Geographic CRSs on modern datums within about 2 m of WGS 84 (NAD83, ETRS89, GDA94, GDA2020, NZGD2000, SIRGAS 2000, JGD2000/2011) are read as longitude/latitude too. Any other CRS needs a projection on every source (`crs: { toWgs84, fromWgs84 }`), which costs a conversion per vertex and per tile; `crs: 'lonlat'` accepts the offset of another geographic datum instead.
 
 ## Low zooms: overview files
 

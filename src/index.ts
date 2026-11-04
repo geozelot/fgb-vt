@@ -16,9 +16,9 @@
  *
  * | Tier | Export | State | Use case |
  * |------|--------|-------|----------|
- * | **Stateful** | {@link TileServer} | Connectors, sources, headers, indices | Long-running server with a fixed source set. Maximum throughput -- all per-source overhead is amortized across requests. |
- * | **Semi-stateful** | {@link TileClient} | Single connector, tile bounds cache | Application sharing one connector but varying sources per request (e.g. dynamic layer selection). |
- * | **Stateless** | {@link tile} | Module-level tile bounds cache only | One-off or ad-hoc tile generation. Everything is provided per call. |
+ * | **Stateful** | {@link TileServer} | Connectors, sources, header and index page cache | Long-running server with a fixed source set. Maximum throughput -- all per-source overhead is amortized across requests. |
+ * | **Semi-stateful** | {@link TileClient} | Single connector, header and index page cache | Application sharing one connector but varying sources per request (e.g. dynamic layer selection). |
+ * | **Stateless** | {@link tile} | Shared module-level page cache only (or none with `cache: false`) | One-off or ad-hoc tile generation. Everything is provided per call. |
  *
  * ---
  *

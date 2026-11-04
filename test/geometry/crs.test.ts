@@ -29,7 +29,12 @@ describe('classifyCrs', () => {
     ['EPSG:900913', crs({ code: 900913 }), 'webmercator'],
     ['ESRI:102100', crs({ org: 'ESRI', code: 102100 }), 'webmercator'],
     ['EPSG:25832', crs({ org: 'EPSG', code: 25832 }), 'other'],
-    ['EPSG:4258 (ETRS89)', crs({ code: 4258 }), 'other'],
+    ['EPSG:4258 (ETRS89, within 2 m)', crs({ code: 4258 }), 'lonlat'],
+    ['EPSG:4269 (NAD83, within 2 m)', crs({ org: 'EPSG', code: 4269 }), 'lonlat'],
+    ['EPSG:4267 (NAD27, up to ~100 m off)', crs({ code: 4267 }), 'other'],
+    ['EPSG:4301 (Tokyo, ~400 m off)', crs({ code: 4301 }), 'other'],
+    ['WKT1 geographic NAD83 without authority', crs({ wkt: 'GEOGCS["NAD83",DATUM["North_American_Datum_1983",SPHEROID["GRS 1980",6378137,298.257222101]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]' }), 'lonlat'],
+    ['WKT1 geographic NAD27 without authority', crs({ wkt: 'GEOGCS["NAD27",DATUM["North_American_Datum_1927",SPHEROID["Clarke 1866",6378206.4,294.978698213898]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]' }), 'other'],
     ['empty CRS table', crs({}), 'lonlat'],
     ['name only', crs({ name: 'something' }), 'lonlat'],
     ['WKT1 geographic WGS 84 without top-level authority', crs({ wkt: WGS84_WKT1 }), 'lonlat'],
@@ -67,7 +72,7 @@ describe('resolveFrame', () => {
   });
 
   it('lets the source override the header', () => {
-    expect(resolveFrame(crs({ code: 4258 }), 'lonlat', 'a.fgb')).toBe(LONLAT_FRAME);
+    expect(resolveFrame(crs({ code: 4267 }), 'lonlat', 'a.fgb')).toBe(LONLAT_FRAME);
     expect(resolveFrame(null, 'webmercator', 'a.fgb')).toBe(WEB_MERCATOR_FRAME);
   });
 

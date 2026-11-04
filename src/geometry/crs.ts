@@ -5,8 +5,11 @@
  *
  * Two systems are built in:
  *
- * - **WGS 84 longitude/latitude** — EPSG:4326, EPSG:4979, OGC:CRS84 and
- *   files that declare no CRS (or an unidentifiable one without WKT).
+ * - **WGS 84 longitude/latitude** — EPSG:4326, EPSG:4979, OGC:CRS84,
+ *   files that declare no CRS (or an unidentifiable one without WKT), and
+ *   geographic CRSs on modern datums that agree with WGS 84 to within about
+ *   2 m (NAD83, ETRS89, GDA94, GDA2020, NZGD2000, SIRGAS 2000, JGD2000/2011),
+ *   which is invisible at web map scales below zoom ~19.
  * - **Web Mercator** — EPSG:3857 and its legacy aliases (EPSG:900913,
  *   EPSG:3785, ESRI:102100, ESRI:102113), read natively in metres.
  *
@@ -50,9 +53,9 @@ export interface Projection {
  * How a source's coordinates are interpreted:
  *
  * - `'auto'` (default) — from the CRS declared in the file header.
- * - `'lonlat'` — WGS 84 longitude/latitude, whatever the header says
- *   (e.g. for geographic CRSs within a metre or two of WGS 84, such as
- *   ETRS89 or NAD83, where that error is acceptable).
+ * - `'lonlat'` — WGS 84 longitude/latitude, whatever the header says (e.g.
+ *   for a geographic CRS on another datum where the offset is acceptable,
+ *   or a file whose header declares a wrong CRS).
  * - `'webmercator'` — EPSG:3857 metres.
  * - a {@link Projection} — any other CRS.
  */
@@ -90,7 +93,28 @@ const CIRCUMFERENCE = 2 * Math.PI * EARTH_RADIUS;
 /** Latitude limit of the Web Mercator square. */
 const MAX_LATITUDE = 85.0511287798066;
 
-const LONLAT_IDS = new Set(['EPSG:4326', 'EPSG:4979', 'OGC:CRS84', 'OGC:CRS84H']);
+const LONLAT_IDS = new Set([
+  'EPSG:4326', 'EPSG:4979', 'OGC:CRS84', 'OGC:CRS84H',
+  // Geographic 2D CRSs on datums within about 2 m of WGS 84
+  'EPSG:4269', // NAD83
+  'EPSG:4152', // NAD83(HARN)
+  'EPSG:4617', // NAD83(CSRS)
+  'EPSG:6318', // NAD83(2011)
+  'EPSG:4258', // ETRS89
+  'EPSG:4283', // GDA94
+  'EPSG:7844', // GDA2020
+  'EPSG:4167', // NZGD2000
+  'EPSG:4674', // SIRGAS 2000
+  'EPSG:4612', // JGD2000
+  'EPSG:6668', // JGD2011
+]);
+
+/** Datum names in WKT that identify a geographic CRS as close enough to WGS 84. */
+const LONLAT_DATUMS = new RegExp([
+  'WGS[ _]?(19)?84', 'NORTH[ _]AMERICAN[ _]DATUM[ _]1983', 'NAD83', 'ETRS[ _]?89',
+  'EUROPEAN[ _]TERRESTRIAL[ _]REFERENCE[ _]SYSTEM[ _]1989', 'GDA94', 'GDA2020',
+  'GEOCENTRIC[ _]DATUM[ _]OF[ _]AUSTRALIA', 'NZGD[ _]?2000', 'SIRGAS[ _]?2000', 'JGD[ _]?20(00|11)',
+].join('|'));
 const WEB_MERCATOR_IDS = new Set([
   'EPSG:3857', 'EPSG:900913', 'EPSG:3785', 'EPSG:102100', 'EPSG:102113', 'ESRI:102100', 'ESRI:102113',
 ]);
@@ -263,7 +287,7 @@ function classifyWkt(wkt: string): CrsKind {
   const keyword = /^\s*([A-Za-z]+)/.exec(wkt)?.[1].toUpperCase();
   const upper = wkt.toUpperCase();
   if (keyword === 'GEOGCS' || keyword === 'GEOGCRS' || keyword === 'GEODCRS') {
-    return /WGS[ _]?(19)?84/.test(upper) ? 'lonlat' : 'other';
+    return LONLAT_DATUMS.test(upper) ? 'lonlat' : 'other';
   }
   if (keyword === 'PROJCS' || keyword === 'PROJCRS') {
     return /PSEUDO[ _-]MERCATOR|POPULAR[ _]VISUALISATION|MERCATOR_AUXILIARY_SPHERE/.test(upper)

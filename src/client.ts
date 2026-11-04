@@ -65,9 +65,9 @@ export const DEFAULT_WARM_INDEX_BYTES = 4 * 1024 * 1024;
  * Semi-stateful tile client.
  *
  * A single {@link Connector} is bound at construction; {@link Source}
- * descriptors are provided per `tile()` call. An instance-level tile bounds
- * cache is shared across calls, avoiding redundant tile-to-mercator
- * calculations.
+ * descriptors are provided per `tile()` call. File headers and spatial
+ * index pages are cached per instance (see {@link IoOptions.cache}), so
+ * repeated tiles from the same files skip most index reads.
  *
  * Use case: application sharing one HTTP connector (with auth headers) but
  * querying different FGB sources depending on request context.
