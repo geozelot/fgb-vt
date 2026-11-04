@@ -75,6 +75,8 @@ export type { TileJSON, BBox } from './types.js';
 export type { ByteCache, MemoryCacheOptions } from './cache.js';
 export type { IoOptions } from './fgb/reader.js';
 export type { OpenOptions } from './client.js';
+export type { RequestOptions } from './pipeline.js';
+export type { LimitKind } from './errors.js';
 
 // == Caching & errors =======================================================
 

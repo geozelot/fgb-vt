@@ -40,6 +40,18 @@ export interface SourceOptions {
   maxZoom?: number;
   /** Skip this source below this zoom level. @defaultValue 0 */
   minZoom?: number;
+  /**
+   * Most features this source may contribute to one tile. Checked against
+   * the spatial index before feature data is read; exceeding it raises
+   * `LimitExceededError`. @defaultValue Infinity
+   */
+  maxFeatures?: number;
+  /**
+   * Most bytes of feature data read from this source for one tile.
+   * Checked against the spatial index before feature data is read;
+   * exceeding it raises `LimitExceededError`. @defaultValue 268435456 (256 MiB)
+   */
+  maxReadBytes?: number;
 }
 
 /**
@@ -81,6 +93,16 @@ export interface TileOptions {
   maxZoom?: number;
   /** Default minimum zoom level. @defaultValue 0 */
   minZoom?: number;
+  /** Default per-source feature limit per tile. @defaultValue Infinity */
+  maxFeatures?: number;
+  /** Default per-source limit on feature bytes read per tile. @defaultValue 268435456 (256 MiB) */
+  maxReadBytes?: number;
+  /**
+   * Largest encoded tile, in bytes; larger tiles raise `LimitExceededError`
+   * (e.g. to stay below a response size limit). Applies to the whole tile,
+   * not per source. @defaultValue Infinity
+   */
+  maxTileBytes?: number;
 }
 
 /**
@@ -95,6 +117,9 @@ export const DEFAULT_TILE_OPTIONS: Required<TileOptions> = {
   tolerance: 3,
   maxZoom: 24,
   minZoom: 0,
+  maxFeatures: Infinity,
+  maxReadBytes: 256 * 1024 * 1024,
+  maxTileBytes: Infinity,
 };
 
 /**
@@ -111,7 +136,7 @@ export const DEFAULT_TILE_OPTIONS: Required<TileOptions> = {
  *   { tolerance: 1 },          // source override
  *   { tolerance: 5, buffer: 32 }, // tile defaults
  * );
- * // → { extent: 4096, buffer: 32, tolerance: 1, maxZoom: 24, minZoom: 0 }
+ * // → { extent: 4096, buffer: 32, tolerance: 1, maxZoom: 24, minZoom: 0, ... }
  * ```
  */
 export function resolveOptions(
@@ -124,5 +149,8 @@ export function resolveOptions(
     tolerance: source?.tolerance ?? tile?.tolerance ?? DEFAULT_TILE_OPTIONS.tolerance,
     maxZoom: source?.maxZoom ?? tile?.maxZoom ?? DEFAULT_TILE_OPTIONS.maxZoom,
     minZoom: source?.minZoom ?? tile?.minZoom ?? DEFAULT_TILE_OPTIONS.minZoom,
+    maxFeatures: source?.maxFeatures ?? tile?.maxFeatures ?? DEFAULT_TILE_OPTIONS.maxFeatures,
+    maxReadBytes: source?.maxReadBytes ?? tile?.maxReadBytes ?? DEFAULT_TILE_OPTIONS.maxReadBytes,
+    maxTileBytes: tile?.maxTileBytes ?? DEFAULT_TILE_OPTIONS.maxTileBytes,
   };
 }

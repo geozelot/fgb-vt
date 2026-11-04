@@ -46,6 +46,7 @@ import type { TileJSON } from './types.js';
 import {
   processMultiConnectorTile,
   type ConnectorSourceGroup,
+  type RequestOptions,
 } from './pipeline.js';
 import { resolveOptions } from './source.js';
 import { MemoryCache } from './cache.js';
@@ -174,18 +175,21 @@ export class TileServer {
    * @param z - Tile zoom level.
    * @param x - Tile column.
    * @param y - Tile row.
+   * @param request - Optional abort `signal`.
    * @returns PBF-encoded Mapbox Vector Tile. Returns an empty tile if no
    *   features intersect the requested tile bounds.
    * @throws {RangeError} If `z/x/y` is not a valid tile.
-   * @throws {FgbVtError} If a source cannot be read (annotated with its path).
+   * @throws {FgbVtError} If a source cannot be read (annotated with its path)
+   *   or a budget is exceeded.
    */
-  async tile(z: number, x: number, y: number): Promise<Uint8Array> {
+  async tile(z: number, x: number, y: number, request?: RequestOptions): Promise<Uint8Array> {
     this.assertOpen();
     return processMultiConnectorTile(
       this.groups,
       z, x, y,
       this.options,
       this.context,
+      request?.signal,
     );
   }
 

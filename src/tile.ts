@@ -34,7 +34,7 @@
 
 import type { Connector } from './connectors/connector.js';
 import type { Source, TileOptions } from './source.js';
-import { processTile } from './pipeline.js';
+import { processTile, type RequestOptions } from './pipeline.js';
 import { MemoryCache } from './cache.js';
 import { createIoContext, type IoOptions } from './fgb/reader.js';
 
@@ -52,8 +52,9 @@ const sharedCache = new MemoryCache({ maxBytes: 64 * 1024 * 1024 });
  * @param x - Tile column.
  * @param y - Tile row.
  * @param sources - Array of source descriptors; each becomes one MVT layer.
- * @param options - Tile-level tiling option defaults (overridden by per-source
- *   options) and I/O options (cache, prefetch, range merging, scan budget).
+ * @param options - Tile-level tiling option defaults and budgets (overridden
+ *   by per-source options), I/O options (cache, prefetch, range merging, scan
+ *   budget) and an optional abort `signal`.
  * @returns PBF-encoded Mapbox Vector Tile containing one layer per source.
  *
  * @example
@@ -70,7 +71,7 @@ export async function tile(
   x: number,
   y: number,
   sources: Source[],
-  options?: TileOptions & IoOptions,
+  options?: TileOptions & IoOptions & RequestOptions,
 ): Promise<Uint8Array>;
 
 /**
@@ -84,8 +85,9 @@ export async function tile(
  * @param x - Tile column.
  * @param y - Tile row.
  * @param source - Single source descriptor; produces one MVT layer.
- * @param options - Tile-level tiling option defaults (overridden by per-source
- *   options) and I/O options (cache, prefetch, range merging, scan budget).
+ * @param options - Tile-level tiling option defaults and budgets (overridden
+ *   by per-source options), I/O options (cache, prefetch, range merging, scan
+ *   budget) and an optional abort `signal`.
  * @returns PBF-encoded Mapbox Vector Tile containing one layer.
  *
  * @example
@@ -102,7 +104,7 @@ export async function tile(
   x: number,
   y: number,
   source: Source,
-  options?: TileOptions & IoOptions,
+  options?: TileOptions & IoOptions & RequestOptions,
 ): Promise<Uint8Array>;
 
 // Implementation
@@ -112,7 +114,7 @@ export async function tile(
   x: number,
   y: number,
   sourceOrSources: Source | Source[],
-  options?: TileOptions & IoOptions,
+  options?: TileOptions & IoOptions & RequestOptions,
 ): Promise<Uint8Array> {
   const sources = Array.isArray(sourceOrSources)
     ? sourceOrSources
@@ -124,5 +126,6 @@ export async function tile(
     sources,
     options,
     createIoContext(options, sharedCache),
+    options?.signal,
   );
 }

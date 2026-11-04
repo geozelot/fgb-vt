@@ -34,7 +34,7 @@
 
 import type { Connector } from './connectors/connector.js';
 import type { Source, TileOptions } from './source.js';
-import { processTile } from './pipeline.js';
+import { processTile, type RequestOptions } from './pipeline.js';
 import { MemoryCache } from './cache.js';
 import { createIoContext, getSource, type IoContext, type IoOptions } from './fgb/reader.js';
 import { withPath } from './errors.js';
@@ -52,6 +52,8 @@ export interface OpenOptions {
    * @defaultValue 4194304 (4 MiB)
    */
   warmIndex?: number | false;
+  /** Aborts opening. Opens shared with concurrent requests keep running. */
+  signal?: AbortSignal;
 }
 
 /** Default budget for {@link OpenOptions.warmIndex}. */
@@ -129,6 +131,7 @@ export class TileClient {
    * @param x - Tile column.
    * @param y - Tile row.
    * @param sources - Array of source descriptors; each becomes one MVT layer.
+   * @param request - Optional abort `signal`.
    * @returns PBF-encoded Mapbox Vector Tile containing one layer per source.
    *
    * @example
@@ -144,6 +147,7 @@ export class TileClient {
     x: number,
     y: number,
     sources: Source[],
+    request?: RequestOptions,
   ): Promise<Uint8Array>;
 
   /**
@@ -156,6 +160,7 @@ export class TileClient {
    * @param x - Tile column.
    * @param y - Tile row.
    * @param source - Single source descriptor; produces one MVT layer.
+   * @param request - Optional abort `signal`.
    * @returns PBF-encoded Mapbox Vector Tile containing one layer.
    *
    * @example
@@ -171,6 +176,7 @@ export class TileClient {
     x: number,
     y: number,
     source: Source,
+    request?: RequestOptions,
   ): Promise<Uint8Array>;
 
   // Implementation
@@ -179,6 +185,7 @@ export class TileClient {
     x: number,
     y: number,
     sourceOrSources: Source | Source[],
+    request?: RequestOptions,
   ): Promise<Uint8Array> {
     const sources = Array.isArray(sourceOrSources)
       ? sourceOrSources
@@ -190,6 +197,7 @@ export class TileClient {
       sources,
       this.options,
       this.context,
+      request?.signal,
     );
   }
 
@@ -222,8 +230,8 @@ export async function openSources(
   const budget = options?.warmIndex === false ? 0 : (options?.warmIndex ?? DEFAULT_WARM_INDEX_BYTES);
   await Promise.all(sources.map(async (source) => {
     try {
-      const fgb = await getSource(connector, source.path, context);
-      if (budget > 0) await fgb.warmIndex(budget);
+      const fgb = await getSource(connector, source.path, context, options?.signal);
+      if (budget > 0) await fgb.warmIndex(budget, options?.signal);
     } catch (err) {
       throw withPath(err, source.path);
     }

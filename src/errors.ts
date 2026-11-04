@@ -90,10 +90,42 @@ export class SourceChangedError extends ConnectorError {
   }
 }
 
-/** A configured safety limit (e.g. the scan budget for unindexed files) was reached. */
+/**
+ * Which configured limit a {@link LimitExceededError} refers to:
+ *
+ * - `features` — features a source contributes to one tile (`maxFeatures`)
+ * - `readBytes` — feature bytes read from a source for one tile (`maxReadBytes`)
+ * - `scanBytes` — feature data scanned in a file without an index (`maxScanBytes`)
+ * - `featureBytes` — size of a single feature (`maxFeatureBytes`)
+ * - `tileBytes` — size of the encoded tile (`maxTileBytes`)
+ */
+export type LimitKind = 'features' | 'readBytes' | 'scanBytes' | 'featureBytes' | 'tileBytes';
+
+/**
+ * A configured safety limit was reached, e.g. a tile would contain more
+ * features or read more bytes than allowed.
+ *
+ * Raised before the expensive work where possible (feature counts and
+ * byte totals are known from the spatial index before any feature data is
+ * read). Typical remedies are a higher `minZoom` for the source, an
+ * overview file for low zooms, or a larger limit.
+ */
 export class LimitExceededError extends FgbVtError {
-  constructor(message: string, options?: { path?: string }) {
+  /** The limit that was exceeded. */
+  readonly limit: LimitKind;
+  /** The configured maximum. */
+  readonly max: number;
+  /** The amount that would have been needed, when known. */
+  readonly actual?: number;
+
+  constructor(
+    message: string,
+    options: { limit: LimitKind; max: number; actual?: number; path?: string },
+  ) {
     super('FGB_LIMIT', message, options);
+    this.limit = options.limit;
+    this.max = options.max;
+    if (options.actual !== undefined) this.actual = options.actual;
   }
 }
 

@@ -33,6 +33,7 @@
 import { FlatBufferReader } from './flatbuffers.js';
 import type { RawFeature, FgbHeader, PropertyValue, ColumnMeta } from '../types.js';
 import { ColumnType, GeomType } from '../types.js';
+import { FormatError } from '../errors.js';
 
 /**
  * Maximum recursion depth for nested geometry parts.
@@ -95,13 +96,17 @@ export interface FeatureChunk {
  * @param accept - Optional filter on a feature's offset within `bytes`;
  *   rejected features are skipped without decoding (e.g. features that
  *   were only read because they sit between two requested ranges).
+ * @param fileOffset - Absolute file offset of `bytes`, used in error
+ *   reports. Defaults to `0`.
  * @returns Decoded features and the position of a truncated trailing
  *   feature, if any.
+ * @throws {FormatError} If a feature's FlatBuffer is corrupt.
  */
 export function decodeFeatureChunk(
   bytes: Uint8Array,
   header: FgbHeader,
   accept?: (offset: number) => boolean,
+  fileOffset = 0,
 ): FeatureChunk {
   const features: RawFeature[] = [];
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -118,7 +123,16 @@ export function decodeFeatureChunk(
 
     if (!accept || accept(offset)) {
       const featureBytes = bytes.subarray(offset + 4, offset + 4 + featureSize);
-      const feature = decodeSingleFeature(featureBytes, header);
+      let feature: RawFeature | null;
+      try {
+        feature = decodeSingleFeature(featureBytes, header);
+      } catch (err) {
+        // Out-of-bounds FlatBuffer access in a corrupt feature
+        throw new FormatError(
+          `Corrupt FlatGeobuf feature: ${(err as Error).message}`,
+          { offset: fileOffset + offset, cause: err },
+        );
+      }
       if (feature) {
         features.push(feature);
       }

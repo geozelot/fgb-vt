@@ -246,6 +246,11 @@ Options cascade through three levels - **source** overrides **tile-level default
 | `tolerance` | `3` | Douglas-Peucker simplification tolerance |
 | `minZoom` | `0` | Skip source below this zoom |
 | `maxZoom` | `24` | Skip source above this zoom |
+| `maxFeatures` | `Infinity` | Most features a source may contribute to one tile |
+| `maxReadBytes` | `256 MiB` | Most feature bytes read from a source for one tile |
+| `maxTileBytes` | `Infinity` | Largest encoded tile (tile level only) |
+
+Budgets are checked against the spatial index **before** any feature data is read; an exceeded budget raises `LimitExceededError` (with `limit`, `max` and `actual`). For dense data at low zooms, prefer a higher `minZoom` or an overview file over large budgets.
 
 ```typescript
 const server = new TileServer(
@@ -273,6 +278,7 @@ I/O options are accepted alongside the tiling options by `tile()`, `TileClient` 
 | `prefetch` | connector hint: 64 KiB local, 256 KiB HTTP/S3 (16 KiB HTTP in browsers) | Size of the first read of each file |
 | `coalesceGap` | connector hint: 4 KiB local, 64 KiB HTTP/S3 | Merge byte ranges at most this far apart |
 | `maxScanBytes` | 32 MiB | Largest feature section scanned for files **without** a spatial index |
+| `maxFeatureBytes` | 256 MiB | Largest single feature read (guards against corrupt size prefixes) |
 
 ```typescript
 import { TileClient, S3Connector, MemoryCache } from '@geozelot/fgb-vt';
@@ -285,6 +291,8 @@ const client = new TileClient(new S3Connector({ region: 'us-east-1' }), {
 // optional, e.g. during init: read headers and upper index levels up front
 await client.open({ name: 'parcels', path: 's3://bucket/parcels.fgb' });
 ```
+
+Every tile call accepts an `AbortSignal`, e.g. for a deadline: `tile(connector, z, x, y, sources, { signal: AbortSignal.timeout(3000) })`, `client.tile(z, x, y, sources, { signal })`, `server.tile(z, x, y, { signal })`. Pending reads are cancelled and the call rejects with the signal's reason.
 
 Cache entries are keyed by path and version tag (ETag, or inode/size/mtime for local files). Every read carries the version tag; if a file is replaced, the source is reopened automatically. With custom connectors that report no version tag, cached files must not change in place.
 
@@ -301,7 +309,7 @@ Data and I/O problems raise subclasses of `FgbVtError` with a stable `code` and 
 | `ConnectorError` | `FGB_IO` | Storage access failed |
 | `RangeNotSupportedError` | `FGB_RANGE_UNSUPPORTED` | An HTTP server ignores `Range` requests |
 | `SourceChangedError` | `FGB_SOURCE_CHANGED` | A file kept changing between reads |
-| `LimitExceededError` | `FGB_LIMIT` | An unindexed file exceeds `maxScanBytes` |
+| `LimitExceededError` | `FGB_LIMIT` | A budget is exceeded (`maxFeatures`, `maxReadBytes`, `maxTileBytes`, `maxScanBytes`, `maxFeatureBytes`); `limit` names which |
 
 Invalid tile coordinates raise `RangeError`.
 
@@ -312,7 +320,7 @@ Invalid tile coordinates raise `RangeError`.
 ```typescript
 import type {
   Connector, ReadOptions, ReadHeadResult, ConnectorHints,
-  Source, SourceOptions, TileOptions, IoOptions, OpenOptions,
+  Source, SourceOptions, TileOptions, IoOptions, OpenOptions, RequestOptions, LimitKind,
   ByteCache, MemoryCacheOptions,
   TileServerLayer, TileJSON, BBox,
   LocalConnectorOptions, HttpConnectorOptions, S3ConnectorOptions,

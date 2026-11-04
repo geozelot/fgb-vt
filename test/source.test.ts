@@ -46,6 +46,9 @@ describe('resolveOptions', () => {
       tolerance: 3,
       maxZoom: 24,
       minZoom: 0,
+      maxFeatures: Infinity,
+      maxReadBytes: 256 * 1024 * 1024,
+      maxTileBytes: Infinity,
     });
   });
 });

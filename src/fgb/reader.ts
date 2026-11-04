@@ -53,6 +53,9 @@ const MAX_MERGED_RANGE = 8 * 1024 * 1024;
 /** Default budget for scanning files without a spatial index. */
 const DEFAULT_MAX_SCAN_BYTES = 32 * 1024 * 1024;
 
+/** Default cap on the size of a single feature. */
+const DEFAULT_MAX_FEATURE_BYTES = 256 * 1024 * 1024;
+
 /** Chunk size for sequential scans. */
 const SCAN_CHUNK = 4 * 1024 * 1024;
 
@@ -106,6 +109,14 @@ export interface IoOptions {
    * @defaultValue 33554432 (32 MiB)
    */
   maxScanBytes?: number;
+  /**
+   * Largest single feature (in bytes) that will be read. Guards against
+   * corrupt size prefixes triggering huge reads; larger features raise
+   * {@link LimitExceededError}.
+   *
+   * @defaultValue 268435456 (256 MiB)
+   */
+  maxFeatureBytes?: number;
 }
 
 /**
@@ -119,6 +130,7 @@ export interface IoContext {
   prefetch?: number;
   coalesceGap?: number;
   maxScanBytes?: number;
+  maxFeatureBytes?: number;
 }
 
 /**
@@ -139,6 +151,12 @@ export interface QueryOptions {
   coalesceGap?: number;
   /** Scan budget for files without an index. */
   maxScanBytes?: number;
+  /** Most features the query may return. */
+  maxFeatures?: number;
+  /** Most feature bytes the query may read. */
+  maxReadBytes?: number;
+  /** Largest single feature that may be read. */
+  maxFeatureBytes?: number;
   /** Aborts the reads when signalled. */
   signal?: AbortSignal;
 }
@@ -259,18 +277,26 @@ export class FgbSource {
    * Read and decode the features whose index entries intersect `bbox`, or
    * all features of an unindexed file (bounded by `maxScanBytes`).
    *
+   * Feature and byte budgets are checked against the spatial index before
+   * any feature data is read.
+   *
    * @param bbox - Query box in the file's coordinate system.
-   * @param options - Range merging, scan budget and abort signal.
+   * @param options - Range merging, budgets and abort signal.
    * @returns Decoded features (callers still clip to the exact tile).
-   * @throws {LimitExceededError} If an unindexed file exceeds the scan budget.
+   * @throws {LimitExceededError} If a budget is exceeded.
    * @throws {SourceChangedError} If the file changed since it was opened.
    */
   async readFeatures(bbox: BBox, options: QueryOptions = {}): Promise<RawFeature[]> {
     const { signal } = options;
     if (!this.hasIndex) return this.scan(options);
 
-    const runs = await this.searchRuns(bbox, options);
+    const { runs, featureCount } = await this.searchRuns(bbox, options);
     if (runs.length === 0) return [];
+    let bytes = 0;
+    for (const r of runs) bytes += r.length;
+    this.checkBudget('features', featureCount, options.maxFeatures);
+    this.checkBudget('readBytes', bytes, options.maxReadBytes);
+    signal?.throwIfAborted();
     const ranges = coalesceRanges(runs, this.coalesceGap(options), MAX_MERGED_RANGE);
 
     const chunks = await this.connector.readRanges(this.path, ranges, this.readOptions(signal));
@@ -286,11 +312,11 @@ export class FgbSource {
         while (run < runs.length && runs[run].offset + runs[run].length <= at) run++;
         return run < runs.length && at >= runs[run].offset;
       };
-      const chunk = decodeFeatureChunk(chunks[c], this.header, accept);
+      const chunk = decodeFeatureChunk(chunks[c], this.header, accept, base);
       for (const f of chunk.features) features.push(f);
       if (chunk.truncatedAt >= 0) {
         // Only the last feature's length can be an estimate (unknown file size)
-        rereads.push(this.readFeatureAt(ranges[c].offset + chunk.truncatedAt, signal));
+        rereads.push(this.readFeatureAt(base + chunk.truncatedAt, options));
       }
     }
     for (const more of await Promise.all(rereads)) {
@@ -309,7 +335,8 @@ export class FgbSource {
    * @throws {FormatError} If the index is truncated or inconsistent.
    */
   async featureRanges(bbox: BBox, options: QueryOptions = {}): Promise<ByteRange[]> {
-    return coalesceRanges(await this.searchRuns(bbox, options), this.coalesceGap(options), MAX_MERGED_RANGE);
+    const { runs } = await this.searchRuns(bbox, options);
+    return coalesceRanges(runs, this.coalesceGap(options), MAX_MERGED_RANGE);
   }
 
   /**
@@ -318,11 +345,12 @@ export class FgbSource {
    *
    * @param bbox - Query box in the file's coordinate system.
    * @param options - Range merging (for index pages) and abort signal.
-   * @returns Sorted, non-overlapping feature byte runs.
+   * @returns Sorted, non-overlapping feature byte runs and the number of
+   *   features they contain.
    * @throws {FormatError} If the index is truncated or inconsistent.
    */
-  private async searchRuns(bbox: BBox, options: QueryOptions): Promise<ByteRange[]> {
-    if (!this.hasIndex) return [];
+  private async searchRuns(bbox: BBox, options: QueryOptions): Promise<{ runs: ByteRange[]; featureCount: number }> {
+    if (!this.hasIndex) return { runs: [], featureCount: 0 };
     const { featuresCount, indexNodeSize: nodeSize, featuresOffset } = this.header;
     const levels = this.levelBounds;
     const [leafStart, leafEnd] = levels[0];
@@ -387,10 +415,12 @@ export class FgbSource {
       frontier = mergeIntervals(next, 0);
     }
 
-    if (runs.length === 0) return [];
+    if (runs.length === 0) return { runs: [], featureCount: 0 };
 
     const ranges: ByteRange[] = [];
+    let featureCount = 0;
     for (const [a, b] of mergeIntervals(runs, 0)) {
+      featureCount += b - a;
       const start = featuresOffset + nodes.u64(leafStart + a, 32);
       let end: number;
       if (b < featuresCount) {
@@ -409,7 +439,7 @@ export class FgbSource {
       ranges.push({ offset: start, length: end - start });
     }
 
-    return ranges;
+    return { runs: ranges, featureCount };
   }
 
   /**
@@ -537,20 +567,28 @@ export class FgbSource {
   /**
    * Scan all features of a file without a spatial index.
    *
-   * @param options - Scan budget and abort signal.
+   * @param options - Scan and read budgets, feature limit and abort signal.
    * @returns All decoded features.
-   * @throws {LimitExceededError} If the feature data exceeds `maxScanBytes`.
+   * @throws {LimitExceededError} If the feature data exceeds `maxScanBytes`
+   *   or `maxReadBytes`, or the file holds more than `maxFeatures` features.
    */
   private async scan(options: QueryOptions): Promise<RawFeature[]> {
     const { signal } = options;
-    const budget = options.maxScanBytes ?? DEFAULT_MAX_SCAN_BYTES;
+    const scanBudget = options.maxScanBytes ?? DEFAULT_MAX_SCAN_BYTES;
+    const readBudget = options.maxReadBytes ?? Infinity;
+    const budget = Math.min(scanBudget, readBudget);
     const start = this.header.featuresOffset;
-    const tooLarge = () => new LimitExceededError(
-      `${this.path} has no spatial index and more than ${budget} bytes of features; ` +
-      'raise maxScanBytes or add an index to the file',
-      { path: this.path },
-    );
-    if (this.size !== null && this.size - start > budget) throw tooLarge();
+    const tooLarge = (actual?: number) => scanBudget <= readBudget
+      ? new LimitExceededError(
+        `${this.path} has no spatial index and more than ${budget} bytes of features; ` +
+        'raise maxScanBytes or add an index to the file',
+        { path: this.path, limit: 'scanBytes', max: budget, actual },
+      )
+      : new LimitExceededError(
+        `${this.path}: scanning more than ${budget} bytes of features exceeds maxReadBytes`,
+        { path: this.path, limit: 'readBytes', max: budget, actual },
+      );
+    if (this.size !== null && this.size - start > budget) throw tooLarge(this.size - start);
 
     const features: RawFeature[] = [];
     let pos = start;
@@ -568,8 +606,9 @@ export class FgbSource {
       const bytes = await this.connector.read(this.path, pos, want, this.readOptions(signal));
       if (bytes.length === 0) break;
 
-      const chunk = decodeFeatureChunk(bytes, this.header);
+      const chunk = decodeFeatureChunk(bytes, this.header, undefined, pos);
       for (const f of chunk.features) features.push(f);
+      this.checkBudget('features', features.length, options.maxFeatures);
 
       if (chunk.truncatedAt > 0) {
         pos += chunk.truncatedAt; // continue from the cut feature
@@ -580,7 +619,7 @@ export class FgbSource {
         if (bytes.length < want) {
           throw new FormatError('Truncated FlatGeobuf feature', { path: this.path, offset: pos });
         }
-        for (const f of await this.readFeatureAt(pos, signal)) features.push(f);
+        for (const f of await this.readFeatureAt(pos, options)) features.push(f);
         pos += new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, true) + 4;
         continue;
       }
@@ -595,19 +634,28 @@ export class FgbSource {
    * size prefix to read exactly its bytes.
    *
    * @param offset - Absolute file offset of the feature's size prefix.
-   * @param signal - Optional abort signal.
+   * @param query - Feature size limit and abort signal.
    * @returns The decoded feature (empty if its geometry is unusable).
    * @throws {FormatError} If the file ends before the feature does.
+   * @throws {LimitExceededError} If the feature exceeds `maxFeatureBytes`.
    */
-  private async readFeatureAt(offset: number, signal?: AbortSignal): Promise<RawFeature[]> {
-    const options = this.readOptions(signal);
+  private async readFeatureAt(offset: number, query: QueryOptions): Promise<RawFeature[]> {
+    const options = this.readOptions(query.signal);
     const prefix = await this.connector.read(this.path, offset, 4, options);
     if (prefix.length < 4) {
       throw new FormatError('Truncated FlatGeobuf feature size prefix', { path: this.path, offset });
     }
-    const length = 4 + new DataView(prefix.buffer, prefix.byteOffset, 4).getUint32(0, true);
+    const size = new DataView(prefix.buffer, prefix.byteOffset, 4).getUint32(0, true);
+    const maxFeatureBytes = query.maxFeatureBytes ?? DEFAULT_MAX_FEATURE_BYTES;
+    if (size > maxFeatureBytes) {
+      throw new LimitExceededError(
+        `${this.path}: feature at byte ${offset} is ${size} bytes, more than maxFeatureBytes (${maxFeatureBytes})`,
+        { path: this.path, limit: 'featureBytes', max: maxFeatureBytes, actual: size },
+      );
+    }
+    const length = 4 + size;
     const bytes = await this.connector.read(this.path, offset, length, options);
-    const { features, truncatedAt } = decodeFeatureChunk(bytes, this.header);
+    const { features, truncatedAt } = decodeFeatureChunk(bytes, this.header, undefined, offset);
     if (truncatedAt >= 0 || bytes.length < length) {
       throw new FormatError(
         `Truncated FlatGeobuf feature: expected ${length} bytes, got ${bytes.length}`,
@@ -615,6 +663,24 @@ export class FgbSource {
       );
     }
     return features;
+  }
+
+  /**
+   * Throw if `actual` exceeds the optional `max`.
+   *
+   * @param limit - Which limit is checked.
+   * @param actual - Amount the query needs.
+   * @param max - Configured maximum (unlimited when undefined).
+   * @throws {LimitExceededError} If `actual > max`.
+   */
+  private checkBudget(limit: 'features' | 'readBytes', actual: number, max: number | undefined): void {
+    if (max === undefined || actual <= max) return;
+    const what = limit === 'features' ? `${actual} features` : `${actual} bytes of features`;
+    const option = limit === 'features' ? 'maxFeatures' : 'maxReadBytes';
+    throw new LimitExceededError(
+      `${this.path}: the tile needs ${what}, more than ${option} (${max})`,
+      { path: this.path, limit, max, actual },
+    );
   }
 
   /** Read options binding every read to this file version. */
@@ -718,8 +784,30 @@ export function getSource(
   signal?: AbortSignal,
 ): Promise<FgbSource> {
   if (!context.registry) return FgbSource.open(connector, path, context, signal);
-  // A shared open must not be cancelled by one caller's signal
-  return context.registry.get(connector, path, () => FgbSource.open(connector, path, context));
+  // A shared open must not be cancelled by one caller's signal, but the
+  // caller stops waiting for it
+  const shared = context.registry.get(connector, path, () => FgbSource.open(connector, path, context));
+  return signal ? abortable(shared, signal) : shared;
+}
+
+/**
+ * Settle with `promise`, or reject with the signal's reason as soon as it
+ * aborts (the underlying work continues for other waiters).
+ *
+ * @param promise - Promise to wait for.
+ * @param signal - Abort signal.
+ * @returns A promise that rejects on abort.
+ */
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
+      (err) => { signal.removeEventListener('abort', onAbort); reject(err); },
+    );
+  });
 }
 
 /** One registry per cache, so every user of a cache shares opened sources. */
@@ -748,6 +836,7 @@ export function createIoContext(io: IoOptions | undefined, defaultCache: ByteCac
     prefetch: io?.prefetch,
     coalesceGap: io?.coalesceGap,
     maxScanBytes: io?.maxScanBytes,
+    maxFeatureBytes: io?.maxFeatureBytes,
   };
 }
 

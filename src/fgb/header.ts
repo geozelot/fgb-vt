@@ -17,7 +17,7 @@ import { FlatBufferReader } from './flatbuffers.js';
 import { calcTreeSize } from './index.js';
 import type { FgbHeader, ColumnMeta, BBox } from '../types.js';
 import { ColumnType, GeomType } from '../types.js';
-import { FormatError, UnsupportedFormatError } from '../errors.js';
+import { FgbVtError, FormatError, UnsupportedFormatError } from '../errors.js';
 
 /**
  * FGB file magic bytes: `"fgb"` followed by major version `0x03`, `"fgb"`,
@@ -128,6 +128,19 @@ function assertMagic(bytes: Uint8Array): void {
  *   column uses a type this reader does not know.
  */
 export function parseHeader(bytes: Uint8Array): FgbHeader {
+  try {
+    return parseHeaderUnchecked(bytes);
+  } catch (err) {
+    if (err instanceof FgbVtError) throw err;
+    // Out-of-bounds FlatBuffer access in a corrupt header
+    throw new FormatError(`Corrupt FlatGeobuf header: ${(err as Error).message}`, { cause: err });
+  }
+}
+
+/**
+ * {@link parseHeader} without the conversion of low-level decoding errors.
+ */
+function parseHeaderUnchecked(bytes: Uint8Array): FgbHeader {
   assertMagic(bytes);
 
   const totalHeaderSize = headerByteSize(bytes);
