@@ -53,7 +53,27 @@ import { MemoryCache } from './cache.js';
 import { createIoContext, getSource, type IoContext, type IoOptions } from './fgb/reader.js';
 import { resolveFrame } from './geometry/crs.js';
 import { openSources, type OpenOptions } from './client.js';
+import { featureSchema, emittedColumns } from './schema.js';
 import { withPath } from './errors.js';
+
+/**
+ * Options for {@link TileServer.tileJSON}.
+ */
+export interface TileJSONOptions {
+  /**
+   * Tile URL templates, e.g. `['https://example.com/tiles/{z}/{x}/{y}.mvt']`.
+   * Required by the TileJSON spec for clients to fetch tiles.
+   */
+  tiles?: string[];
+  /** Tileset name (defaults to the header title or name of a single source). */
+  name?: string;
+  /** Tileset description (defaults to the header description of a single source). */
+  description?: string;
+  /** Attribution (HTML) to display with the map. */
+  attribution?: string;
+  /** Tileset version (semver). */
+  version?: string;
+}
 
 /**
  * A layer configuration binding a {@link Connector} to one or more
@@ -136,6 +156,7 @@ export class TileServer {
   private readonly context: IoContext;
   /** Cache created by this instance (cleared on close), if not caller-supplied. */
   private readonly ownCache: MemoryCache | null;
+  private readonly onTile: RequestOptions['onTile'];
   private closed = false;
 
   /**
@@ -149,13 +170,14 @@ export class TileServer {
    *   sources. A single {@link TileServerLayer} is accepted for convenience.
    * @param options - Tile-level tiling option defaults applied to all sources
    *   unless overridden by per-source options, plus I/O options (cache,
-   *   prefetch, range merging, scan budget).
+   *   prefetch, range merging, scan budget) and a default `onTile` hook.
    */
   constructor(
     layers: TileServerLayer | TileServerLayer[],
-    options?: TileOptions & IoOptions,
+    options?: TileOptions & IoOptions & Pick<RequestOptions, 'onTile'>,
   ) {
     this.options = options;
+    this.onTile = options?.onTile;
     this.ownCache = options?.cache === undefined ? new MemoryCache() : null;
     this.context = createIoContext(options, this.ownCache ?? new MemoryCache());
 
@@ -176,7 +198,7 @@ export class TileServer {
    * @param z - Tile zoom level.
    * @param x - Tile column.
    * @param y - Tile row.
-   * @param request - Optional abort `signal`.
+   * @param request - Optional abort `signal` and `onTile` hook (overrides the constructor's).
    * @returns PBF-encoded Mapbox Vector Tile. Returns an empty tile if no
    *   features intersect the requested tile bounds.
    * @throws {RangeError} If `z/x/y` is not a valid tile.
@@ -190,7 +212,7 @@ export class TileServer {
       z, x, y,
       this.options,
       this.context,
-      request?.signal,
+      { onTile: this.onTile, ...request },
     );
   }
 
@@ -220,82 +242,91 @@ export class TileServer {
    * listing each source's layer name, field schema, and zoom range.
    * Sources are opened (headers read) if not already open.
    *
-   * Bounds come from each file's header envelope or, when that is absent
-   * or invalid, from the root of its spatial index, converted to WGS 84.
-   * Without either (an unindexed file without envelope) the world is
-   * assumed.
+   * - **`tiles`**: the URL templates from `options` (required by the
+   *   TileJSON spec; empty when not given).
+   * - **`name` / `description`**: from `options`, or, for a single source,
+   *   the file's header title (or name) and description.
+   * - **`bounds`**: each file's header envelope or, when that is absent or
+   *   invalid, the root of its spatial index, converted to WGS 84. Without
+   *   either (an unindexed file without envelope) the world is assumed.
+   * - **`minzoom` / `maxzoom`**: the lowest `minZoom` and highest `maxZoom`
+   *   of the sources.
+   * - **`fields`**: the columns actually written as properties, after the
+   *   source's `properties` selection and without the id column (unless
+   *   kept) and binary columns.
    *
+   * @param options - Tile URLs and descriptive metadata.
    * @returns TileJSON metadata object conforming to the 3.0.0 specification.
    * @throws {FgbVtError} If a source cannot be opened (annotated with its path).
    */
-  async tileJSON(): Promise<TileJSON> {
+  async tileJSON(options?: TileJSONOptions): Promise<TileJSON> {
     this.assertOpen();
 
-    const opened = await Promise.all(this.groups.flatMap(group =>
-      group.sources.map(async (source) => {
-        try {
-          const fgb = await getSource(group.connector, source.path, this.context);
-          const frame = resolveFrame(fgb.header.crs, source.crs, source.path);
-          const extent = await fgb.bounds();
-          return { header: fgb.header, bounds: extent ? frame.toWgs84BBox(extent) : null };
-        } catch (err) {
-          throw withPath(err, source.path);
-        }
-      }),
-    ));
+    const sources = this.groups.flatMap(group => group.sources.map(source => ({ group, source })));
+    const opened = await Promise.all(sources.map(async ({ group, source }) => {
+      try {
+        const fgb = await getSource(group.connector, source.path, this.context);
+        const frame = resolveFrame(fgb.header.crs, source.crs, source.path);
+        const extent = await fgb.bounds();
+        return { header: fgb.header, bounds: extent ? frame.toWgs84BBox(extent) : null };
+      } catch (err) {
+        throw withPath(err, source.path);
+      }
+    }));
 
     const vectorLayers: TileJSON['vector_layers'] = [];
-    let globalBounds: [number, number, number, number] = [180, 90, -180, -90];
-    let globalMinZoom = Infinity;
-    let globalMaxZoom = 0;
+    let bounds: [number, number, number, number] = [180, 90, -180, -90];
+    const defaults = resolveOptions(undefined, this.options);
+    let minzoom = sources.length > 0 ? Infinity : defaults.minZoom;
+    let maxzoom = sources.length > 0 ? -Infinity : defaults.maxZoom;
 
-    let index = 0;
-    for (const group of this.groups) {
-      for (const source of group.sources) {
-        const { header, bounds } = opened[index++];
-        const opts = resolveOptions(source.options, this.options);
+    sources.forEach(({ source }, i) => {
+      const { header, bounds: b } = opened[i];
+      const opts = resolveOptions(source.options, this.options);
 
-        // Build field map from header columns
-        const fields: Record<string, string> = {};
-        for (const col of header.columns) {
-          fields[col.name] = columnTypeToString(col.type);
-        }
-
-        vectorLayers.push({
-          id: source.name,
-          fields,
-          minzoom: opts.minZoom,
-          maxzoom: opts.maxZoom,
-        });
-
-        // Update global zoom range
-        globalMinZoom = Math.min(globalMinZoom, opts.minZoom);
-        globalMaxZoom = Math.max(globalMaxZoom, opts.maxZoom);
-
-        // Update global bounds from the source extent (header envelope or
-        // index root, in WGS 84)
-        if (bounds) {
-          const b = bounds;
-          globalBounds = [
-            Math.min(globalBounds[0], b.minX),
-            Math.min(globalBounds[1], b.minY),
-            Math.max(globalBounds[2], b.maxX),
-            Math.max(globalBounds[3], b.maxY),
-          ];
-        }
+      const fields: Record<string, string> = {};
+      for (const col of emittedColumns(featureSchema(source), header)) {
+        fields[col.name] = columnTypeToString(col.type);
       }
+      const description = header.description ?? header.title;
+      vectorLayers.push({
+        id: source.name,
+        ...(description ? { description } : {}),
+        fields,
+        minzoom: opts.minZoom,
+        maxzoom: opts.maxZoom,
+      });
+
+      minzoom = Math.min(minzoom, opts.minZoom);
+      maxzoom = Math.max(maxzoom, opts.maxZoom);
+      if (b) {
+        bounds = [
+          Math.min(bounds[0], b.minX),
+          Math.min(bounds[1], b.minY),
+          Math.max(bounds[2], b.maxX),
+          Math.max(bounds[3], b.maxY),
+        ];
+      }
+    });
+
+    // If no source had bounds, default to the Web Mercator world
+    if (bounds[0] > bounds[2]) {
+      bounds = [-180, -85.0511, 180, 85.0511];
     }
 
-    // If no source had a bbox, default to world
-    if (globalBounds[0] > globalBounds[2]) {
-      globalBounds = [-180, -85.0511, 180, 85.0511];
-    }
-
+    const single = opened.length === 1 ? opened[0].header : null;
+    const name = options?.name ?? single?.title ?? single?.name ?? undefined;
+    const description = options?.description ?? single?.description ?? undefined;
     return {
       tilejson: '3.0.0',
-      bounds: globalBounds,
-      minzoom: globalMinZoom === Infinity ? 0 : globalMinZoom,
-      maxzoom: globalMaxZoom === 0 ? 24 : globalMaxZoom,
+      tiles: options?.tiles ?? [],
+      ...(name ? { name } : {}),
+      ...(description ? { description } : {}),
+      ...(options?.attribution ? { attribution: options.attribution } : {}),
+      ...(options?.version ? { version: options.version } : {}),
+      bounds,
+      minzoom,
+      maxzoom,
       vector_layers: vectorLayers,
     };
   }

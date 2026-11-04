@@ -24,6 +24,7 @@
  */
 
 import type { SourceCrs } from './geometry/crs.js';
+import type { PropertySelection } from './schema.js';
 
 /**
  * Per-source tiling option overrides.
@@ -83,6 +84,24 @@ export interface Source {
    * @defaultValue 'auto'
    */
   crs?: SourceCrs;
+  /**
+   * Properties to write: the column names to keep (`[]` writes none), or
+   * `{ exclude: [...] }` to drop some. Binary columns are always dropped
+   * (MVT has no binary values). @defaultValue all properties
+   */
+  properties?: PropertySelection;
+  /**
+   * Column providing the MVT feature id, or `false` for no ids. By default
+   * the first integer column named `id`, `fid`, `gid` or `ogc_fid` (case
+   * insensitive) is used. A named column must be an integer column;
+   * features whose value is negative or missing get no id.
+   */
+  idColumn?: string | false;
+  /**
+   * Also write the id column as a property (subject to `properties`).
+   * @defaultValue false
+   */
+  keepIdProperty?: boolean;
 }
 
 /**
@@ -113,6 +132,12 @@ export interface TileOptions {
    * not per source. @defaultValue Infinity
    */
   maxTileBytes?: number;
+  /**
+   * Leave layers without features out of the tile. A tile without any
+   * features then encodes to zero bytes, which a server can answer with
+   * `204 No Content`. Applies to the whole tile. @defaultValue false
+   */
+  omitEmptyLayers?: boolean;
 }
 
 /**
@@ -130,6 +155,7 @@ export const DEFAULT_TILE_OPTIONS: Required<TileOptions> = {
   maxFeatures: Infinity,
   maxReadBytes: 256 * 1024 * 1024,
   maxTileBytes: Infinity,
+  omitEmptyLayers: false,
 };
 
 /**
@@ -162,5 +188,6 @@ export function resolveOptions(
     maxFeatures: source?.maxFeatures ?? tile?.maxFeatures ?? DEFAULT_TILE_OPTIONS.maxFeatures,
     maxReadBytes: source?.maxReadBytes ?? tile?.maxReadBytes ?? DEFAULT_TILE_OPTIONS.maxReadBytes,
     maxTileBytes: tile?.maxTileBytes ?? DEFAULT_TILE_OPTIONS.maxTileBytes,
+    omitEmptyLayers: tile?.omitEmptyLayers ?? DEFAULT_TILE_OPTIONS.omitEmptyLayers,
   };
 }

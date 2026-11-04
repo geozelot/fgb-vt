@@ -126,6 +126,6 @@ export async function tile(
     sources,
     options,
     createIoContext(options, sharedCache),
-    options?.signal,
+    options,
   );
 }

@@ -56,6 +56,9 @@ export interface FeatureSpec {
 
 /** Header fields of a test file. */
 export interface FileSpec {
+  name?: string;
+  title?: string;
+  description?: string;
   geometryType?: number;
   columns?: ColumnSpec[];
   envelope?: number[];
@@ -71,6 +74,9 @@ export function writeFgb(spec: FileSpec): Uint8Array {
     9: { u16: 0 }, // explicit: the schema default is 16
   };
   if (spec.envelope) header[1] = { f64s: spec.envelope };
+  if (spec.name !== undefined) header[0] = { str: spec.name };
+  if (spec.title !== undefined) header[11] = { str: spec.title };
+  if (spec.description !== undefined) header[12] = { str: spec.description };
   if (spec.columns) header[7] = { tables: spec.columns.map(columnTable) };
   if (spec.crs) {
     const crs: FbTable = {};

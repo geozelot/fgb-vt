@@ -42,6 +42,7 @@ import { buildMvtLayer } from './mvt/layer.js';
 import { encodePbf } from './pbf/encode.js';
 import { tileClipBounds, validateTile } from './tiles.js';
 import { resolveFrame, type CoordinateFrame } from './geometry/crs.js';
+import { featureSchema, validateSchema } from './schema.js';
 import { LimitExceededError, SourceChangedError, withPath } from './errors.js';
 
 /**
@@ -53,6 +54,58 @@ export interface RequestOptions {
    * the signal's reason. Use `AbortSignal.timeout(ms)` for a deadline.
    */
   signal?: AbortSignal;
+  /**
+   * Called after a tile has been encoded, with per-source read and feature
+   * counts and timings (e.g. for metrics or logs). Not called for failed
+   * tiles. Errors thrown by the hook are ignored.
+   */
+  onTile?: (stats: TileStats) => void;
+}
+
+/**
+ * Statistics of one generated tile, passed to {@link RequestOptions.onTile}.
+ */
+export interface TileStats {
+  /** Tile zoom level. */
+  z: number;
+  /** Tile column. */
+  x: number;
+  /** Tile row. */
+  y: number;
+  /** Size of the encoded tile in bytes. */
+  tileBytes: number;
+  /** Wall-clock time to generate the tile, in milliseconds. */
+  durationMs: number;
+  /** One entry per source, in layer order. */
+  sources: SourceStats[];
+}
+
+/**
+ * Statistics of one source within a tile.
+ */
+export interface SourceStats {
+  /** Layer name. */
+  name: string;
+  /** Source path. */
+  path: string;
+  /** `'zoom'` if the source was skipped because the zoom is outside its range. */
+  skipped?: 'zoom';
+  /** Features read from the file and decoded. */
+  featuresRead: number;
+  /** Features written to the layer (after clipping and simplification). */
+  featuresEncoded: number;
+  /**
+   * Range requests issued for this tile (index pages and features). Header
+   * reads when a source is opened, cached index pages and reads shared with
+   * a concurrent tile are not counted.
+   */
+  requests: number;
+  /** Bytes received for index pages. */
+  indexBytes: number;
+  /** Bytes received for feature data. */
+  featureBytes: number;
+  /** Time until this source's layer was built, in milliseconds. */
+  durationMs: number;
 }
 
 // == Single-source pipeline =================================================
@@ -73,9 +126,11 @@ export interface RequestOptions {
  * @param tileOpts - Fully resolved tiling options (extent, buffer, tolerance, zoom range, budgets).
  * @param context - I/O settings, cache and source registry.
  * @param signal - Optional abort signal.
+ * @param stats - Receives read and feature counts, when given.
  * @returns The encoded MVT layer for this source. Returns an empty layer (no features)
  *   when the zoom is out of range or no features intersect the tile.
  * @throws {FgbVtError} On format, I/O or limit errors, annotated with the source path.
+ * @throws {RangeError} If the source's `idColumn` is not an integer column of the file.
  */
 export async function processSource(
   connector: Connector,
@@ -84,9 +139,11 @@ export async function processSource(
   tileOpts: Required<TileOptions>,
   context: IoContext,
   signal?: AbortSignal,
+  stats?: SourceStats,
 ): Promise<MvtLayer> {
   // Skip if outside zoom range
   if (z < tileOpts.minZoom || z > tileOpts.maxZoom) {
+    if (stats) stats.skipped = 'zoom';
     return emptyLayer(source.name, tileOpts.extent);
   }
 
@@ -95,18 +152,19 @@ export async function processSource(
 
   let read: { features: RawFeature[]; frame: CoordinateFrame };
   try {
-    read = await readSourceFeatures(connector, source, clipBounds, tileOpts, context, signal);
+    read = await readSourceFeatures(connector, source, clipBounds, tileOpts, context, signal, stats);
   } catch (err) {
     throw withPath(err, source.path);
   }
   signal?.throwIfAborted();
+  if (stats) stats.featuresRead = read.features.length;
 
   if (read.features.length === 0) {
     return emptyLayer(source.name, tileOpts.extent);
   }
 
   // Build MVT layer (includes project → clip → simplify → transform → encode)
-  return buildMvtLayer(
+  const layer = buildMvtLayer(
     read.features,
     source.name,
     z, x, y,
@@ -115,6 +173,8 @@ export async function processSource(
     tileOpts.tolerance,
     read.frame.toMercator,
   );
+  if (stats) stats.featuresEncoded = layer.features.length;
+  return layer;
 }
 
 /**
@@ -128,9 +188,11 @@ export async function processSource(
  * @param tileOpts - Resolved options (extent, buffer and budgets).
  * @param context - I/O settings.
  * @param signal - Optional abort signal.
+ * @param stats - Receives read counts, when given.
  * @returns Decoded features in source coordinates, and the frame that
  *   converts them.
  * @throws {UnsupportedFormatError} If the source CRS is not supported.
+ * @throws {RangeError} If the source's `idColumn` does not fit the file.
  */
 async function readSourceFeatures(
   connector: Connector,
@@ -139,11 +201,14 @@ async function readSourceFeatures(
   tileOpts: Required<TileOptions>,
   context: IoContext,
   signal: AbortSignal | undefined,
+  stats: SourceStats | undefined,
 ): Promise<{ features: RawFeature[]; frame: CoordinateFrame }> {
+  const schema = featureSchema(source);
   for (let attempt = 0; ; attempt++) {
     try {
       const fgb = await getSource(connector, source.path, context, signal);
       const frame = resolveFrame(fgb.header.crs, source.crs, source.path);
+      validateSchema(schema, fgb.header, source.path);
       const query = frame.queryBBox(clipBounds);
       const features = await fgb.readFeatures(query, {
         coalesceGap: context.coalesceGap,
@@ -152,6 +217,8 @@ async function readSourceFeatures(
         maxFeatures: tileOpts.maxFeatures,
         maxReadBytes: tileOpts.maxReadBytes,
         curveTolerance: unitsPerTileUnit(query, tileOpts) * CURVE_TOLERANCE,
+        schema,
+        stats,
         signal,
       });
       return { features, frame };
@@ -205,7 +272,7 @@ function unitsPerTileUnit(query: BBox, tileOpts: Required<TileOptions>): number 
  * @param tileOptions - Tile-level option defaults applied to sources
  *   that do not specify their own overrides.
  * @param context - I/O settings, cache and source registry.
- * @param signal - Optional abort signal.
+ * @param request - Optional abort signal and statistics hook.
  * @returns PBF-encoded binary tile containing one layer per source.
  * @throws {RangeError} If `z/x/y` is not a valid tile.
  * @throws {LimitExceededError} If the tile exceeds `maxTileBytes` or a source a budget.
@@ -216,10 +283,9 @@ export async function processTile(
   sources: Source[],
   tileOptions: TileOptions | undefined,
   context: IoContext,
-  signal?: AbortSignal,
+  request?: RequestOptions,
 ): Promise<Uint8Array> {
-  const layers = await processTileLayers(connector, z, x, y, sources, tileOptions, context, signal);
-  return encodeChecked(layers, z, x, y, tileOptions);
+  return renderTile(sources.map(source => [connector, source]), z, x, y, tileOptions, context, request);
 }
 
 /**
@@ -288,7 +354,7 @@ export interface ConnectorSourceGroup {
  * @param tileOptions - Tile-level option defaults applied to sources
  *   that do not specify their own overrides.
  * @param context - I/O settings, cache and source registry.
- * @param signal - Optional abort signal.
+ * @param request - Optional abort signal and statistics hook.
  * @returns PBF-encoded binary tile containing one layer per source, ordered
  *   by group then by source within each group.
  * @throws {RangeError} If `z/x/y` is not a valid tile.
@@ -299,35 +365,85 @@ export async function processMultiConnectorTile(
   z: number, x: number, y: number,
   tileOptions: TileOptions | undefined,
   context: IoContext,
-  signal?: AbortSignal,
+  request?: RequestOptions,
 ): Promise<Uint8Array> {
-  validateTile(z, x, y);
-  signal?.throwIfAborted();
-
-  const allLayerPromises: Promise<MvtLayer>[] = [];
+  const entries: Array<[Connector, Source]> = [];
   for (const group of groups) {
-    for (const source of group.sources) {
-      allLayerPromises.push(
-        processSource(group.connector, source, z, x, y, resolveOptions(source.options, tileOptions), context, signal),
-      );
-    }
+    for (const source of group.sources) entries.push([group.connector, source]);
   }
-
-  const layers = await Promise.all(allLayerPromises);
-  return encodeChecked(layers, z, x, y, tileOptions);
+  return renderTile(entries, z, x, y, tileOptions, context, request);
 }
 
 // == Helpers ================================================================
 
 /**
- * Encode layers into a PBF tile and enforce `maxTileBytes`.
+ * Render and encode a tile from sources with their connectors, enforcing
+ * `maxTileBytes` and reporting statistics to `request.onTile`.
+ *
+ * @param entries - Connector and source per layer, in layer order.
+ * @param z - Tile zoom level.
+ * @param x - Tile column.
+ * @param y - Tile row.
+ * @param tileOptions - Tile-level options.
+ * @param context - I/O settings, cache and source registry.
+ * @param request - Optional abort signal and statistics hook.
+ * @returns The encoded tile.
+ */
+async function renderTile(
+  entries: Array<[Connector, Source]>,
+  z: number, x: number, y: number,
+  tileOptions: TileOptions | undefined,
+  context: IoContext,
+  request: RequestOptions | undefined,
+): Promise<Uint8Array> {
+  validateTile(z, x, y);
+  const signal = request?.signal;
+  signal?.throwIfAborted();
+
+  const onTile = request?.onTile;
+  const started = onTile ? now() : 0;
+  const stats: SourceStats[] | undefined = onTile
+    ? entries.map(([, source]) => ({
+      name: source.name, path: source.path,
+      featuresRead: 0, featuresEncoded: 0, requests: 0, indexBytes: 0, featureBytes: 0, durationMs: 0,
+    }))
+    : undefined;
+
+  const layers = await Promise.all(entries.map(async ([connector, source], i) => {
+    const layer = await processSource(
+      connector, source, z, x, y, resolveOptions(source.options, tileOptions), context, signal, stats?.[i],
+    );
+    if (stats) stats[i].durationMs = now() - started;
+    return layer;
+  }));
+
+  const pbf = encodeChecked(layers, z, x, y, tileOptions);
+  if (onTile && stats) {
+    try {
+      onTile({ z, x, y, tileBytes: pbf.length, durationMs: now() - started, sources: stats });
+    } catch {
+      // Observability must not break tile serving
+    }
+  }
+  return pbf;
+}
+
+/** Monotonic clock in milliseconds. */
+function now(): number {
+  return performance.now();
+}
+
+/**
+ * Encode layers into a PBF tile, leaving out empty layers when
+ * `omitEmptyLayers` is set, and enforce `maxTileBytes`.
  *
  * @param layers - Layers to encode.
  * @param z - Tile zoom level (for the error message).
  * @param x - Tile column.
  * @param y - Tile row.
- * @param tileOptions - Tile-level options carrying `maxTileBytes`.
- * @returns The encoded tile.
+ * @param tileOptions - Tile-level options carrying `maxTileBytes` and
+ *   `omitEmptyLayers`.
+ * @returns The encoded tile (zero bytes when every layer was left out).
  * @throws {LimitExceededError} If the tile is larger than `maxTileBytes`.
  */
 function encodeChecked(
@@ -335,7 +451,8 @@ function encodeChecked(
   z: number, x: number, y: number,
   tileOptions: TileOptions | undefined,
 ): Uint8Array {
-  const pbf = encodePbf(layers);
+  const omitEmpty = tileOptions?.omitEmptyLayers ?? DEFAULT_TILE_OPTIONS.omitEmptyLayers;
+  const pbf = encodePbf(omitEmpty ? layers.filter(l => l.features.length > 0) : layers);
   const max = tileOptions?.maxTileBytes ?? DEFAULT_TILE_OPTIONS.maxTileBytes;
   if (pbf.length > max) {
     throw new LimitExceededError(

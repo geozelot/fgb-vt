@@ -32,6 +32,7 @@
 
 import { FlatBufferReader } from './flatbuffers.js';
 import { parseColumns, detectIdColumn } from './header.js';
+import { DEFAULT_SCHEMA, idColumnIndex, type FeatureSchema } from '../schema.js';
 import type { RawFeature, FgbHeader, PropertyValue, ColumnMeta } from '../types.js';
 import { ColumnType, GeomType } from '../types.js';
 import { linearizeArcs } from '../geometry/curve.js';
@@ -76,6 +77,19 @@ export interface DecodeOptions {
    * finest resolution).
    */
   curveTolerance?: number;
+  /** Property selection and id column. Defaults to all properties and id detection. */
+  schema?: FeatureSchema;
+}
+
+/** Settings shared by all features of one {@link decodeFeatureChunk} call. */
+interface DecodeContext {
+  header: FgbHeader;
+  curveTolerance: number;
+  schema: FeatureSchema;
+  /** Per header column: whether it is decoded (kept or the id), or `null` for all. */
+  headerMask: Uint8Array | null;
+  /** Id column within the header schema, or `-1`. */
+  headerId: number;
 }
 
 /**
@@ -140,7 +154,15 @@ export function decodeFeatureChunk(
   header: FgbHeader,
   options: DecodeOptions = {},
 ): FeatureChunk {
-  const { accept, fileOffset = 0, curveTolerance = 0 } = options;
+  const { accept, fileOffset = 0, curveTolerance = 0, schema = DEFAULT_SCHEMA } = options;
+  const headerId = idColumnIndex(schema, header.columns, header.idColumnIndex);
+  const ctx: DecodeContext = {
+    header,
+    curveTolerance,
+    schema,
+    headerMask: decodeMask(schema, header.columns, headerId),
+    headerId,
+  };
   const features: RawFeature[] = [];
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let offset = 0;
@@ -158,7 +180,7 @@ export function decodeFeatureChunk(
     if (!accept || accept(offset)) {
       const featureBytes = bytes.subarray(offset + 4, offset + 4 + featureSize);
       try {
-        if (!decodeSingleFeature(featureBytes, header, curveTolerance, features)) skipped++;
+        if (!decodeSingleFeature(featureBytes, ctx, features)) skipped++;
       } catch (err) {
         if (err instanceof FgbVtError) throw err;
         // Out-of-bounds FlatBuffer access in a corrupt feature
@@ -215,18 +237,16 @@ export function decodeFeatures(
  * (a per-feature schema that overrides the header's when present).
  *
  * @param bytes - Raw FlatBuffer bytes for one feature.
- * @param header - Parsed FGB header providing geometry type and column
- *   schema.
- * @param curveTolerance - Chord tolerance for circular arcs.
+ * @param ctx - Header, curve tolerance and property selection.
  * @param out - Receives the decoded features.
  * @returns `true` if at least one feature was produced.
  */
 function decodeSingleFeature(
   bytes: Uint8Array,
-  header: FgbHeader,
-  curveTolerance: number,
+  ctx: DecodeContext,
   out: RawFeature[],
 ): boolean {
+  const { header, schema } = ctx;
   const fb = new FlatBufferReader(bytes);
   const rootOffset = fb.rootTableOffset();
 
@@ -241,7 +261,7 @@ function decodeSingleFeature(
     const geom = decodeGeometry(fb, geomTableOffset, type);
     geoms = geom ? [geom] : [];
   } else {
-    const collector = new Collector(curveTolerance);
+    const collector = new Collector(ctx.curveTolerance);
     collect(fb, geomTableOffset, type, 0, collector);
     geoms = collector.result();
   }
@@ -249,34 +269,38 @@ function decodeSingleFeature(
 
   // Columns (field 2) — a per-feature schema overrides the header's
   let columns = header.columns;
-  let idColumnIndex = header.idColumnIndex;
+  let idIndex = ctx.headerId;
+  let mask = ctx.headerMask;
   const colsFieldOff = fb.fieldOffset(rootOffset, 2);
   if (colsFieldOff) {
     const own = parseColumns(fb, fb.indirect(colsFieldOff));
     if (own.length > 0) {
       columns = own;
-      idColumnIndex = detectIdColumn(own);
+      idIndex = idColumnIndex(schema, own, detectIdColumn(own));
+      mask = decodeMask(schema, own, idIndex);
     }
   }
 
   // Properties (field 1) — custom binary encoding
   const propsFieldOff = fb.fieldOffset(rootOffset, 1);
   const properties = propsFieldOff
-    ? decodeProperties(fb, fb.indirect(propsFieldOff), columns)
+    ? decodeProperties(fb, fb.indirect(propsFieldOff), columns, mask)
     : new Map<string, PropertyValue>();
 
-  // Extract feature ID from a detected ID column (if any). MVT ids are
-  // uint64, so only non-negative integers qualify; anything else stays a
-  // regular property rather than being mangled.
+  // Take the feature id from the id column (if any). MVT ids are uint64,
+  // so only non-negative integers qualify; anything else stays a regular
+  // property rather than being mangled.
   let id: number | bigint | null = null;
-  if (idColumnIndex >= 0) {
-    const idCol = columns[idColumnIndex];
-    const rawId = properties.get(idCol.name);
+  if (idIndex >= 0) {
+    const name = columns[idIndex].name;
+    const rawId = properties.get(name);
     if ((typeof rawId === 'number' && Number.isSafeInteger(rawId) && rawId >= 0) ||
         (typeof rawId === 'bigint' && rawId >= 0n)) {
       id = rawId;
-      properties.delete(idCol.name);
+      if (!schema.keepId) properties.delete(name);
     }
+    // Decoded for the id only
+    if (schema.keep && !schema.keep(name)) properties.delete(name);
   }
 
   for (const geom of geoms) {
@@ -750,6 +774,25 @@ function cumulativeEnds(arrays: Float64Array[]): Uint32Array {
 // == Properties decoding ====================================================
 
 /**
+ * Which columns of a schema to decode: those the selection keeps, plus the
+ * id column.
+ *
+ * @param schema - Property selection.
+ * @param columns - Column schema.
+ * @param idIndex - Id column within `columns`, or `-1`.
+ * @returns One flag per column, or `null` to decode all.
+ */
+function decodeMask(schema: FeatureSchema, columns: ColumnMeta[], idIndex: number): Uint8Array | null {
+  const { keep } = schema;
+  if (keep === null) return null;
+  const mask = new Uint8Array(columns.length);
+  for (let i = 0; i < columns.length; i++) {
+    mask[i] = keep(columns[i].name) || i === idIndex ? 1 : 0;
+  }
+  return mask;
+}
+
+/**
  * Decode properties from FGB's custom binary encoding.
  *
  * The properties vector is a flat byte array containing sequential pairs
@@ -770,12 +813,15 @@ function cumulativeEnds(arrays: Float64Array[]): Uint32Array {
  * @param propsVecOffset - Byte offset of the properties byte-vector
  *   within the FlatBuffer.
  * @param columns - Column schema from the parsed header.
+ * @param mask - Per column, whether to decode it (`null`: all). Skipped
+ *   string values are never converted from UTF-8.
  * @returns Map from column name to decoded property value.
  */
 function decodeProperties(
   fb: FlatBufferReader,
   propsVecOffset: number,
   columns: ColumnMeta[],
+  mask: Uint8Array | null,
 ): Map<string, PropertyValue> {
   const props = new Map<string, PropertyValue>();
 
@@ -797,10 +843,11 @@ function decodeProperties(
     if (colIdx >= columns.length) break;
     const col = columns[colIdx];
 
-    readPropertyValue(view, propsBytes, offset, col.type);
+    const wanted = mask === null || mask[colIdx] === 1;
+    readPropertyValue(view, propsBytes, offset, col.type, wanted);
     offset += propResult.bytesRead;
 
-    props.set(col.name, propResult.value);
+    if (wanted) props.set(col.name, propResult.value);
   }
 
   return props;
@@ -817,12 +864,15 @@ function decodeProperties(
  *   string and binary slicing).
  * @param offset - Current read position within the properties vector.
  * @param type - Column type determining the encoding.
+ * @param decode - When `false`, only the size of a string value is
+ *   determined (its value is left undefined).
  */
 function readPropertyValue(
   view: DataView,
   bytes: Uint8Array,
   offset: number,
   type: ColumnType,
+  decode = true,
 ): void {
   switch (type) {
     case ColumnType.Bool:
@@ -895,7 +945,7 @@ function readPropertyValue(
       if (offset + 4 > bytes.length) { propResult.value = null; propResult.bytesRead = 0; return; }
       const strLen = view.getUint32(offset, true);
       if (offset + 4 + strLen > bytes.length) { propResult.value = null; propResult.bytesRead = 0; return; }
-      propResult.value = textDecoder.decode(bytes.subarray(offset + 4, offset + 4 + strLen));
+      propResult.value = decode ? textDecoder.decode(bytes.subarray(offset + 4, offset + 4 + strLen)) : null;
       propResult.bytesRead = 4 + strLen;
       return;
     }

@@ -202,6 +202,12 @@ function parseHeaderUnchecked(bytes: Uint8Array): FgbHeader {
   const crsOff = fb.fieldOffset(rootOffset, 10);
   const crs = crsOff ? parseCrs(fb, fb.indirect(crsOff)) : null;
 
+  // Descriptive metadata (fields 0, 11, 12, 13)
+  const text = (field: number): string | null => {
+    const off = fb.fieldOffset(rootOffset, field);
+    return off ? fb.readString(fb.indirect(off)) : null;
+  };
+
   // Detect an ID column among the parsed columns
   const idColumnIndex = detectIdColumn(columns);
 
@@ -225,6 +231,10 @@ function parseHeaderUnchecked(bytes: Uint8Array): FgbHeader {
     headerSize: totalHeaderSize,
     idColumnIndex,
     crs,
+    name: text(0),
+    title: text(11),
+    description: text(12),
+    metadata: text(13),
   };
 }
 
@@ -285,7 +295,7 @@ const ID_COLUMN_NAMES = ['id', 'fid', 'gid', 'ogc_fid'];
  * Float and Double are excluded because MVT feature IDs are unsigned
  * integers, and floating-point values would need lossy truncation.
  */
-function isIntegerColumnType(type: ColumnType): boolean {
+export function isIntegerColumnType(type: ColumnType): boolean {
   return type === ColumnType.Byte || type === ColumnType.UByte ||
     type === ColumnType.Short || type === ColumnType.UShort ||
     type === ColumnType.Int || type === ColumnType.UInt ||

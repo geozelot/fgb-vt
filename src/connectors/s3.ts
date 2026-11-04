@@ -5,7 +5,8 @@
  *
  * Reads FlatGeobuf byte ranges via `GetObject` with the `Range` header.
  * The `@aws-sdk/client-s3` package is loaded lazily at first use so that
- * applications not using S3 pay no import cost. Multi-range reads are
+ * applications not using S3 pay no import cost; alternatively an existing
+ * `S3Client` and/or the SDK module can be passed in. Multi-range reads are
  * throttled to a configurable concurrency limit.
  *
  * Compatible with any S3-compatible object store (MinIO, Cloudflare R2,
@@ -18,9 +19,48 @@ import { ConnectorError, SourceChangedError } from '../errors.js';
 /**
  * Configuration options for {@link S3Connector}.
  */
+/**
+ * The parts of an `@aws-sdk/client-s3` `S3Client` the connector uses.
+ */
+export interface S3ClientLike {
+  /** Send a command (here: `GetObjectCommand`). */
+  send(command: unknown, options?: { abortSignal?: AbortSignal }): Promise<any>;
+  /** Release the client's connections. */
+  destroy?(): void;
+}
+
+/**
+ * The parts of the `@aws-sdk/client-s3` module the connector uses.
+ */
+export interface S3SdkModule {
+  /** `S3Client` constructor. */
+  S3Client: new (config: Record<string, unknown>) => S3ClientLike;
+  /** `GetObjectCommand` constructor. */
+  GetObjectCommand: new (input: Record<string, unknown>) => unknown;
+}
+
+/**
+ * Configuration options for {@link S3Connector}.
+ */
 export interface S3ConnectorOptions {
-  /** AWS region for the S3 client (e.g. `"us-east-1"`). */
-  region: string;
+  /**
+   * AWS region for the S3 client (e.g. `"us-east-1"`). When omitted, the
+   * SDK takes it from the environment (`AWS_REGION`). Ignored with `client`.
+   */
+  region?: string;
+  /**
+   * An existing `S3Client` to send requests with, e.g. one shared with the
+   * rest of the application. The connector does not destroy it on
+   * {@link S3Connector.close}. `region`, `credentials`, `endpoint` and
+   * `forcePathStyle` are ignored.
+   */
+  client?: S3ClientLike;
+  /**
+   * The `@aws-sdk/client-s3` module, e.g. `import * as s3 from
+   * '@aws-sdk/client-s3'`. Pass it when bundling the SDK into your
+   * application; otherwise it is imported at runtime on first use.
+   */
+  sdk?: S3SdkModule;
   /**
    * Explicit AWS credentials.
    *
@@ -103,24 +143,28 @@ function parseS3Path(path: string): { bucket: string; key: string } {
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 /**
- * Lazily load the `@aws-sdk/client-s3` module at runtime.
- *
- * Uses the `Function` constructor to create a dynamic `import()` expression
- * that is invisible to static analysis by TypeScript and bundlers. This
- * ensures the SDK is only loaded (and required to be installed) when
- * {@link S3Connector} is actually instantiated.
+ * Module specifier of the AWS SDK. Held in a variable so that TypeScript
+ * and bundlers leave the optional peer dependency unresolved.
+ */
+const SDK_MODULE = '@aws-sdk/client-s3';
+
+/**
+ * Load the `@aws-sdk/client-s3` module at runtime with a plain dynamic
+ * `import()` (no `Function` constructor, so it works under a
+ * Content-Security-Policy without `unsafe-eval`).
  *
  * @returns The resolved `@aws-sdk/client-s3` module namespace.
  * @throws {Error} If the package is not installed, with an actionable
  *   installation instruction in the error message.
  */
-async function loadS3Sdk(): Promise<any> {
+async function loadS3Sdk(): Promise<S3SdkModule> {
   try {
-    return await (Function('return import("@aws-sdk/client-s3")')() as Promise<any>);
-  } catch {
+    return await import(SDK_MODULE);
+  } catch (err) {
     throw new Error(
       'S3Connector requires @aws-sdk/client-s3 as a peer dependency. ' +
-      'Install it with: npm install @aws-sdk/client-s3',
+      'Install it with: npm install @aws-sdk/client-s3, or pass the module as the sdk option.',
+      { cause: err },
     );
   }
 }
@@ -155,6 +199,13 @@ async function loadS3Sdk(): Promise<any> {
  * await connector.close();
  * ```
  *
+ * @example Reusing an application's client and bundled SDK
+ * ```typescript
+ * import * as s3 from '@aws-sdk/client-s3';
+ *
+ * const connector = new S3Connector({ client: new s3.S3Client({}), sdk: s3 });
+ * ```
+ *
  * @example Using with an S3-compatible store (MinIO)
  * ```typescript
  * const minio = new S3Connector({
@@ -172,10 +223,12 @@ export class S3Connector implements Connector {
   readonly hints: ConnectorHints;
 
   private readonly maxConcurrency: number;
-  private client: any = null;
-  private sdk: any = null;
-  private clientPromise: Promise<{ client: any; sdk: any }> | null = null;
+  private client: S3ClientLike | null = null;
+  private sdk: S3SdkModule | null = null;
+  private clientPromise: Promise<{ client: S3ClientLike; sdk: S3SdkModule }> | null = null;
   private readonly clientOptions: S3ConnectorOptions;
+  /** Whether {@link client} was created here (and is destroyed on close). */
+  private ownsClient = false;
 
   /**
    * Create a new S3 connector.
@@ -185,7 +238,7 @@ export class S3Connector implements Connector {
    *
    * @param options - S3 client configuration. See {@link S3ConnectorOptions}.
    */
-  constructor(options: S3ConnectorOptions) {
+  constructor(options: S3ConnectorOptions = {}) {
     this.maxConcurrency = options.maxConcurrency ?? 10;
     this.hints = {
       prefetch: options.prefetch ?? 256 * 1024,
@@ -288,10 +341,9 @@ export class S3Connector implements Connector {
    */
   async close(): Promise<void> {
     this.clientPromise = null;
-    if (this.client) {
-      this.client.destroy();
-      this.client = null;
-    }
+    if (this.client && this.ownsClient) this.client.destroy?.();
+    this.client = null;
+    this.ownsClient = false;
   }
 
   // == Internal ==========================================================
@@ -360,8 +412,8 @@ export class S3Connector implements Connector {
    *
    * @returns The SDK module and initialized S3 client.
    */
-  private getClient(): Promise<{ client: any; sdk: any }> {
-    if (this.client) return Promise.resolve({ client: this.client, sdk: this.sdk });
+  private getClient(): Promise<{ client: S3ClientLike; sdk: S3SdkModule }> {
+    if (this.client && this.sdk) return Promise.resolve({ client: this.client, sdk: this.sdk });
 
     if (!this.clientPromise) {
       this.clientPromise = this.initClient();
@@ -379,14 +431,20 @@ export class S3Connector implements Connector {
    *
    * @returns The SDK module and initialized S3 client.
    */
-  private async initClient(): Promise<{ client: any; sdk: any }> {
+  private async initClient(): Promise<{ client: S3ClientLike; sdk: S3SdkModule }> {
     try {
-      const sdk = await loadS3Sdk();
+      const sdk = this.clientOptions.sdk ?? await loadS3Sdk();
       this.sdk = sdk;
+      if (this.clientOptions.client) {
+        this.client = this.clientOptions.client;
+        this.ownsClient = false;
+        return { client: this.client, sdk };
+      }
 
-      const config: Record<string, unknown> = {
-        region: this.clientOptions.region,
-      };
+      const config: Record<string, unknown> = {};
+      if (this.clientOptions.region) {
+        config.region = this.clientOptions.region;
+      }
 
       if (this.clientOptions.credentials) {
         config.credentials = this.clientOptions.credentials;
@@ -401,7 +459,8 @@ export class S3Connector implements Connector {
       }
 
       this.client = new sdk.S3Client(config);
-      return { client: this.client, sdk: this.sdk };
+      this.ownsClient = true;
+      return { client: this.client, sdk };
     } catch (err) {
       this.clientPromise = null; // allow retry on failure
       throw err;

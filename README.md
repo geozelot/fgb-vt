@@ -104,7 +104,10 @@ Bind connectors and sources once; call `tile()` for the life of the process. Fil
     });
 
     const pbf = await server.tile(4, 4, 6);
-    const meta = await server.tileJSON();   // TileJSON 3.0.0
+    const meta = await server.tileJSON({     // TileJSON 3.0.0
+      tiles: ['https://tiles.example.com/{z}/{x}/{y}.mvt'],
+      attribution: '© Example',
+    });
     await server.close();
     ```
 
@@ -232,7 +235,13 @@ new S3Connector({
   maxConcurrency: 6,
   endpoint: 'http://localhost:9000'   // for S3-compatible storage backends
 })
+
+// reuse the application's client; pass the SDK module when bundling it
+import * as s3 from '@aws-sdk/client-s3';
+new S3Connector({ client: existingS3Client, sdk: s3 })
 ```
+
+`@aws-sdk/client-s3` is an optional peer dependency, imported on first use unless `sdk` is given. A `client` passed in is not destroyed by `close()`.
 ---
 
 ### Options
@@ -249,6 +258,7 @@ Options cascade through three levels - **source** overrides **tile-level default
 | `maxFeatures` | `Infinity` | Most features a source may contribute to one tile |
 | `maxReadBytes` | `256 MiB` | Most feature bytes read from a source for one tile |
 | `maxTileBytes` | `Infinity` | Largest encoded tile (tile level only) |
+| `omitEmptyLayers` | `false` | Leave out layers without features (tile level only); a tile without any features then encodes to **zero bytes**, e.g. to answer `204 No Content` |
 
 Budgets are checked against the spatial index **before** any feature data is read; an exceeded budget raises `LimitExceededError` (with `limit`, `max` and `actual`). For dense data at low zooms, prefer a higher `minZoom` or an overview file over large budgets.
 
@@ -284,7 +294,17 @@ const server = new TileServer(
 
 Arcs are linearised per tile, so that no chord deviates from the true curve by more than one tile unit (up to 128 chords per arc): curves get smoother as you zoom in. Z, M, T and TM values are ignored (MVT is two-dimensional). Features with an unknown or abstract geometry type are skipped.
 
-**Properties** — all 15 column types; a feature's own column schema overrides the header schema. An integer column named `id`, `fid`, `gid` or `ogc_fid` becomes the MVT feature id.
+**Properties** — all 15 column types (binary columns are dropped: MVT has no binary values); a feature's own column schema overrides the header schema. By default all properties are written, and an integer column named `id`, `fid`, `gid` or `ogc_fid` becomes the MVT feature id. Per source:
+
+| Source field | Default | Description |
+|--------------|---------|-------------|
+| `properties` | all | Names to keep (`['name', 'class']`, `[]` for none), or `{ exclude: [...] }`. Dropped strings are never decoded |
+| `idColumn` | auto-detected | Integer column providing the feature id, or `false` for none. Negative or missing values give no id |
+| `keepIdProperty` | `false` | Also write the id column as a property |
+
+```typescript
+{ name: 'roads', path: './roads.fgb', properties: ['name', 'class'], idColumn: 'osm_id' }
+```
 
 **Coordinate reference systems** — WGS 84 longitude/latitude (EPSG:4326, OGC:CRS84, or no CRS declared) and Web Mercator (EPSG:3857 and its aliases) are built in. Other CRSs raise `UnsupportedFormatError` unless the source sets `crs`:
 
@@ -337,6 +357,16 @@ await client.open({ name: 'parcels', path: 's3://bucket/parcels.fgb' });
 
 Every tile call accepts an `AbortSignal`, e.g. for a deadline: `tile(connector, z, x, y, sources, { signal: AbortSignal.timeout(3000) })`, `client.tile(z, x, y, sources, { signal })`, `server.tile(z, x, y, { signal })`. Pending reads are cancelled and the call rejects with the signal's reason.
 
+For metrics, pass an `onTile` hook per call or to the `TileClient` / `TileServer` constructor. It receives the tile size and duration, and per source the features read and encoded, range requests, and index and feature bytes (cached pages cost nothing):
+
+```typescript
+const server = new TileServer(layers, {
+  onTile: ({ z, x, y, tileBytes, durationMs, sources }) => {
+    for (const s of sources) metrics.record(s.name, s.requests, s.indexBytes + s.featureBytes, s.featuresEncoded);
+  },
+});
+```
+
 Cache entries are keyed by path and version tag (ETag, or inode/size/mtime for local files). Every read carries the version tag; if a file is replaced, the source is reopened automatically. With custom connectors that report no version tag, cached files must not change in place.
 
 ---
@@ -354,7 +384,7 @@ Data and I/O problems raise subclasses of `FgbVtError` with a stable `code` and 
 | `SourceChangedError` | `FGB_SOURCE_CHANGED` | A file kept changing between reads |
 | `LimitExceededError` | `FGB_LIMIT` | A budget is exceeded (`maxFeatures`, `maxReadBytes`, `maxTileBytes`, `maxScanBytes`, `maxFeatureBytes`); `limit` names which |
 
-Invalid tile coordinates raise `RangeError`.
+Invalid tile coordinates, and an `idColumn` that is not an integer column of the file, raise `RangeError`.
 
 ---
 
@@ -364,10 +394,10 @@ Invalid tile coordinates raise `RangeError`.
 import type {
   Connector, ReadOptions, ReadHeadResult, ConnectorHints,
   Source, SourceOptions, TileOptions, IoOptions, OpenOptions, RequestOptions, LimitKind,
-  Projection, SourceCrs,
+  Projection, SourceCrs, PropertySelection, TileStats, SourceStats,
   ByteCache, MemoryCacheOptions,
-  TileServerLayer, TileJSON, BBox,
-  LocalConnectorOptions, HttpConnectorOptions, S3ConnectorOptions,
+  TileServerLayer, TileJSON, TileJSONOptions, BBox,
+  LocalConnectorOptions, HttpConnectorOptions, S3ConnectorOptions, S3ClientLike, S3SdkModule,
 } from '@geozelot/fgb-vt';
 ```
 

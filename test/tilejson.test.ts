@@ -235,7 +235,7 @@ describe('TileJSON metadata generation', () => {
         { name: 'string_col', type: 11 },   // String → String
         { name: 'json_col', type: 12 },     // Json → String
         { name: 'datetime_col', type: 13 }, // DateTime → String
-        { name: 'binary_col', type: 14 },   // Binary → String
+        { name: 'binary_col', type: 14 },   // Binary → not emitted (no MVT type)
       ],
     });
 
@@ -257,7 +257,7 @@ describe('TileJSON metadata generation', () => {
       expect(fields.string_col).toBe('String');
       expect(fields.json_col).toBe('String');
       expect(fields.datetime_col).toBe('String');
-      expect(fields.binary_col).toBe('String');
+      expect(fields.binary_col).toBeUndefined();
     } finally {
       await server.close();
     }

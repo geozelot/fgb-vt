@@ -49,6 +49,7 @@ describe('resolveOptions', () => {
       maxFeatures: Infinity,
       maxReadBytes: 256 * 1024 * 1024,
       maxTileBytes: Infinity,
+      omitEmptyLayers: false,
     });
   });
 });

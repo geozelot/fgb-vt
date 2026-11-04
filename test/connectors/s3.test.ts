@@ -3,11 +3,8 @@ import { S3Connector } from '../../src/connectors/s3.js';
 
 // == Mock SDK ================================================================
 //
-// The real S3Connector uses a Function constructor trick to dynamically
-// import @aws-sdk/client-s3 at runtime. Instead of installing the SDK or
-// fighting with module mocks, we inject a fake SDK directly into the
-// connector's private fields — the lazy init checks `this.client` first,
-// so it never reaches the dynamic import.
+// The connector imports @aws-sdk/client-s3 at runtime unless the module is
+// passed as the `sdk` option, which these tests do with a fake SDK.
 
 /** Simulated S3 object store: keys are "bucket/key" */
 type ObjectStore = Record<string, Uint8Array>;
@@ -52,12 +49,6 @@ function createMockSdk(store: ObjectStore) {
   return { S3Client, GetObjectCommand, sendFn };
 }
 
-/** Inject a mock SDK into the connector, bypassing lazy init. */
-function injectMock(connector: S3Connector, sdk: ReturnType<typeof createMockSdk>) {
-  const c = connector as any;
-  c.sdk = sdk;
-  c.client = new sdk.S3Client();
-}
 
 // == Test data ===============================================================
 
@@ -82,8 +73,7 @@ describe('S3Connector', () => {
   describe('path parsing', () => {
     it('should parse s3:// URIs', async () => {
       const sdk = createMockSdk(STORE);
-      connector = new S3Connector({ region: 'us-east-1' });
-      injectMock(connector, sdk);
+      connector = new S3Connector({ region: 'us-east-1', sdk });
 
       await connector.read('s3://test-bucket/data/counties.fgb', 0, 4);
 
@@ -95,8 +85,7 @@ describe('S3Connector', () => {
 
     it('should parse bare bucket/key paths', async () => {
       const sdk = createMockSdk(STORE);
-      connector = new S3Connector({ region: 'us-east-1' });
-      injectMock(connector, sdk);
+      connector = new S3Connector({ region: 'us-east-1', sdk });
 
       await connector.read('other-bucket/nested/path/roads.fgb', 0, 4);
 
@@ -107,16 +96,14 @@ describe('S3Connector', () => {
 
     it('should reject paths without a key', async () => {
       const sdk = createMockSdk(STORE);
-      connector = new S3Connector({ region: 'us-east-1' });
-      injectMock(connector, sdk);
+      connector = new S3Connector({ region: 'us-east-1', sdk });
 
       await expect(connector.read('bucket-only', 0, 1)).rejects.toThrow('Invalid S3 path');
     });
 
     it('should reject s3:// paths without a key', async () => {
       const sdk = createMockSdk(STORE);
-      connector = new S3Connector({ region: 'us-east-1' });
-      injectMock(connector, sdk);
+      connector = new S3Connector({ region: 'us-east-1', sdk });
 
       await expect(connector.read('s3://bucket-only', 0, 1)).rejects.toThrow('Invalid S3 path');
     });
@@ -125,8 +112,7 @@ describe('S3Connector', () => {
   describe('read', () => {
     it('should read a byte range', async () => {
       const sdk = createMockSdk(STORE);
-      connector = new S3Connector({ region: 'us-east-1' });
-      injectMock(connector, sdk);
+      connector = new S3Connector({ region: 'us-east-1', sdk });
 
       const result = await connector.read('s3://test-bucket/data/counties.fgb', 10, 5);
 
@@ -137,8 +123,7 @@ describe('S3Connector', () => {
 
     it('should construct the correct Range header', async () => {
       const sdk = createMockSdk(STORE);
-      connector = new S3Connector({ region: 'us-east-1' });
-      injectMock(connector, sdk);
+      connector = new S3Connector({ region: 'us-east-1', sdk });
 
       await connector.read('s3://test-bucket/data/counties.fgb', 100, 50);
 
@@ -148,8 +133,7 @@ describe('S3Connector', () => {
 
     it('should read single byte at offset 0', async () => {
       const sdk = createMockSdk(STORE);
-      connector = new S3Connector({ region: 'us-east-1' });
-      injectMock(connector, sdk);
+      connector = new S3Connector({ region: 'us-east-1', sdk });
 
       const result = await connector.read('s3://test-bucket/data/counties.fgb', 0, 1);
 
@@ -160,8 +144,7 @@ describe('S3Connector', () => {
 
     it('should propagate S3 errors', async () => {
       const sdk = createMockSdk(STORE);
-      connector = new S3Connector({ region: 'us-east-1' });
-      injectMock(connector, sdk);
+      connector = new S3Connector({ region: 'us-east-1', sdk });
 
       await expect(
         connector.read('s3://nonexistent/file.fgb', 0, 1),
@@ -173,8 +156,7 @@ describe('S3Connector', () => {
       // Override send to return null body
       sdk.sendFn.mockResolvedValueOnce({ Body: null });
 
-      connector = new S3Connector({ region: 'us-east-1' });
-      injectMock(connector, sdk);
+      connector = new S3Connector({ region: 'us-east-1', sdk });
 
       await expect(
         connector.read('s3://test-bucket/data/counties.fgb', 0, 1),
@@ -185,8 +167,7 @@ describe('S3Connector', () => {
   describe('readRanges', () => {
     it('should return empty array for empty ranges', async () => {
       const sdk = createMockSdk(STORE);
-      connector = new S3Connector({ region: 'us-east-1' });
-      injectMock(connector, sdk);
+      connector = new S3Connector({ region: 'us-east-1', sdk });
 
       const results = await connector.readRanges('s3://test-bucket/data/counties.fgb', []);
 
@@ -196,8 +177,7 @@ describe('S3Connector', () => {
 
     it('should handle single range', async () => {
       const sdk = createMockSdk(STORE);
-      connector = new S3Connector({ region: 'us-east-1' });
-      injectMock(connector, sdk);
+      connector = new S3Connector({ region: 'us-east-1', sdk });
 
       const results = await connector.readRanges('s3://test-bucket/data/counties.fgb', [
         { offset: 5, length: 3 },
@@ -209,8 +189,7 @@ describe('S3Connector', () => {
 
     it('should read multiple ranges in order', async () => {
       const sdk = createMockSdk(STORE);
-      connector = new S3Connector({ region: 'us-east-1' });
-      injectMock(connector, sdk);
+      connector = new S3Connector({ region: 'us-east-1', sdk });
 
       const ranges = [
         { offset: 0, length: 3 },
@@ -241,8 +220,7 @@ describe('S3Connector', () => {
         return originalSend(cmd);
       });
 
-      connector = new S3Connector({ region: 'us-east-1' });
-      injectMock(connector, sdk);
+      connector = new S3Connector({ region: 'us-east-1', sdk });
 
       const results = await connector.readRanges('s3://b/k.fgb', [
         { offset: 10, length: 1 },
@@ -270,8 +248,7 @@ describe('S3Connector', () => {
         return result;
       });
 
-      connector = new S3Connector({ region: 'us-east-1', maxConcurrency: 2 });
-      injectMock(connector, sdk);
+      connector = new S3Connector({ region: 'us-east-1', maxConcurrency: 2, sdk });
 
       // 6 ranges, maxConcurrency=2 — should never exceed 2 in-flight
       const ranges = Array.from({ length: 6 }, (_, i) => ({
@@ -300,8 +277,7 @@ describe('S3Connector', () => {
         },
       });
 
-      connector = new S3Connector({ region: 'us-east-1' });
-      injectMock(connector, sdk);
+      connector = new S3Connector({ region: 'us-east-1', sdk });
 
       const result = await connector.read('s3://test-bucket/data/counties.fgb', 10, 5);
 
@@ -312,8 +288,7 @@ describe('S3Connector', () => {
   describe('close', () => {
     it('should destroy the client', async () => {
       const sdk = createMockSdk(STORE);
-      connector = new S3Connector({ region: 'us-east-1' });
-      injectMock(connector, sdk);
+      connector = new S3Connector({ region: 'us-east-1', sdk });
 
       // Trigger a read to ensure client is "active"
       await connector.read('s3://test-bucket/data/counties.fgb', 0, 1);
@@ -325,13 +300,37 @@ describe('S3Connector', () => {
       expect((connector as any).client).toBeNull();
     });
 
+    it('should not destroy a client passed in', async () => {
+      const sdk = createMockSdk(STORE);
+      const client = new sdk.S3Client();
+      connector = new S3Connector({ client, sdk });
+      expect([...await connector.read('s3://test-bucket/data/counties.fgb', 3, 2)]).toEqual([3, 4]);
+      await connector.close();
+      expect(client.destroy).not.toHaveBeenCalled();
+      expect(sdk.sendFn).toHaveBeenCalledOnce();
+    });
+
     it('should be safe to call twice', async () => {
       const sdk = createMockSdk(STORE);
-      connector = new S3Connector({ region: 'us-east-1' });
-      injectMock(connector, sdk);
+      connector = new S3Connector({ region: 'us-east-1', sdk });
 
       await connector.close();
       await connector.close(); // should not throw
+    });
+  });
+
+  describe('SDK loading', () => {
+    it('should explain how to install the SDK when it is missing', async () => {
+      // @aws-sdk/client-s3 is not installed in this repository
+      connector = new S3Connector({ region: 'us-east-1' });
+      await expect(connector.read('s3://test-bucket/data/counties.fgb', 0, 1))
+        .rejects.toThrow(/npm install @aws-sdk\/client-s3/);
+    });
+
+    it('should not use the Function constructor (CSP without unsafe-eval)', async () => {
+      const { readFileSync } = await import('node:fs');
+      const source = readFileSync(new URL('../../src/connectors/s3.ts', import.meta.url), 'utf8');
+      expect(source).not.toMatch(/Function\(/);
     });
   });
 });

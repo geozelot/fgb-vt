@@ -36,6 +36,7 @@ import type { BBox, FgbHeader, RawFeature } from '../types.js';
 import { headerByteSize, isValidBBox, parseHeader } from './header.js';
 import { computeLevelBounds } from './index.js';
 import { decodeFeatureChunk } from './feature.js';
+import type { FeatureSchema } from '../schema.js';
 import { FormatError, LimitExceededError } from '../errors.js';
 
 /** Byte size of one packed R-tree node (4 x f64 bbox + u64 offset). */
@@ -159,8 +160,25 @@ export interface QueryOptions {
   maxFeatureBytes?: number;
   /** Chord tolerance for circular arcs, in the file's coordinate units. */
   curveTolerance?: number;
+  /** Property selection and id column for decoding. */
+  schema?: FeatureSchema;
+  /** Receives counts of the reads this query issues. */
+  stats?: ReadStats;
   /** Aborts the reads when signalled. */
   signal?: AbortSignal;
+}
+
+/**
+ * Reads issued by one query. Pages served from the cache, and reads another
+ * concurrent query already started, are not counted.
+ */
+export interface ReadStats {
+  /** Connector requests (one per byte range). */
+  requests: number;
+  /** Bytes received for index pages. */
+  indexBytes: number;
+  /** Bytes received for feature data. */
+  featureBytes: number;
 }
 
 // == Source ==================================================================
@@ -321,6 +339,7 @@ export class FgbSource {
     const ranges = coalesceRanges(runs, this.coalesceGap(options), MAX_MERGED_RANGE);
 
     const chunks = await this.connector.readRanges(this.path, ranges, this.readOptions(signal));
+    count(options.stats, 'featureBytes', chunks);
     const features: RawFeature[] = [];
     const rereads: Array<Promise<RawFeature[]>> = [];
     let run = 0;
@@ -334,7 +353,7 @@ export class FgbSource {
         return run < runs.length && at >= runs[run].offset;
       };
       const chunk = decodeFeatureChunk(chunks[c], this.header, {
-        accept, fileOffset: base, curveTolerance: options.curveTolerance,
+        accept, fileOffset: base, curveTolerance: options.curveTolerance, schema: options.schema,
       });
       for (const f of chunk.features) features.push(f);
       if (chunk.truncatedAt >= 0) {
@@ -537,7 +556,10 @@ export class FgbSource {
           length: (b - 1 - a) * pageBytes + this.pageLength(b - 1),
         })),
         this.readOptions(options.signal),
-      );
+      ).then(chunks => {
+        count(options.stats, 'indexBytes', chunks);
+        return chunks;
+      });
       groups.forEach(([a, b], g) => {
         for (let p = a; p < b; p++) {
           const page = batch.then(chunks => {
@@ -619,6 +641,7 @@ export class FgbSource {
       if (pos - start >= budget) {
         // Only reachable with unknown file size: is there more data?
         const probe = await this.connector.read(this.path, pos, 4, this.readOptions(signal));
+        count(options.stats, 'featureBytes', [probe]);
         if (probe.length >= 4 && new DataView(probe.buffer, probe.byteOffset, 4).getUint32(0, true) !== 0) {
           throw tooLarge();
         }
@@ -627,9 +650,12 @@ export class FgbSource {
       const want = Math.min(SCAN_CHUNK, start + budget - pos, this.size !== null ? this.size - pos : Infinity);
       if (want <= 0) break;
       const bytes = await this.connector.read(this.path, pos, want, this.readOptions(signal));
+      count(options.stats, 'featureBytes', [bytes]);
       if (bytes.length === 0) break;
 
-      const chunk = decodeFeatureChunk(bytes, this.header, { fileOffset: pos, curveTolerance: options.curveTolerance });
+      const chunk = decodeFeatureChunk(bytes, this.header, {
+        fileOffset: pos, curveTolerance: options.curveTolerance, schema: options.schema,
+      });
       for (const f of chunk.features) features.push(f);
       this.checkBudget('features', features.length, options.maxFeatures);
 
@@ -665,6 +691,7 @@ export class FgbSource {
   private async readFeatureAt(offset: number, query: QueryOptions): Promise<RawFeature[]> {
     const options = this.readOptions(query.signal);
     const prefix = await this.connector.read(this.path, offset, 4, options);
+    count(query.stats, 'featureBytes', [prefix]);
     if (prefix.length < 4) {
       throw new FormatError('Truncated FlatGeobuf feature size prefix', { path: this.path, offset });
     }
@@ -678,8 +705,9 @@ export class FgbSource {
     }
     const length = 4 + size;
     const bytes = await this.connector.read(this.path, offset, length, options);
+    count(query.stats, 'featureBytes', [bytes]);
     const { features, truncatedAt } = decodeFeatureChunk(bytes, this.header, {
-      fileOffset: offset, curveTolerance: query.curveTolerance,
+      fileOffset: offset, curveTolerance: query.curveTolerance, schema: query.schema,
     });
     if (truncatedAt >= 0 || bytes.length < length) {
       throw new FormatError(
@@ -878,6 +906,13 @@ export async function invalidateSource(connector: Connector, path: string, conte
 }
 
 // == Helpers =================================================================
+
+/** Add completed reads to optional query stats. */
+function count(stats: ReadStats | undefined, kind: 'indexBytes' | 'featureBytes', chunks: Uint8Array[]): void {
+  if (!stats) return;
+  stats.requests += chunks.length;
+  for (const c of chunks) stats[kind] += c.length;
+}
 
 /**
  * Accessor for packed R-tree nodes spread over index pages.

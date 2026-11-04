@@ -41,12 +41,13 @@ export type { Connector, ReadOptions, ReadHeadResult, ConnectorHints } from './c
 export type { HttpConnectorOptions } from './connectors/http.js';
 export type { Source, SourceOptions, TileOptions } from './source.js';
 export type { Projection, SourceCrs } from './geometry/crs.js';
-export type { TileServerLayer } from './server.js';
+export type { TileServerLayer, TileJSONOptions } from './server.js';
 export type { TileJSON, BBox } from './types.js';
 export type { ByteCache, MemoryCacheOptions } from './cache.js';
 export type { IoOptions } from './fgb/reader.js';
 export type { OpenOptions } from './client.js';
-export type { RequestOptions } from './pipeline.js';
+export type { RequestOptions, TileStats, SourceStats } from './pipeline.js';
+export type { PropertySelection } from './schema.js';
 export type { LimitKind } from './errors.js';
 
 // == Caching & errors =======================================================

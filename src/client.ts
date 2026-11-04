@@ -38,6 +38,7 @@ import { processTile, type RequestOptions } from './pipeline.js';
 import { MemoryCache } from './cache.js';
 import { createIoContext, getSource, type IoContext, type IoOptions } from './fgb/reader.js';
 import { resolveFrame } from './geometry/crs.js';
+import { featureSchema, validateSchema } from './schema.js';
 import { withPath } from './errors.js';
 
 /**
@@ -89,6 +90,7 @@ export class TileClient {
   private readonly connector: Connector;
   private readonly options: TileOptions | undefined;
   private readonly context: IoContext;
+  private readonly onTile: RequestOptions['onTile'];
 
   /**
    * Create a new tile client bound to the given connector.
@@ -97,12 +99,13 @@ export class TileClient {
    *   across all subsequent `tile()` calls.
    * @param options - Tile-level tiling option defaults applied to every call
    *   unless overridden by per-source options, plus I/O options (cache,
-   *   prefetch, range merging, scan budget).
+   *   prefetch, range merging, scan budget) and a default `onTile` hook.
    */
-  constructor(connector: Connector, options?: TileOptions & IoOptions) {
+  constructor(connector: Connector, options?: TileOptions & IoOptions & Pick<RequestOptions, 'onTile'>) {
     this.connector = connector;
     this.options = options;
     this.context = createIoContext(options, new MemoryCache());
+    this.onTile = options?.onTile;
   }
 
   /**
@@ -118,6 +121,7 @@ export class TileClient {
    * @returns Resolves when every source is open.
    * @throws {FgbVtError} If a source cannot be opened (annotated with its path),
    *   including `UnsupportedFormatError` for a CRS without a configured projection.
+   * @throws {RangeError} If a source's `idColumn` is not an integer column of its file.
    */
   async open(sources: Source | Source[], options?: OpenOptions): Promise<void> {
     await openSources(this.connector, Array.isArray(sources) ? sources : [sources], this.context, options);
@@ -133,7 +137,7 @@ export class TileClient {
    * @param x - Tile column.
    * @param y - Tile row.
    * @param sources - Array of source descriptors; each becomes one MVT layer.
-   * @param request - Optional abort `signal`.
+   * @param request - Optional abort `signal` and `onTile` hook (overrides the constructor's).
    * @returns PBF-encoded Mapbox Vector Tile containing one layer per source.
    *
    * @example
@@ -162,7 +166,7 @@ export class TileClient {
    * @param x - Tile column.
    * @param y - Tile row.
    * @param source - Single source descriptor; produces one MVT layer.
-   * @param request - Optional abort `signal`.
+   * @param request - Optional abort `signal` and `onTile` hook (overrides the constructor's).
    * @returns PBF-encoded Mapbox Vector Tile containing one layer.
    *
    * @example
@@ -199,7 +203,7 @@ export class TileClient {
       sources,
       this.options,
       this.context,
-      request?.signal,
+      { onTile: this.onTile, ...request },
     );
   }
 
@@ -233,8 +237,9 @@ export async function openSources(
   await Promise.all(sources.map(async (source) => {
     try {
       const fgb = await getSource(connector, source.path, context, options?.signal);
-      // Fail now rather than on the first tile if the CRS is unsupported
+      // Fail now rather than on the first tile if the CRS or id column do not fit
       resolveFrame(fgb.header.crs, source.crs, source.path);
+      validateSchema(featureSchema(source), fgb.header, source.path);
       if (budget > 0) await fgb.warmIndex(budget, options?.signal);
     } catch (err) {
       throw withPath(err, source.path);

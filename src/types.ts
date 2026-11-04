@@ -227,6 +227,14 @@ export interface FgbHeader {
   idColumnIndex: number;
   /** Coordinate reference system, or `null` if the header declares none. */
   crs: CrsInfo | null;
+  /** Dataset name (`name`), or `null`. */
+  name: string | null;
+  /** Human-readable title (`title`), or `null`. */
+  title: string | null;
+  /** Human-readable description (`description`), or `null`. */
+  description: string | null;
+  /** Free-form metadata (`metadata`, by convention JSON), or `null`. */
+  metadata: string | null;
 }
 
 /**
@@ -308,8 +316,16 @@ export interface MvtLayer {
 export interface TileJSON {
   /** Specification version — always `"3.0.0"`. */
   tilejson: '3.0.0';
+  /** Tile URL templates (from `tileJSON({ tiles })`). */
+  tiles: string[];
   /** Human-readable tileset name. */
   name?: string;
+  /** Human-readable tileset description. */
+  description?: string;
+  /** Attribution (HTML). */
+  attribution?: string;
+  /** Tileset version (semver). */
+  version?: string;
   /** WGS84 bounding box: `[west, south, east, north]`. */
   bounds: [number, number, number, number];
   /** Minimum zoom level with tile coverage. */
@@ -320,6 +336,8 @@ export interface TileJSON {
   vector_layers: Array<{
     /** Layer identifier (matches the source `name`). */
     id: string;
+    /** Layer description (from the file header's description or title). */
+    description?: string;
     /** Map of property names to type strings (`"Number"`, `"String"`, `"Boolean"`). */
     fields: Record<string, string>;
     /** Minimum zoom at which this layer appears. */
