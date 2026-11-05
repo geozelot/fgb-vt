@@ -9,6 +9,7 @@
  * are decoded, so dropped string properties are never decoded at all.
  */
 
+import { redactPath } from './errors.js';
 import type { Source } from './source.js';
 import type { ColumnMeta, FgbHeader } from './types.js';
 import { ColumnType } from './types.js';
@@ -84,10 +85,10 @@ export function validateSchema(schema: FeatureSchema, header: FgbHeader, path: s
   if (typeof idColumn !== 'string' || header.columns.length === 0) return;
   const column = header.columns.find(c => c.name === idColumn);
   if (!column) {
-    throw new RangeError(`idColumn "${idColumn}" is not a column of ${path}`);
+    throw new RangeError(`idColumn "${idColumn}" is not a column of ${redactPath(path)}`);
   }
   if (!isIntegerColumnType(column.type)) {
-    throw new RangeError(`idColumn "${idColumn}" of ${path} is not an integer column`);
+    throw new RangeError(`idColumn "${idColumn}" of ${redactPath(path)} is not an integer column`);
   }
 }
 

@@ -12,14 +12,16 @@ jobs:
 
     strategy:
       matrix:
-        node-version: [18, 20, 22]
+        # The test tooling (vitest 5) needs Node.js 22.12+; older runtimes
+        # are covered by the compat job
+        node-version: [22, 24]
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
@@ -33,8 +35,42 @@ jobs:
       - name: Run tests
         run: npm test
 
-      - name: Build (Node + browser bundles)
+      - name: Build (Node, CommonJS and browser bundles)
         run: npm run build
+
+      - name: Smoke test of the build
+        run: npm run test:smoke
+
+  compat:
+    name: Node ${{ matrix.node-version }} (runtime)
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        # Supported runtimes the test tooling no longer runs on: build with
+        # the current LTS, then run the smoke test of the built package
+        node-version: [18, 20]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup Node.js 22 (build)
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies and build
+        run: npm ci && npm run build
+
+      - name: Setup Node.js ${{ matrix.node-version }} (run)
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Smoke test of the build
+        run: node test/smoke.mjs
 
   bench:
     name: Benchmarks
@@ -43,10 +79,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
@@ -59,7 +95,7 @@ jobs:
         run: npm run bench -- --json bench-results.json --summary "$GITHUB_STEP_SUMMARY"
 
       - name: Upload results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bench-results-${{ github.sha }}
           path: bench-results.json

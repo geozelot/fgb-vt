@@ -1,0 +1,12 @@
+{
+  "name": "fgb-vt-fixtures-flatgeobuf-js",
+  "private": true,
+  "type": "module",
+  "description": "Writes FlatGeobuf fixtures with the flatgeobuf npm package (JavaScript writer) for fgb-vt interoperability tests",
+  "scripts": {
+    "generate": "node generate.mjs ../.."
+  },
+  "dependencies": {
+    "flatgeobuf": "4.6.1"
+  }
+}

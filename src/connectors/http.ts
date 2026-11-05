@@ -14,8 +14,18 @@
  */
 
 import type { Connector, ConnectorHints, ReadHeadResult, ReadOptions } from './connector.js';
-import { ConnectorError, RangeNotSupportedError, SourceChangedError } from '../errors.js';
+import { ConnectorError, RangeNotSupportedError, SourceChangedError, redactPath } from '../errors.js';
 import { RequestLimiter, readAll } from './limiter.js';
+import { concatBytes, hash53 } from '../util.js';
+
+/** Longest backoff between two attempts, in milliseconds. */
+const MAX_BACKOFF_MS = 30_000;
+
+/** Largest `setTimeout` delay; longer timeouts mean no timeout. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/** Prefix of version tags derived from `Last-Modified` (no ETag). */
+const LAST_MODIFIED_TAG = 'last-modified:';
 
 /**
  * Configuration options for {@link HttpConnector}.
@@ -29,10 +39,11 @@ export interface HttpConnectorOptions {
    */
   headers?: Record<string, string>;
   /**
-   * Per-request timeout in milliseconds.
+   * Per-attempt timeout in milliseconds, covering the response and its
+   * body.
    *
-   * If a single fetch does not complete within this window, the request
-   * is aborted and (if retries remain) retried.
+   * If an attempt does not complete within this window, it is aborted and
+   * (if retries remain) retried. `0` or `Infinity` disable the timeout.
    *
    * @defaultValue 30000
    */
@@ -51,18 +62,35 @@ export interface HttpConnectorOptions {
   /**
    * Retry configuration for transient failures.
    *
-   * Retries are attempted on HTTP 5xx responses, HTTP 429 (Too Many
-   * Requests), network errors, and timeouts. Backoff between attempts
-   * follows an exponential schedule: `backoff * 2^attempt` ms.
+   * Retries are attempted on HTTP 5xx responses, HTTP 408 and 429, network
+   * errors, truncated responses and timeouts. Backoff between attempts
+   * grows exponentially (`backoff * 2^attempt` ms, at most 30 s) with
+   * random jitter, so concurrent requests do not retry in lockstep. A
+   * server's `Retry-After` is honoured; if it asks for more than 30 s, the
+   * error is raised instead (with {@link ConnectorError.retryAfterMs}).
    *
    * @defaultValue \{ attempts: 3, backoff: 200 \}
    */
   retry?: {
-    /** Total number of attempts (including the initial request). */
+    /** Total number of attempts (including the initial request); at least 1. */
     attempts: number;
     /** Base backoff delay in milliseconds before the first retry. */
     backoff: number;
   };
+  /**
+   * How reads are bound to the file version seen when the source was
+   * opened (its `ETag`, or `Last-Modified` without one).
+   *
+   * By default every response's validator is compared with it, and a
+   * mismatch raises {@link SourceChangedError}. With `true`, requests also
+   * carry `If-Match` (or `If-Unmodified-Since`), so the server itself
+   * refuses a changed file with 412. Conditional requests have costs:
+   * per the Fetch standard they bypass HTTP caches, and in browsers they
+   * need a CORS preflight per request.
+   *
+   * @defaultValue false
+   */
+  conditionalRequests?: boolean;
   /**
    * Size of the first read of a file (header plus top of the index).
    *
@@ -75,6 +103,15 @@ export interface HttpConnectorOptions {
    * @defaultValue 65536 (64 KiB)
    */
   coalesceGap?: number;
+  /**
+   * Cache namespace (see {@link Connector.cacheNamespace}). Defaults to
+   * `http`, or, with `headers`, to `http:` plus a hash of them: headers
+   * such as `Authorization` may select different content at the same URL,
+   * so connectors with different headers do not share cache entries. Set
+   * it to share entries anyway, e.g. across rotating tokens for the same
+   * files.
+   */
+  cacheNamespace?: string;
 }
 
 /**
@@ -88,7 +125,7 @@ export interface HttpConnectorOptions {
  *
  * @example
  * ```typescript
- * import { HttpConnector } from 'fgb-vt';
+ * import { HttpConnector } from '@geozelot/fgb-vt';
  *
  * const connector = new HttpConnector({
  *   headers: { Authorization: 'Bearer my-token' },
@@ -108,24 +145,41 @@ export interface HttpConnectorOptions {
  */
 export class HttpConnector implements Connector {
   readonly hints: ConnectorHints;
+  /** URLs identify resources globally, given the same request headers. */
+  readonly cacheNamespace: string;
 
   private readonly headers: Record<string, string>;
-  private readonly timeout: number;
+  /** Per-attempt timeout in milliseconds, or `null` for none. */
+  private readonly timeout: number | null;
   private readonly limiter: RequestLimiter;
   private readonly retryAttempts: number;
   private readonly retryBackoff: number;
+  private readonly conditional: boolean;
 
   /**
    * Create a new HTTP connector.
    *
    * @param options - Optional configuration. See {@link HttpConnectorOptions}.
+   * @throws {RangeError} If `timeout`, `retry` or `maxConcurrency` are invalid.
    */
   constructor(options?: HttpConnectorOptions) {
+    const timeout = options?.timeout ?? 30_000;
+    if (!(timeout >= 0)) throw new RangeError(`timeout must be a non-negative number, got ${timeout}`);
+    const attempts = options?.retry?.attempts ?? 3;
+    if (!Number.isInteger(attempts) || attempts < 1) {
+      throw new RangeError(`retry.attempts must be a positive integer, got ${attempts}`);
+    }
+    const backoff = options?.retry?.backoff ?? 200;
+    if (!(backoff >= 0 && backoff !== Infinity)) {
+      throw new RangeError(`retry.backoff must be a non-negative finite number, got ${backoff}`);
+    }
     this.headers = options?.headers ?? {};
-    this.timeout = options?.timeout ?? 30_000;
+    this.timeout = timeout === 0 || timeout > MAX_TIMER_MS ? null : timeout;
     this.limiter = new RequestLimiter(options?.maxConcurrency ?? (isNode() ? 32 : 6));
-    this.retryAttempts = Math.max(1, options?.retry?.attempts ?? 3);
-    this.retryBackoff = options?.retry?.backoff ?? 200;
+    this.retryAttempts = attempts;
+    this.retryBackoff = backoff;
+    this.conditional = options?.conditionalRequests ?? false;
+    this.cacheNamespace = options?.cacheNamespace ?? headerNamespace(this.headers);
     this.hints = {
       prefetch: options?.prefetch ?? (isNode() ? 256 * 1024 : 16 * 1024),
       coalesceGap: options?.coalesceGap ?? 64 * 1024,
@@ -145,8 +199,12 @@ export class HttpConnector implements Connector {
    *   offset 0 whose full body fits within `length`; otherwise a
    *   {@link RangeNotSupportedError}, because every later read would
    *   silently download the whole file.
-   * - **412 Precondition Failed** (with {@link ReadOptions.ifMatch}) →
-   *   {@link SourceChangedError}.
+   * - A response whose `ETag` (or `Last-Modified`) differs from
+   *   {@link ReadOptions.ifMatch}, or **412 Precondition Failed** (with
+   *   `conditionalRequests`) → {@link SourceChangedError}.
+   * - A response shorter than its `Content-Range` → retried; a server that
+   *   returns less than requested (a cap on range sizes) is asked for the
+   *   rest.
    *
    * @param path - Fully qualified HTTP(S) URL to the FGB resource.
    * @param offset - Zero-based byte offset to begin reading from.
@@ -165,7 +223,8 @@ export class HttpConnector implements Connector {
 
   /**
    * Read the first `length` bytes together with the resource size (from
-   * `Content-Range`) and version tag (`ETag`).
+   * `Content-Range`, or a `HEAD` request when the server reports `*`) and
+   * version tag (`ETag`, or `Last-Modified` without one).
    *
    * @param path - Fully qualified HTTP(S) URL to the FGB resource.
    * @param length - Number of leading bytes to read.
@@ -173,7 +232,12 @@ export class HttpConnector implements Connector {
    * @returns The leading bytes plus size and version tag.
    */
   async readHead(path: string, length: number, options?: ReadOptions): Promise<ReadHeadResult> {
-    return this.request(path, 0, length, options);
+    const head = await this.request(path, 0, length, options);
+    if (head.size === null && head.bytes.length === length && length > 0) {
+      const size = await this.contentLength(path, head.etag, options?.signal);
+      if (size !== null) return { ...head, size };
+    }
+    return head;
   }
 
   /**
@@ -225,6 +289,40 @@ export class HttpConnector implements Connector {
   // == Internal ==========================================================
 
   /**
+   * Read a byte range, continuing with further requests when the server
+   * returns less than asked (some servers and CDNs cap range sizes).
+   *
+   * @param path - URL to read.
+   * @param offset - Zero-based byte offset.
+   * @param length - Number of bytes.
+   * @param options - Optional version check and abort signal.
+   * @returns Body bytes, total size (or `null`) and version tag (or `null`).
+   */
+  private async request(path: string, offset: number, length: number, options?: ReadOptions): Promise<ReadHeadResult> {
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 0) {
+      throw new RangeError(`Invalid byte range for ${redactPath(path)}: offset ${offset}, length ${length}`);
+    }
+    checkUrl(path);
+    options?.signal?.throwIfAborted();
+    if (length === 0) return { bytes: new Uint8Array(0), size: null, etag: null };
+
+    let result = await this.requestOnce(path, offset, length, options);
+    let { bytes } = result;
+    while (result.partial && bytes.length < length) {
+      const end = result.size !== null ? Math.min(offset + length, result.size) : offset + length;
+      const next = offset + bytes.length;
+      if (next >= end) break;
+      // The rest must come from the same version of the file
+      const expected = options?.ifMatch ?? result.etag ?? undefined;
+      const more = await this.requestOnce(path, next, offset + length - next, { ...options, ifMatch: expected });
+      if (more.bytes.length === 0) break;
+      bytes = concatBytes(bytes, more.bytes);
+      result = { ...more, size: result.size ?? more.size, etag: result.etag ?? more.etag };
+    }
+    return { bytes, size: result.size, etag: result.etag };
+  }
+
+  /**
    * Perform one ranged GET (with retries) and return the body together
    * with the resource size and version tag reported by the server.
    *
@@ -232,60 +330,82 @@ export class HttpConnector implements Connector {
    * @param offset - Zero-based byte offset.
    * @param length - Number of bytes.
    * @param options - Optional version check and abort signal.
-   * @returns Body bytes, total size (or `null`) and ETag (or `null`).
+   * @returns Body bytes, total size (or `null`), version tag (or `null`),
+   *   and whether the server may hold more of the requested range.
    */
-  private async request(path: string, offset: number, length: number, options?: ReadOptions): Promise<ReadHeadResult> {
-    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 0) {
-      throw new RangeError(`Invalid byte range for ${path}: offset ${offset}, length ${length}`);
-    }
-    options?.signal?.throwIfAborted();
-    if (length === 0) return { bytes: new Uint8Array(0), size: null, etag: null };
-
+  private async requestOnce(
+    path: string,
+    offset: number,
+    length: number,
+    options?: ReadOptions,
+  ): Promise<ReadHeadResult & { partial: boolean }> {
     const end = offset + length - 1;
-    const where = `${path} [${offset}-${end}]`;
+    const where = `${redactPath(path)} [${offset}-${end}]`;
+    const expected = options?.ifMatch;
     const headers: Record<string, string> = { ...this.headers, Range: `bytes=${offset}-${end}` };
-    // Weak validators cannot be used with If-Match (strong comparison)
-    if (options?.ifMatch !== undefined && !options.ifMatch.startsWith('W/')) {
-      headers['If-Match'] = options.ifMatch;
+    if (this.conditional && expected !== undefined) {
+      if (expected.startsWith(LAST_MODIFIED_TAG)) {
+        headers['If-Unmodified-Since'] = expected.slice(LAST_MODIFIED_TAG.length);
+      } else if (!expected.startsWith('W/')) {
+        // Weak validators cannot be used with If-Match (strong comparison)
+        headers['If-Match'] = expected;
+      }
     }
 
     return this.withRetry(where, options?.signal, async (signal) => {
       const response = await fetch(path, { headers, signal });
       const { status } = response;
-      const etag = response.headers.get('etag');
+      const etag = versionTag(response.headers);
+
+      if ((status === 206 || status === 200) && expected !== undefined && etag !== null && versionChanged(etag, expected)) {
+        await discard(response);
+        throw new SourceChangedError(`${redactPath(path)} changed since it was opened`, { path, status });
+      }
 
       if (status === 206) {
         const contentRange = response.headers.get('content-range');
         let size: number | null = null;
+        let wanted = length;
+        let partial = false;
         if (contentRange !== null) {
           const m = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(contentRange.trim());
-          if (!m || Number(m[1]) !== offset) {
+          if (!m || Number(m[1]) !== offset || Number(m[2]) < Number(m[1])) {
             await discard(response);
             throw new ConnectorError(`Unexpected Content-Range "${contentRange}" reading ${where}`, { path, status });
           }
           if (m[3] !== '*') size = Number(m[3]);
+          wanted = Math.min(length, Number(m[2]) - offset + 1);
+          partial = wanted < length;
         }
-        const body = new Uint8Array(await response.arrayBuffer());
-        return { bytes: body.length > length ? body.subarray(0, length) : body, size, etag };
+        const bytes = await readBody(response, wanted);
+        if (contentRange !== null && bytes.length < wanted) {
+          throw new ConnectorError(
+            `Truncated response reading ${where}: ${bytes.length} of ${wanted} bytes`,
+            { path, status, retryable: true },
+          );
+        }
+        return { bytes, size, etag, partial };
       }
 
       if (status === 416) {
         await discard(response);
         const m = /\/(\d+)\s*$/.exec(response.headers.get('content-range') ?? '');
-        return { bytes: new Uint8Array(0), size: m ? Number(m[1]) : null, etag };
+        return { bytes: new Uint8Array(0), size: m ? Number(m[1]) : null, etag, partial: false };
       }
 
       if (status === 412) {
         await discard(response);
-        throw new SourceChangedError(`${path} changed since it was opened (HTTP 412)`, { path, status });
+        throw new SourceChangedError(`${redactPath(path)} changed since it was opened (HTTP 412)`, { path, status });
       }
 
       if (status === 200) {
-        // The server ignored Range and is sending the whole resource.
+        // The server ignored Range and is sending the whole resource:
+        // acceptable only if that is what was asked for. Never read more
+        // than that, whatever the (possibly absent) Content-Length says.
         const declared = Number(response.headers.get('content-length') ?? NaN);
         if (offset === 0 && !(declared > length)) {
-          const body = new Uint8Array(await response.arrayBuffer());
-          if (body.length <= length) return { bytes: body, size: body.length, etag };
+          const bytes = await readBody(response, length + 1);
+          if (bytes.length <= length) return { bytes, size: bytes.length, etag, partial: false };
         } else {
           await discard(response);
         }
@@ -298,27 +418,55 @@ export class HttpConnector implements Connector {
 
       await discard(response);
       const retryable = status >= 500 || status === 429 || status === 408;
-      throw new ConnectorError(`HTTP ${status} reading ${where}`, { path, status, retryable });
+      const retryAfterMs = retryable ? parseRetryAfter(response.headers.get('retry-after')) : undefined;
+      throw new ConnectorError(`HTTP ${status} reading ${where}`, {
+        path, status, retryable, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+      });
     });
+  }
+
+  /**
+   * Ask for the size of a resource whose ranged responses report `*`.
+   *
+   * @param path - URL.
+   * @param etag - Version tag of the ranged response, or `null`.
+   * @param signal - Optional abort signal.
+   * @returns The `Content-Length` of a `HEAD` response for the same
+   *   version, or `null` if unavailable.
+   */
+  private async contentLength(path: string, etag: string | null, signal?: AbortSignal): Promise<number | null> {
+    try {
+      return await this.withRetry(`${redactPath(path)} [HEAD]`, signal, async (attemptSignal) => {
+        const response = await fetch(path, { method: 'HEAD', headers: this.headers, signal: attemptSignal });
+        const tag = versionTag(response.headers);
+        if (!response.ok || (etag !== null && tag !== null && versionChanged(tag, etag))) return null;
+        const length = Number(response.headers.get('content-length') ?? NaN);
+        return Number.isSafeInteger(length) && length >= 0 ? length : null;
+      });
+    } catch {
+      signal?.throwIfAborted();
+      // The size is an optimisation; reads work without it
+      return null;
+    }
   }
 
   /**
    * Run one complete request attempt — fetch plus body read — in a
    * connector slot and under a per-attempt timeout, retrying transient
-   * failures with exponential backoff. The slot is taken before the
-   * timeout starts and freed during backoff.
+   * failures with exponential backoff and jitter. The slot is taken before
+   * the timeout starts and freed during backoff.
    *
-   * Retries are triggered by HTTP 5xx, 408 and 429, network errors, body
-   * read failures, and timeouts. Errors marked non-retryable (client
-   * errors, missing range support, changed source) and aborts requested
-   * by the caller are thrown immediately. The backoff schedule is
-   * `retryBackoff * 2^attempt` milliseconds.
+   * Retries are triggered by HTTP 5xx, 408 and 429, network errors,
+   * truncated bodies, and timeouts. Errors marked non-retryable (client
+   * errors, missing range support, changed source) and aborts requested by
+   * the caller are thrown immediately. Network errors that exhaust the
+   * attempts are raised as a retryable {@link ConnectorError}.
    *
    * @param where - Request description used in error messages.
    * @param callerSignal - Optional caller abort signal.
    * @param attempt - Performs the request with the given abort signal.
    * @returns The attempt's result.
-   * @throws {Error} The last encountered error if all attempts fail.
+   * @throws {ConnectorError} The last encountered error if all attempts fail.
    */
   private async withRetry<T>(
     where: string,
@@ -331,7 +479,7 @@ export class HttpConnector implements Connector {
       callerSignal?.throwIfAborted();
       const release = await this.limiter.acquire(callerSignal);
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), this.timeout);
+      const timer = this.timeout === null ? null : setTimeout(() => controller.abort(), this.timeout);
       const onAbort = () => controller.abort(callerSignal?.reason);
       callerSignal?.addEventListener('abort', onAbort, { once: true });
       try {
@@ -343,17 +491,149 @@ export class HttpConnector implements Connector {
           ? new ConnectorError(`Timed out after ${this.timeout} ms reading ${where}`, { retryable: true, cause: err })
           : err;
       } finally {
-        clearTimeout(timer);
+        if (timer !== null) clearTimeout(timer);
         callerSignal?.removeEventListener('abort', onAbort);
         release();
       }
       if (i < this.retryAttempts - 1) {
-        await sleep(this.retryBackoff * Math.pow(2, i), callerSignal);
+        const requested = lastError instanceof ConnectorError ? lastError.retryAfterMs : undefined;
+        if (requested !== undefined && requested > MAX_BACKOFF_MS) break;
+        await sleep(Math.max(requested ?? 0, this.backoff(i)), callerSignal);
       }
     }
 
-    throw lastError ?? new ConnectorError(`Failed to read ${where}`);
+    if (lastError instanceof ConnectorError) throw lastError;
+    throw new ConnectorError(
+      `Failed to read ${where}${lastError instanceof Error ? `: ${lastError.message}` : ''}`,
+      { retryable: true, cause: lastError ?? undefined },
+    );
   }
+
+  /**
+   * Delay before retry `i + 1`: exponential, capped, with "equal jitter"
+   * (between half and all of the exponential delay).
+   */
+  private backoff(i: number): number {
+    const delay = Math.min(MAX_BACKOFF_MS, this.retryBackoff * 2 ** i);
+    return delay / 2 + Math.random() * (delay / 2);
+  }
+}
+
+/**
+ * Check that `path` is a URL fetch can request (absolute, or relative to
+ * the page in browsers), so malformed paths fail at once instead of being
+ * retried like network errors.
+ *
+ * @param path - URL to check.
+ * @throws {TypeError} If `path` is not a valid URL.
+ */
+function checkUrl(path: string): void {
+  let base: string | undefined;
+  try {
+    base = (globalThis as { location?: { href?: string } }).location?.href;
+  } catch {
+    // Deno throws on access to location unless run with --location
+  }
+  try {
+    new URL(path, base);
+  } catch {
+    throw new TypeError(`Invalid URL: ${redactPath(path)}`);
+  }
+}
+
+/**
+ * Default cache namespace for requests with `headers`: `http`, or `http:`
+ * plus a hash of the headers (names case-insensitive, in any order). The
+ * hash keeps header values such as tokens out of cache keys.
+ *
+ * @param headers - Request headers.
+ * @returns The namespace.
+ */
+function headerNamespace(headers: Record<string, string>): string {
+  const entries = Object.entries(headers).map(([k, v]) => `${k.toLowerCase()}:${v}`).sort();
+  if (entries.length === 0) return 'http';
+  const text = entries.join('\n');
+  return `http:${hash53(text, 1).toString(36)}${hash53(text, 2).toString(36)}`;
+}
+
+/**
+ * Version tag of a response: its `ETag`, or its `Last-Modified` date
+ * (prefixed) when it has no ETag.
+ *
+ * @param headers - Response headers.
+ * @returns The tag, or `null` if the response has neither.
+ */
+function versionTag(headers: Headers): string | null {
+  const etag = headers.get('etag');
+  if (etag !== null) return etag;
+  const modified = headers.get('last-modified');
+  return modified !== null ? LAST_MODIFIED_TAG + modified : null;
+}
+
+/**
+ * Whether two version tags show a change. ETags are compared weakly
+ * (ignoring `W/`), as CDNs may weaken an origin's strong ETag. An ETag and
+ * a `Last-Modified` tag cannot be compared (some responses of a server or
+ * CDN may lack the ETag), so they never show a change.
+ */
+function versionChanged(a: string, b: string): boolean {
+  if (a.startsWith(LAST_MODIFIED_TAG) !== b.startsWith(LAST_MODIFIED_TAG)) return false;
+  return (a.startsWith('W/') ? a.slice(2) : a) !== (b.startsWith('W/') ? b.slice(2) : b);
+}
+
+/**
+ * Parse a `Retry-After` header (seconds or an HTTP date).
+ *
+ * @param value - Header value, or `null`.
+ * @returns The delay in milliseconds, or `undefined` if absent or invalid.
+ */
+function parseRetryAfter(value: string | null): number | undefined {
+  if (value === null) return undefined;
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000;
+  const date = Date.parse(trimmed);
+  return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
+}
+
+/**
+ * Read at most `max` bytes of a response body, then release the rest.
+ *
+ * @param response - Response whose body to read.
+ * @param max - Most bytes to keep.
+ * @returns The body bytes (fewer if the body is shorter).
+ */
+async function readBody(response: Response, max: number): Promise<Uint8Array> {
+  if (!response.body) return new Uint8Array(await response.arrayBuffer()).subarray(0, max);
+  const reader = response.body.getReader();
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < max) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parts.push(value);
+      total += value.length;
+    }
+  } finally {
+    if (total >= max) {
+      try {
+        await reader.cancel();
+      } catch {
+        // The body may already be closed
+      }
+    }
+    reader.releaseLock();
+  }
+  if (parts.length === 1) return parts[0].length > max ? parts[0].subarray(0, max) : parts[0];
+  const out = new Uint8Array(Math.min(total, max));
+  let pos = 0;
+  for (const part of parts) {
+    const n = Math.min(part.length, out.length - pos);
+    out.set(n === part.length ? part : part.subarray(0, n), pos);
+    pos += n;
+    if (pos === out.length) break;
+  }
+  return out;
 }
 
 /**

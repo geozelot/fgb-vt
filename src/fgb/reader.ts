@@ -31,13 +31,14 @@
  */
 
 import type { Connector, ReadOptions } from '../connectors/connector.js';
-import type { ByteCache } from '../cache.js';
+import { guardCache, type ByteCache } from '../cache.js';
 import type { BBox, FgbHeader, RawFeature } from '../types.js';
 import { headerByteSize, isValidBBox, parseHeader } from './header.js';
 import { computeLevelBounds } from './index.js';
 import { decodeFeatureChunk } from './feature.js';
 import type { FeatureSchema } from '../schema.js';
-import { FormatError, IndexMismatchError, LimitExceededError } from '../errors.js';
+import { FormatError, IndexMismatchError, LimitExceededError, redactPath } from '../errors.js';
+import { concatBytes } from '../util.js';
 
 /** Byte size of one packed R-tree node (4 x f64 bbox + u64 offset). */
 const NODE_BYTES = 40;
@@ -67,8 +68,14 @@ const LAST_FEATURE_GUESS = 64 * 1024;
 const MIN_PAGE_NODES = 64;
 const MAX_PAGE_NODES = 1024;
 
+/**
+ * How long a confirmed file version is trusted by {@link FgbSource.revalidate}
+ * before the file is asked again, in milliseconds.
+ */
+const REVALIDATE_MS = 1000;
+
 /** Version of the cache entry layout; part of every key. */
-const CACHE_PREFIX = 'fgb-vt:1';
+const CACHE_PREFIX = 'fgb-vt:2';
 
 // == Public options =========================================================
 
@@ -128,6 +135,11 @@ export interface IoContext {
   cache: ByteCache | null;
   /** Memo of opened sources, or `null` to open per request. */
   registry: SourceRegistry | null;
+  /**
+   * Cached headers written at or before this time (`Date.now()`) are not
+   * used: the header is read from the file again (see {@link forgetHeaders}).
+   */
+  headersStaleUntil: number;
   prefetch?: number;
   coalesceGap?: number;
   maxScanBytes?: number;
@@ -196,6 +208,12 @@ export class FgbSource {
   readonly size: number | null;
   /** Version tag reported by the connector, or `null`. */
   readonly etag: string | null;
+  /**
+   * Identifies this file version in index page cache keys: the version
+   * tag, or (without one) a token generated when the header was read from
+   * the file, so pages cached before an invalidation are never reused.
+   */
+  private readonly versionKey: string;
 
   private readonly connector: Connector;
   private readonly path: string;
@@ -208,6 +226,10 @@ export class FgbSource {
   private readonly seed = new Map<number, Uint8Array>();
   /** Page reads in progress, shared by concurrent queries. */
   private readonly inflight = new Map<number, Promise<Uint8Array>>();
+  /** When the file last confirmed {@link etag} (`Date.now()`), or 0. */
+  private checkedAt = 0;
+  /** Version check in progress, shared by concurrent callers. */
+  private checking: Promise<void> | null = null;
 
   private constructor(
     connector: Connector,
@@ -215,6 +237,7 @@ export class FgbSource {
     header: FgbHeader,
     size: number | null,
     etag: string | null,
+    token: string,
     context: IoContext,
   ) {
     this.connector = connector;
@@ -222,6 +245,7 @@ export class FgbSource {
     this.header = header;
     this.size = size;
     this.etag = etag;
+    this.versionKey = etag !== null ? `e${etag}` : `g${token}`;
     this.context = context;
     this.levelBounds = header.indexSize > 0
       ? computeLevelBounds(header.featuresCount, header.indexNodeSize)
@@ -249,12 +273,14 @@ export class FgbSource {
     signal?: AbortSignal,
   ): Promise<FgbSource> {
     const { cache } = context;
-    const headerKey = headerCacheKey(path);
+    const headerKey = headerCacheKey(connector, path);
 
     if (cache) {
       const cached = decodeHeaderEntry(await cache.get(headerKey));
-      if (cached) {
-        return new FgbSource(connector, path, parseHeader(cached.headerBytes), cached.size, cached.etag, context);
+      if (cached && cached.time > context.headersStaleUntil) {
+        return new FgbSource(
+          connector, path, parseHeader(cached.headerBytes), cached.size, cached.etag, cached.token, context,
+        );
       }
     }
 
@@ -271,7 +297,7 @@ export class FgbSource {
         ...readOptions,
         ...(head.etag !== null ? { ifMatch: head.etag } : {}),
       });
-      bytes = concat(bytes, rest);
+      bytes = concatBytes(bytes, rest);
     }
 
     const header = parseHeader(bytes);
@@ -282,12 +308,48 @@ export class FgbSource {
       );
     }
 
-    const source = new FgbSource(connector, path, header, head.size, head.etag, context);
+    const token = randomToken();
+    const source = new FgbSource(connector, path, header, head.size, head.etag, token, context);
+    source.checkedAt = Date.now();
     if (cache) {
-      await cache.set(headerKey, encodeHeaderEntry(head.size, head.etag, bytes.subarray(0, headerSize)));
+      await cache.set(headerKey, encodeHeaderEntry(head.size, head.etag, token, Date.now(), bytes.subarray(0, headerSize)));
     }
     await source.seedPages(bytes);
     return source;
+  }
+
+  /**
+   * Confirm that the file still has the version this source was opened
+   * with, by reading its first byte with {@link ReadOptions.ifMatch}.
+   *
+   * Reads of the index and features check the version anyway; this is for
+   * callers that rely on {@link etag} without reading, such as tile ETags.
+   * A version confirmed less than a second ago is trusted, and concurrent
+   * callers share one check.
+   *
+   * @param signal - Optional abort signal.
+   * @throws {SourceChangedError} If the file changed since it was opened.
+   */
+  async revalidate(signal?: AbortSignal): Promise<void> {
+    if (this.etag === null) return;
+    signal?.throwIfAborted();
+    if (Date.now() - this.checkedAt < REVALIDATE_MS) return;
+    if (!this.checking) {
+      const check = this.connector.read(this.path, 0, 1, { ifMatch: this.etag }).then(() => {
+        this.checkedAt = Date.now();
+      });
+      this.checking = check;
+      const done = () => { if (this.checking === check) this.checking = null; };
+      check.then(done, done);
+    }
+    const check = this.checking;
+    if (!signal) return check;
+    // The shared check runs on; only this caller stops waiting
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = () => reject(signal.reason);
+      signal.addEventListener('abort', onAbort, { once: true });
+      check.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+    });
   }
 
   /** Whether the file has a spatial index. */
@@ -328,11 +390,34 @@ export class FgbSource {
    * @throws {SourceChangedError} If the file changed since it was opened.
    */
   async readFeatures(bbox: BBox, options: QueryOptions = {}): Promise<RawFeature[]> {
-    const { signal } = options;
-    if (!this.hasIndex || options.useIndex === false) return this.scan(options);
+    const features: RawFeature[] = [];
+    await this.forEachFeatures(bbox, options, (chunk) => {
+      for (const f of chunk) features.push(f);
+    });
+    return features;
+  }
 
-    const { runs, featureCount } = await this.searchRuns(bbox, options);
-    if (runs.length === 0) return [];
+  /**
+   * Like {@link readFeatures}, but hands the features over in file order,
+   * one decoded read at a time, so a caller can process and release them
+   * before the next read is decoded.
+   *
+   * @param bbox - Query box in the file's coordinate system.
+   * @param options - Range merging, budgets and abort signal.
+   * @param onFeatures - Receives each batch of decoded features, in file order.
+   * @throws {LimitExceededError} If a budget is exceeded.
+   * @throws {SourceChangedError} If the file changed since it was opened.
+   */
+  async forEachFeatures(
+    bbox: BBox,
+    options: QueryOptions,
+    onFeatures: (features: RawFeature[]) => void,
+  ): Promise<void> {
+    const { signal } = options;
+    if (!this.hasIndex || options.useIndex === false) return this.scan(options, onFeatures);
+
+    const { runs, featureCount, lastGuessed } = await this.searchRuns(bbox, options);
+    if (runs.length === 0) return;
     let bytes = 0;
     for (const r of runs) bytes += r.length;
     this.checkBudget('features', featureCount, options.maxFeatures);
@@ -342,8 +427,6 @@ export class FgbSource {
 
     const chunks = await this.connector.readRanges(this.path, ranges, this.readOptions(signal));
     count(options.stats, 'featureBytes', chunks);
-    const features: RawFeature[] = [];
-    const rereads: Array<Promise<{ features: RawFeature[]; stored: number }>> = [];
     let stored = 0;
     let run = 0;
     try {
@@ -359,22 +442,28 @@ export class FgbSource {
         const chunk = decodeFeatureChunk(chunks[c], this.header, {
           accept, fileOffset: base, curveTolerance: options.curveTolerance, schema: options.schema,
         });
-        for (const f of chunk.features) features.push(f);
+        chunks[c] = EMPTY_BYTES; // release the read buffer
         stored += chunk.stored;
+        onFeatures(chunk.features);
         if (chunk.truncatedAt >= 0) {
-          // Only the last feature's length can be an estimate (unknown file size)
-          rereads.push(this.readFeatureAt(base + chunk.truncatedAt, options));
+          // Only the file's last feature can be longer than its range, when
+          // its length was guessed (unknown file size)
+          if (!lastGuessed || c !== chunks.length - 1) {
+            throw this.indexMismatch(
+              `the feature at byte ${base + chunk.truncatedAt} is longer than its index entry allows`,
+            );
+          }
+          const readSoFar = bytes - (ranges[c].length - chunk.truncatedAt);
+          const more = await this.readFeatureAt(base + chunk.truncatedAt, options, readSoFar);
+          stored += more.stored;
+          onFeatures(more.features);
         }
-      }
-      for (const more of await Promise.all(rereads)) {
-        for (const f of more.features) features.push(f);
-        stored += more.stored;
       }
     } catch (err) {
       // Garbage at an indexed offset means corrupt features or a wrong index
       if (err instanceof FormatError && !(err instanceof IndexMismatchError)) {
         throw new FormatError(
-          `${err.message} (read through the spatial index of ${this.path}; if the features themselves ` +
+          `${err.message} (read through the spatial index of ${redactPath(this.path)}; if the features themselves ` +
           'are intact, the index does not match them: set useIndex: false on the source to scan the file)',
           { path: this.path, offset: err.offset, cause: err },
         );
@@ -384,7 +473,6 @@ export class FgbSource {
     if (stored !== featureCount) {
       throw this.indexMismatch(`the index lists ${featureCount} features in the requested area, the data holds ${stored}`);
     }
-    return features;
   }
 
   /**
@@ -407,12 +495,19 @@ export class FgbSource {
    *
    * @param bbox - Query box in the file's coordinate system.
    * @param options - Range merging (for index pages) and abort signal.
-   * @returns Sorted, non-overlapping feature byte runs and the number of
-   *   features they contain.
+   * @returns Sorted, non-overlapping feature byte runs, the number of
+   *   features they contain, and whether the last run's length is a guess
+   *   (it ends with the file's last feature and the file size is unknown).
    * @throws {FormatError} If the index is truncated or inconsistent.
    */
-  private async searchRuns(bbox: BBox, options: QueryOptions): Promise<{ runs: ByteRange[]; featureCount: number }> {
-    if (!this.hasIndex) return { runs: [], featureCount: 0 };
+  private async searchRuns(
+    bbox: BBox,
+    options: QueryOptions,
+  ): Promise<{ runs: ByteRange[]; featureCount: number; lastGuessed: boolean }> {
+    // A NaN box (e.g. from a projection) would intersect every node
+    if (!this.hasIndex || !(bbox.minX <= bbox.maxX && bbox.minY <= bbox.maxY)) {
+      return { runs: [], featureCount: 0, lastGuessed: false };
+    }
     const { featuresCount, indexNodeSize: nodeSize, featuresOffset } = this.header;
     const levels = this.levelBounds;
     const [leafStart, leafEnd] = levels[0];
@@ -470,6 +565,8 @@ export class FgbSource {
             runs.push([first, last]);
             boundaryLeaves.add(leafStart + first);
             if (last < featuresCount) boundaryLeaves.add(leafStart + last);
+            // Without the file size, the last feature's own offset starts its guessed range
+            else if (this.size === null) boundaryLeaves.add(leafStart + last - 1);
             continue;
           }
 
@@ -479,10 +576,11 @@ export class FgbSource {
       frontier = mergeIntervals(next, 0);
     }
 
-    if (runs.length === 0) return { runs: [], featureCount: 0 };
+    if (runs.length === 0) return { runs: [], featureCount: 0, lastGuessed: false };
 
     const ranges: ByteRange[] = [];
     let featureCount = 0;
+    let lastGuessed = false;
     for (const [a, b] of mergeIntervals(runs, 0)) {
       featureCount += b - a;
       const start = featuresOffset + nodes.u64(leafStart + a, 32);
@@ -492,7 +590,12 @@ export class FgbSource {
       } else if (this.size !== null) {
         end = this.size;
       } else {
-        end = start + LAST_FEATURE_GUESS; // corrected via the size prefix if short
+        // The last feature's length is unknown: guess from its own offset,
+        // and re-read it via its size prefix if the guess is short
+        const last = featuresOffset + nodes.u64(leafStart + b - 1, 32);
+        if (last < start) throw this.indexMismatch(`feature ${b - 1} is stored before feature ${a}`);
+        end = last + LAST_FEATURE_GUESS;
+        lastGuessed = true;
       }
       if (end <= start) {
         throw this.indexMismatch(`feature ${a} is stored after feature ${b}`);
@@ -500,7 +603,7 @@ export class FgbSource {
       ranges.push({ offset: start, length: end - start });
     }
 
-    return { runs: ranges, featureCount };
+    return { runs: ranges, featureCount, lastGuessed };
   }
 
   /**
@@ -536,6 +639,7 @@ export class FgbSource {
     nodes: NodeReader,
     options: QueryOptions,
     retain = false,
+    share = true,
   ): Promise<void> {
     const wanted = new Set<number>();
     for (const [a, b] of ranges) {
@@ -547,65 +651,99 @@ export class FgbSource {
 
     const { cache } = this.context;
     const pending: Array<Promise<void>> = [];
-    const missing: number[] = [];
-    const lookups = [...wanted].map(async (p) => {
+    const retry: number[] = [];
+    // Pages this query fetches; registered before any await, so concurrent
+    // queries wait for them instead of fetching them again
+    const owned = new Map<number, OwnedPage>();
+    for (const p of wanted) {
       const seeded = this.seed.get(p);
-      if (seeded) return nodes.add(p, seeded);
-      const flying = this.inflight.get(p);
-      if (flying) return void pending.push(flying.then(page => nodes.add(p, page)));
-      if (cache) {
-        const hit = await cache.get(this.pageKey(p));
-        if (hit && hit.length === this.pageLength(p)) return nodes.add(p, hit);
+      if (seeded) {
+        nodes.add(p, seeded);
+        continue;
       }
-      missing.push(p);
-    });
-    await Promise.all(lookups);
+      const flying = share ? this.inflight.get(p) : undefined;
+      let lookup: ReturnType<ByteCache['get']> = undefined;
+      if (!flying && cache) {
+        // A synchronous cache (the built-in MemoryCache) needs no promises
+        lookup = cache.get(this.pageKey(p));
+        if (lookup instanceof Uint8Array && lookup.length === this.pageLength(p)) {
+          nodes.add(p, lookup);
+          continue;
+        }
+      }
+      if (flying) {
+        // Another query's read may fail for reasons of its own (its signal):
+        // then read the page ourselves
+        pending.push(flying.then(page => nodes.add(p, page), () => void retry.push(p)));
+        continue;
+      }
+      const page: OwnedPage = { ...deferred<Uint8Array>(), lookup };
+      owned.set(p, page);
+      this.inflight.set(p, page.promise);
+      pending.push(page.promise.then(
+        async (bytes) => {
+          nodes.add(p, bytes);
+          if (cache) await cache.set(this.pageKey(p), bytes);
+          else if (retain) this.seed.set(p, bytes);
+        },
+      ).finally(() => {
+        if (this.inflight.get(p) === page.promise) this.inflight.delete(p);
+      }));
+    }
 
-    if (missing.length > 0) {
-      missing.sort((x, y) => x - y);
-      const pageBytes = this.pageNodes * NODE_BYTES;
-      const groups = mergeIntervals(
-        missing.map(p => [p, p + 1] as [number, number]),
-        Math.floor(this.coalesceGap(options) / pageBytes),
-      );
-      const batch = this.connector.readRanges(
-        this.path,
-        groups.map(([a, b]) => ({
-          offset: this.header.indexOffset + a * pageBytes,
-          length: (b - 1 - a) * pageBytes + this.pageLength(b - 1),
-        })),
-        this.readOptions(options.signal),
-      ).then(chunks => {
+    try {
+      const missing: number[] = [];
+      // Asynchronous cache lookups started above
+      await Promise.all([...owned].map(async ([p, page]) => {
+        const hit = await page.lookup;
+        if (hit && hit.length === this.pageLength(p)) page.resolve(hit);
+        else missing.push(p);
+      }));
+
+      if (missing.length > 0) {
+        missing.sort((x, y) => x - y);
+        const pageBytes = this.pageNodes * NODE_BYTES;
+        const groups = mergeIntervals(
+          missing.map(p => [p, p + 1] as [number, number]),
+          Math.floor(this.coalesceGap(options) / pageBytes),
+        );
+        const chunks = await this.connector.readRanges(
+          this.path,
+          groups.map(([a, b]) => ({
+            offset: this.header.indexOffset + a * pageBytes,
+            length: (b - 1 - a) * pageBytes + this.pageLength(b - 1),
+          })),
+          this.readOptions(options.signal),
+        );
         count(options.stats, 'indexBytes', chunks);
-        return chunks;
-      });
-      groups.forEach(([a, b], g) => {
-        for (let p = a; p < b; p++) {
-          const page = batch.then(chunks => {
-            const chunk = chunks[g];
+        groups.forEach(([a, b], g) => {
+          const chunk = chunks[g];
+          for (let p = a; p < b; p++) {
+            // Groups span gaps between missing pages; those pages are handled elsewhere
+            const page = owned.get(p);
+            if (!page) continue;
             const start = (p - a) * pageBytes;
             const length = this.pageLength(p);
             if (chunk.length < start + length) {
-              throw new FormatError(
+              page.reject(new FormatError(
                 `Truncated FlatGeobuf index: page ${p} is incomplete`,
                 { path: this.path, offset: this.header.indexOffset + p * pageBytes },
-              );
+              ));
+            } else {
+              page.resolve(chunk.slice(start, start + length));
             }
-            return chunk.slice(start, start + length);
-          });
-          this.inflight.set(p, page);
-          pending.push(page.then(async (bytes) => {
-            nodes.add(p, bytes);
-            if (cache) await cache.set(this.pageKey(p), bytes);
-            else if (retain) this.seed.set(p, bytes);
-          }).finally(() => {
-            if (this.inflight.get(p) === page) this.inflight.delete(p);
-          }));
-        }
-      });
+          }
+        });
+      }
+    } catch (err) {
+      for (const page of owned.values()) page.reject(err);
     }
 
     await Promise.all(pending);
+    if (retry.length > 0) {
+      options.signal?.throwIfAborted();
+      await this.loadNodes(retry.map(p => [p * this.pageNodes, p * this.pageNodes + 1]), nodes, options, retain, false);
+    }
   }
 
   /**
@@ -632,11 +770,11 @@ export class FgbSource {
    * Scan all features of a file without a spatial index.
    *
    * @param options - Scan and read budgets, feature limit and abort signal.
-   * @returns All decoded features.
+   * @param onFeatures - Receives the decoded features, in file order.
    * @throws {LimitExceededError} If the feature data exceeds `maxScanBytes`
    *   or `maxReadBytes`, or the file holds more than `maxFeatures` features.
    */
-  private async scan(options: QueryOptions): Promise<RawFeature[]> {
+  private async scan(options: QueryOptions, onFeatures: (features: RawFeature[]) => void): Promise<void> {
     const { signal } = options;
     const scanBudget = options.maxScanBytes ?? DEFAULT_MAX_SCAN_BYTES;
     const readBudget = options.maxReadBytes ?? Infinity;
@@ -644,17 +782,17 @@ export class FgbSource {
     const start = this.header.featuresOffset;
     const tooLarge = (actual?: number) => scanBudget <= readBudget
       ? new LimitExceededError(
-        `${this.path} has no spatial index and more than ${budget} bytes of features; ` +
+        `${redactPath(this.path)} has no spatial index and more than ${budget} bytes of features; ` +
         'raise maxScanBytes or add an index to the file',
         { path: this.path, limit: 'scanBytes', max: budget, actual },
       )
       : new LimitExceededError(
-        `${this.path}: scanning more than ${budget} bytes of features exceeds maxReadBytes`,
+        `${redactPath(this.path)}: scanning more than ${budget} bytes of features exceeds maxReadBytes`,
         { path: this.path, limit: 'readBytes', max: budget, actual },
       );
     if (this.size !== null && this.size - start > budget) throw tooLarge(this.size - start);
 
-    const features: RawFeature[] = [];
+    let decoded = 0;
     let pos = start;
     for (;;) {
       if (pos - start >= budget) {
@@ -675,8 +813,9 @@ export class FgbSource {
       const chunk = decodeFeatureChunk(bytes, this.header, {
         fileOffset: pos, curveTolerance: options.curveTolerance, schema: options.schema,
       });
-      for (const f of chunk.features) features.push(f);
-      this.checkBudget('features', features.length, options.maxFeatures);
+      decoded += chunk.features.length;
+      this.checkBudget('features', decoded, options.maxFeatures);
+      onFeatures(chunk.features);
 
       if (chunk.truncatedAt > 0) {
         pos += chunk.truncatedAt; // continue from the cut feature
@@ -687,14 +826,16 @@ export class FgbSource {
         if (bytes.length < want) {
           throw new FormatError('Truncated FlatGeobuf feature', { path: this.path, offset: pos });
         }
-        for (const f of (await this.readFeatureAt(pos, options)).features) features.push(f);
+        const more = await this.readFeatureAt(pos, options);
+        decoded += more.features.length;
+        this.checkBudget('features', decoded, options.maxFeatures);
+        onFeatures(more.features);
         pos += new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, true) + 4;
         continue;
       }
       pos += chunk.end;
       if (chunk.end < bytes.length || bytes.length < want) break; // end marker or end of file
     }
-    return features;
   }
 
   /**
@@ -702,13 +843,20 @@ export class FgbSource {
    * size prefix to read exactly its bytes.
    *
    * @param offset - Absolute file offset of the feature's size prefix.
-   * @param query - Feature size limit and abort signal.
+   * @param query - Feature size and read limits, and abort signal.
+   * @param readSoFar - Feature bytes the query has already read, counted
+   *   against `maxReadBytes`.
    * @returns The decoded features (none if its geometry is unusable) and
    *   the number of stored features decoded (1).
    * @throws {FormatError} If the file ends before the feature does.
-   * @throws {LimitExceededError} If the feature exceeds `maxFeatureBytes`.
+   * @throws {LimitExceededError} If the feature exceeds `maxFeatureBytes`,
+   *   or reading it exceeds `maxReadBytes`.
    */
-  private async readFeatureAt(offset: number, query: QueryOptions): Promise<{ features: RawFeature[]; stored: number }> {
+  private async readFeatureAt(
+    offset: number,
+    query: QueryOptions,
+    readSoFar = 0,
+  ): Promise<{ features: RawFeature[]; stored: number }> {
     const options = this.readOptions(query.signal);
     const prefix = await this.connector.read(this.path, offset, 4, options);
     count(query.stats, 'featureBytes', [prefix]);
@@ -719,11 +867,12 @@ export class FgbSource {
     const maxFeatureBytes = query.maxFeatureBytes ?? DEFAULT_MAX_FEATURE_BYTES;
     if (size > maxFeatureBytes) {
       throw new LimitExceededError(
-        `${this.path}: feature at byte ${offset} is ${size} bytes, more than maxFeatureBytes (${maxFeatureBytes})`,
+        `${redactPath(this.path)}: feature at byte ${offset} is ${size} bytes, more than maxFeatureBytes (${maxFeatureBytes})`,
         { path: this.path, limit: 'featureBytes', max: maxFeatureBytes, actual: size },
       );
     }
     const length = 4 + size;
+    this.checkBudget('readBytes', readSoFar + length, query.maxReadBytes);
     const bytes = await this.connector.read(this.path, offset, length, options);
     count(query.stats, 'featureBytes', [bytes]);
     const { features, truncatedAt, stored } = decodeFeatureChunk(bytes, this.header, {
@@ -779,7 +928,7 @@ export class FgbSource {
   /** Error for an index that does not describe the feature data. */
   private indexMismatch(detail: string): IndexMismatchError {
     return new IndexMismatchError(
-      `The spatial index of ${this.path} does not match its feature data: ${detail}. ` +
+      `The spatial index of ${redactPath(this.path)} does not match its feature data: ${detail}. ` +
       'The file was probably written by a faulty writer; rewrite it (e.g. ogr2ogr -f FlatGeobuf out.fgb in.fgb), ' +
       'or set useIndex: false on the source to scan it instead',
       { path: this.path },
@@ -799,7 +948,7 @@ export class FgbSource {
     const what = limit === 'features' ? `${actual} features` : `${actual} bytes of features`;
     const option = limit === 'features' ? 'maxFeatures' : 'maxReadBytes';
     throw new LimitExceededError(
-      `${this.path}: the tile needs ${what}, more than ${option} (${max})`,
+      `${redactPath(this.path)}: the tile needs ${what}, more than ${option} (${max})`,
       { path: this.path, limit, max, actual },
     );
   }
@@ -828,7 +977,7 @@ export class FgbSource {
   }
 
   private pageKey(p: number): string {
-    return `${CACHE_PREFIX}:p:${this.pageNodes}:${this.etag ?? ''}:${this.path}:${p}`;
+    return `${CACHE_PREFIX}:p:${this.pageNodes}:${this.versionKey}:${cacheScope(this.connector)}:${this.path}:${p}`;
   }
 }
 
@@ -887,6 +1036,11 @@ export class SourceRegistry {
   invalidate(connector: Connector, path: string): void {
     this.entries.delete(registryKey(connector, path));
   }
+
+  /** Forget every source. */
+  clear(): void {
+    this.entries.clear();
+  }
 }
 
 /**
@@ -940,8 +1094,17 @@ const registries = new WeakMap<ByteCache, SourceRegistry>();
  * @param io - Caller options.
  * @param defaultCache - Cache to use unless the caller passes one or `false`.
  * @returns The context to pass through the pipeline.
+ * @throws {RangeError} If a size option is negative or not a number.
  */
 export function createIoContext(io: IoOptions | undefined, defaultCache: ByteCache): IoContext {
+  for (const key of ['prefetch', 'coalesceGap'] as const) {
+    const v = io?.[key];
+    if (v !== undefined && !(v >= 0 && v !== Infinity)) throw new RangeError(`${key} must be a non-negative finite number, got ${v}`);
+  }
+  for (const key of ['maxScanBytes', 'maxFeatureBytes'] as const) {
+    const v = io?.[key];
+    if (v !== undefined && !(v >= 0)) throw new RangeError(`${key} must be a non-negative number, got ${v}`);
+  }
   const cache = io?.cache === false ? null : (io?.cache ?? defaultCache);
   let registry: SourceRegistry | null = null;
   if (cache) {
@@ -952,8 +1115,10 @@ export function createIoContext(io: IoOptions | undefined, defaultCache: ByteCac
     }
   }
   return {
-    cache,
+    // Cache failures (a full disk, an unreachable store) are misses
+    cache: cache ? guardCache(cache) : null,
     registry,
+    headersStaleUntil: -Infinity,
     prefetch: io?.prefetch,
     coalesceGap: io?.coalesceGap,
     maxScanBytes: io?.maxScanBytes,
@@ -970,7 +1135,29 @@ export function createIoContext(io: IoOptions | undefined, defaultCache: ByteCac
  */
 export async function invalidateSource(connector: Connector, path: string, context: IoContext): Promise<void> {
   context.registry?.invalidate(connector, path);
-  await context.cache?.delete(headerCacheKey(path));
+  await context.cache?.delete(headerCacheKey(connector, path));
+}
+
+/**
+ * Forget every source opened through `cache`, so each is reopened (and its
+ * header re-read) on next use.
+ *
+ * @param cache - The cache whose source registry to clear.
+ */
+export function forgetSources(cache: ByteCache): void {
+  registries.get(cache)?.clear();
+}
+
+/**
+ * Stop using the headers `context` finds in its cache now: each source
+ * opened through `context` re-reads its header (and, without a version
+ * tag, its index) from the file. Entries stay in the cache for other
+ * users until they are overwritten by the fresh reads.
+ *
+ * @param context - The I/O context whose cached headers to distrust.
+ */
+export function forgetHeaders(context: IoContext): void {
+  context.headersStaleUntil = Date.now();
 }
 
 // == Helpers =================================================================
@@ -1036,8 +1223,23 @@ function registryKey(connector: Connector, path: string): string {
   return `${id}\u0000${path}`;
 }
 
-function headerCacheKey(path: string): string {
-  return `${CACHE_PREFIX}:h:${path}`;
+/**
+ * Cache scope of a connector: its namespace, or (without one) a
+ * process-local id, so connectors that may resolve a path to different
+ * files never share entries.
+ */
+function cacheScope(connector: Connector): string {
+  if (connector.cacheNamespace !== undefined) return `n${connector.cacheNamespace}`;
+  let id = connectorIds.get(connector);
+  if (id === undefined) {
+    id = nextConnectorId++;
+    connectorIds.set(connector, id);
+  }
+  return `i${id}`;
+}
+
+function headerCacheKey(connector: Connector, path: string): string {
+  return `${CACHE_PREFIX}:h:${cacheScope(connector)}:${path}`;
 }
 
 function prefetchFor(connector: Connector, context: IoContext): number {
@@ -1048,11 +1250,42 @@ function prefetchFor(connector: Connector, context: IoContext): number {
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
+/** Placeholder for read buffers released after decoding. */
+const EMPTY_BYTES = new Uint8Array(0);
+
+/** An index page this query fetches, with its pending cache lookup. */
+interface OwnedPage extends Deferred<Uint8Array> {
+  lookup: ReturnType<ByteCache['get']>;
+}
+
+/** A promise with its settle functions. */
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason: unknown) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 /**
  * Serialize a header cache entry: `[u32 metaLength][meta JSON][header bytes]`.
  */
-function encodeHeaderEntry(size: number | null, etag: string | null, headerBytes: Uint8Array): Uint8Array {
-  const meta = textEncoder.encode(JSON.stringify({ size, etag }));
+function encodeHeaderEntry(
+  size: number | null,
+  etag: string | null,
+  token: string,
+  time: number,
+  headerBytes: Uint8Array,
+): Uint8Array {
+  const meta = textEncoder.encode(JSON.stringify({ size, etag, token, time }));
   const out = new Uint8Array(4 + meta.length + headerBytes.length);
   new DataView(out.buffer).setUint32(0, meta.length, true);
   out.set(meta, 4);
@@ -1065,15 +1298,18 @@ function encodeHeaderEntry(size: number | null, etag: string | null, headerBytes
  */
 function decodeHeaderEntry(
   entry: Uint8Array | undefined,
-): { size: number | null; etag: string | null; headerBytes: Uint8Array } | null {
+): { size: number | null; etag: string | null; token: string; time: number; headerBytes: Uint8Array } | null {
   if (!entry || entry.length < 4) return null;
   try {
     const metaLength = new DataView(entry.buffer, entry.byteOffset, 4).getUint32(0, true);
     if (4 + metaLength > entry.length) return null;
     const meta = JSON.parse(textDecoder.decode(entry.subarray(4, 4 + metaLength)));
+    if (typeof meta.token !== 'string') return null;
     return {
       size: typeof meta.size === 'number' ? meta.size : null,
       etag: typeof meta.etag === 'string' ? meta.etag : null,
+      token: meta.token,
+      time: typeof meta.time === 'number' ? meta.time : 0,
       headerBytes: entry.subarray(4 + metaLength),
     };
   } catch {
@@ -1081,11 +1317,9 @@ function decodeHeaderEntry(
   }
 }
 
-function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
-  const out = new Uint8Array(a.length + b.length);
-  out.set(a);
-  out.set(b, a.length);
-  return out;
+/** A random token identifying one read of a file's header. */
+function randomToken(): string {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
 /**

@@ -25,7 +25,11 @@
 export class FgbVtError extends Error {
   /** Stable machine-readable error code. */
   readonly code: string;
-  /** Path of the FlatGeobuf source involved, when known. */
+  /**
+   * Path of the FlatGeobuf source involved, when known, exactly as given
+   * (a URL keeps its query, which may hold credentials such as a presigned
+   * signature; error messages show URLs without query and user info).
+   */
   path?: string;
 
   constructor(code: string, message: string, options?: { path?: string; cause?: unknown }) {
@@ -66,16 +70,30 @@ export class UnsupportedFormatError extends FgbVtError {
 export class ConnectorError extends FgbVtError {
   /** Whether retrying the same request may succeed. */
   readonly retryable: boolean;
-  /** HTTP status code, for HTTP-based connectors. */
+  /**
+   * HTTP status code: the response status for HTTP and S3, and the
+   * equivalent status for local file errors (404 for a missing file, 403
+   * for a permission error).
+   */
   readonly status?: number;
+  /** Delay the server asked for before a retry (HTTP `Retry-After`), in milliseconds. */
+  readonly retryAfterMs?: number;
 
   constructor(
     message: string,
-    options?: { path?: string; retryable?: boolean; status?: number; cause?: unknown; code?: string },
+    options?: {
+      path?: string;
+      retryable?: boolean;
+      status?: number;
+      retryAfterMs?: number;
+      cause?: unknown;
+      code?: string;
+    },
   ) {
     super(options?.code ?? 'FGB_IO', message, options);
     this.retryable = options?.retryable ?? false;
     if (options?.status !== undefined) this.status = options.status;
+    if (options?.retryAfterMs !== undefined) this.retryAfterMs = options.retryAfterMs;
   }
 }
 
@@ -151,4 +169,19 @@ export class LimitExceededError extends FgbVtError {
 export function withPath(err: unknown, path: string): unknown {
   if (err instanceof FgbVtError && err.path === undefined) err.path = path;
   return err;
+}
+
+/**
+ * A source path as shown in error messages: URLs lose their query and
+ * user info, which may hold credentials (presigned signatures, tokens).
+ *
+ * @param path - Source path.
+ * @returns The path, with a URL's query replaced by `?…` and its user
+ *   info by `…@`.
+ */
+export function redactPath(path: string): string {
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(path)) return path;
+  return path
+    .replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#@]*@/i, '$1…@')
+    .replace(/[?#].*$/s, (rest) => (rest.startsWith('?') ? '?…' : ''));
 }

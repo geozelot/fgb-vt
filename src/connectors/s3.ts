@@ -14,8 +14,11 @@
  */
 
 import type { Connector, ConnectorHints, ReadHeadResult, ReadOptions } from './connector.js';
-import { ConnectorError, SourceChangedError } from '../errors.js';
+import { ConnectorError, RangeNotSupportedError, SourceChangedError } from '../errors.js';
 import { RequestLimiter, readAll } from './limiter.js';
+
+/** Largest `setTimeout` delay; longer timeouts mean no timeout. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
 
 /**
  * Configuration options for {@link S3Connector}.
@@ -114,33 +117,75 @@ export interface S3ConnectorOptions {
    * @defaultValue 65536 (64 KiB)
    */
   coalesceGap?: number;
+  /**
+   * Timeout per `GetObject` in milliseconds, covering the response and its
+   * body, so a stalled connection cannot hold a request slot forever. The
+   * SDK's own retries (`maxAttempts`) happen within it. `0` or `Infinity`
+   * disable the timeout.
+   *
+   * @defaultValue 30000
+   */
+  timeout?: number;
+  /**
+   * Set to `'requester'` to read from Requester Pays buckets (the
+   * requester is charged for the requests and transfer).
+   */
+  requestPayer?: 'requester';
+  /**
+   * Account id the bucket must belong to; requests to a bucket owned by
+   * another account fail with 403 (`ExpectedBucketOwner`).
+   */
+  expectedBucketOwner?: string;
+  /**
+   * Further `GetObject` input sent with every request, e.g. server-side
+   * encryption with customer keys: `{ SSECustomerAlgorithm: 'AES256',
+   * SSECustomerKey, SSECustomerKeyMD5 }`. `Bucket`, `Key`, `Range`,
+   * `IfMatch` and `VersionId` are set by the connector.
+   */
+  getObjectParams?: Record<string, unknown>;
+  /**
+   * Cache namespace (see {@link Connector.cacheNamespace}). Defaults to
+   * `s3:<endpoint>` (`s3:aws` without an endpoint); with an injected
+   * `client` whose endpoint is unknown, cache entries are private to this
+   * connector unless a namespace is given.
+   */
+  cacheNamespace?: string;
 }
 
 /**
- * Parse an S3 path string into its constituent bucket name and object key.
+ * Parse an S3 path string into its constituent bucket name, object key and
+ * optional object version.
  *
- * Accepts both the `s3://` URI scheme and bare `bucket/key` format:
+ * Accepts both the `s3://` URI scheme and bare `bucket/key` format, with
+ * an optional `?versionId=` suffix for a specific version of a versioned
+ * object:
  *
  * - `"s3://my-bucket/path/to/file.fgb"` -> `{ bucket: "my-bucket", key: "path/to/file.fgb" }`
- * - `"my-bucket/path/to/file.fgb"` -> `{ bucket: "my-bucket", key: "path/to/file.fgb" }`
+ * - `"my-bucket/path/to/file.fgb?versionId=3HL4kq"` -> `{ ..., versionId: "3HL4kq" }`
  *
  * @param path - S3 path in either `s3://bucket/key` or `bucket/key` format.
- * @returns An object containing the parsed `bucket` and `key`.
- * @throws {Error} If the path contains no `/` separator after the bucket
- *   name (i.e. the key portion is missing).
+ * @returns The parsed `bucket`, `key` and `versionId` (or `undefined`).
+ * @throws {TypeError} If the bucket or key is missing.
  */
-function parseS3Path(path: string): { bucket: string; key: string } {
+function parseS3Path(path: string): { bucket: string; key: string; versionId: string | undefined } {
   let normalized = path;
   if (normalized.startsWith('s3://')) {
     normalized = normalized.slice(5);
   }
+  let versionId: string | undefined;
+  const version = /\?versionId=([^&?]+)$/.exec(normalized);
+  if (version) {
+    versionId = decodeURIComponent(version[1]);
+    normalized = normalized.slice(0, version.index);
+  }
   const slashIdx = normalized.indexOf('/');
-  if (slashIdx === -1) {
-    throw new Error(`Invalid S3 path (no key): ${path}`);
+  if (slashIdx <= 0 || slashIdx === normalized.length - 1) {
+    throw new TypeError(`Invalid S3 path (expected s3://bucket/key): ${path}`);
   }
   return {
     bucket: normalized.slice(0, slashIdx),
     key: normalized.slice(slashIdx + 1),
+    versionId,
   };
 }
 
@@ -187,7 +232,7 @@ async function loadS3Sdk(): Promise<S3SdkModule> {
  *
  * @example
  * ```typescript
- * import { S3Connector } from 'fgb-vt';
+ * import { S3Connector } from '@geozelot/fgb-vt';
  *
  * const connector = new S3Connector({
  *   region: 'us-east-1',
@@ -225,8 +270,11 @@ async function loadS3Sdk(): Promise<S3SdkModule> {
  */
 export class S3Connector implements Connector {
   readonly hints: ConnectorHints;
+  readonly cacheNamespace?: string;
 
   private readonly limiter: RequestLimiter;
+  /** Timeout per request in milliseconds, or `null` for none. */
+  private readonly timeout: number | null;
   private client: S3ClientLike | null = null;
   private sdk: S3SdkModule | null = null;
   private clientPromise: Promise<{ client: S3ClientLike; sdk: S3SdkModule }> | null = null;
@@ -238,16 +286,22 @@ export class S3Connector implements Connector {
    * Create a new S3 connector.
    *
    * The underlying `S3Client` is **not** created until the first read
-   * operation, so construction is synchronous and never throws.
+   * operation, so construction is synchronous.
    *
    * @param options - S3 client configuration. See {@link S3ConnectorOptions}.
+   * @throws {RangeError} If `timeout` or `maxConcurrency` are invalid.
    */
   constructor(options: S3ConnectorOptions = {}) {
+    const timeout = options.timeout ?? 30_000;
+    if (!(timeout >= 0)) throw new RangeError(`timeout must be a non-negative number, got ${timeout}`);
+    this.timeout = timeout === 0 || timeout > MAX_TIMER_MS ? null : timeout;
     this.limiter = new RequestLimiter(options.maxConcurrency ?? 50);
     this.hints = {
       prefetch: options.prefetch ?? 256 * 1024,
       coalesceGap: options.coalesceGap ?? 64 * 1024,
     };
+    this.cacheNamespace = options.cacheNamespace ??
+      (options.endpoint ? `s3:${options.endpoint}` : options.client ? undefined : 's3:aws');
     this.clientOptions = options;
   }
 
@@ -262,15 +316,16 @@ export class S3Connector implements Connector {
    * @param length - Number of bytes to read.
    * @param options - Optional version check (`IfMatch`) and abort signal.
    * @returns The requested byte range.
-   * @throws {ConnectorError} If the S3 response body is empty.
+   * @throws {ConnectorError} If the request fails (with the HTTP `status`
+   *   of the S3 error, e.g. 404 for `NoSuchKey`, 403 for `AccessDenied`),
+   *   times out, or returns fewer bytes than its `ContentRange` announces.
+   * @throws {RangeNotSupportedError} If the store ignores `Range`.
    * @throws {SourceChangedError} If `ifMatch` no longer matches the object.
    * @throws {Error} If the `@aws-sdk/client-s3` peer dependency is not
    *   installed (on first call only).
-   * @throws {Error} If the SDK `GetObject` call fails (permissions,
-   *   invalid bucket/key, network errors, etc.).
    */
   async read(path: string, offset: number, length: number, options?: ReadOptions): Promise<Uint8Array> {
-    return (await this.getRange(path, offset, length, options)).bytes;
+    return (await this.getRangeOrEmpty(path, offset, length, options)).bytes;
   }
 
   /**
@@ -283,7 +338,7 @@ export class S3Connector implements Connector {
    * @returns The leading bytes plus size and version tag.
    */
   async readHead(path: string, length: number, options?: ReadOptions): Promise<ReadHeadResult> {
-    return this.getRange(path, 0, length, options);
+    return this.getRangeOrEmpty(path, 0, length, options);
   }
 
   /**
@@ -339,6 +394,19 @@ export class S3Connector implements Connector {
   // == Internal ==========================================================
 
   /**
+   * {@link getRange}, with a range beyond the end of the object read as
+   * empty (like reading past the end of a file).
+   */
+  private async getRangeOrEmpty(path: string, offset: number, length: number, options?: ReadOptions): Promise<ReadHeadResult> {
+    try {
+      return await this.getRange(path, offset, length, options);
+    } catch (err) {
+      if (err instanceof EmptyRange) return { bytes: new Uint8Array(0), size: err.size, etag: null };
+      throw err;
+    }
+  }
+
+  /**
    * Issue one ranged `GetObject` and return the body with the object size
    * and `ETag`.
    *
@@ -347,52 +415,139 @@ export class S3Connector implements Connector {
    * @param length - Number of bytes.
    * @param options - Optional version check and abort signal.
    * @returns Body bytes, total size (or `null`) and ETag (or `null`).
+   * @throws {EmptyRange} If the range starts beyond the end of the object.
    */
   private async getRange(path: string, offset: number, length: number, options?: ReadOptions): Promise<ReadHeadResult> {
     if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 0) {
       throw new RangeError(`Invalid byte range for ${path}: offset ${offset}, length ${length}`);
     }
+    const { bucket, key, versionId } = parseS3Path(path);
     options?.signal?.throwIfAborted();
     if (length === 0) return { bytes: new Uint8Array(0), size: null, etag: null };
 
     const { client, sdk } = await this.getClient();
-    const { bucket, key } = parseS3Path(path);
     const end = offset + length - 1;
+    const where = `${path} [${offset}-${end}]`;
+    const { requestPayer, expectedBucketOwner, getObjectParams } = this.clientOptions;
 
     const command = new sdk.GetObjectCommand({
+      ...getObjectParams,
+      ...(requestPayer ? { RequestPayer: requestPayer } : {}),
+      ...(expectedBucketOwner ? { ExpectedBucketOwner: expectedBucketOwner } : {}),
       Bucket: bucket,
       Key: key,
       Range: `bytes=${offset}-${end}`,
+      ...(versionId !== undefined ? { VersionId: versionId } : {}),
       ...(options?.ifMatch !== undefined ? { IfMatch: options.ifMatch } : {}),
     });
 
     // The slot is held until the body is read: it occupies the connection
-    const result = await this.limiter.run(async () => {
-      let response: any;
+    return this.limiter.run(async () => {
+      const deadline = new Deadline(options?.signal, this.timeout);
       try {
-        response = await client.send(command, options?.signal ? { abortSignal: options.signal } : undefined);
-      } catch (err) {
-        // Range starting at or beyond the end of the object: nothing to read
-        if (isInvalidRange(err)) return null;
-        if (isPreconditionFailed(err)) {
+        let response: any;
+        try {
+          response = await client.send(command, { abortSignal: deadline.signal });
+        } catch (err) {
+          throw this.sdkError(err, path, where, deadline, options?.signal);
+        }
+
+        const etag = typeof response.ETag === 'string' ? response.ETag : null;
+        if (options?.ifMatch !== undefined && etag !== null && etag !== options.ifMatch) {
+          destroyBody(response.Body);
           throw new SourceChangedError(`${path} changed since it was opened`, { path, status: 412 });
         }
-        throw err;
-      }
-      if (!response.Body) {
-        throw new ConnectorError(`Empty response body for ${path} [${offset}-${end}]`, { path });
-      }
-      return { response, bytes: await streamToUint8Array(response.Body) };
-    }, options?.signal);
-    if (!result) return { bytes: new Uint8Array(0), size: null, etag: null };
+        if (!response.Body) {
+          throw new ConnectorError(`Empty response body for ${where}`, { path, retryable: true });
+        }
 
-    const { response, bytes } = result;
-    const total = /\/(\d+)\s*$/.exec(response.ContentRange ?? '');
-    return {
-      bytes: bytes.length > length ? bytes.subarray(0, length) : bytes,
-      size: total ? Number(total[1]) : null,
-      etag: typeof response.ETag === 'string' ? response.ETag : null,
-    };
+        // The store must answer with the requested range; one that ignores
+        // Range sends the whole object, acceptable only if that was asked for
+        const range = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(String(response.ContentRange ?? '').trim());
+        let expected: number;
+        let size: number | null;
+        if (range) {
+          if (Number(range[1]) !== offset || Number(range[2]) < offset) {
+            destroyBody(response.Body);
+            throw new ConnectorError(`Unexpected ContentRange "${response.ContentRange}" reading ${where}`, { path });
+          }
+          expected = Math.min(length, Number(range[2]) - offset + 1);
+          size = range[3] === '*' ? null : Number(range[3]);
+        } else {
+          const declared = Number(response.ContentLength ?? NaN);
+          if (offset !== 0 || !(declared <= length)) {
+            destroyBody(response.Body);
+            throw new RangeNotSupportedError(
+              `Object store does not support byte-range requests (whole object for ${where})`,
+              { path, status: 200 },
+            );
+          }
+          expected = declared;
+          size = declared;
+        }
+
+        const onAbort = () => destroyBody(response.Body, deadline.signal.reason);
+        deadline.signal.addEventListener('abort', onAbort, { once: true });
+        let bytes: Uint8Array;
+        try {
+          bytes = await streamToUint8Array(response.Body);
+        } catch (err) {
+          throw this.sdkError(err, path, where, deadline, options?.signal);
+        } finally {
+          deadline.signal.removeEventListener('abort', onAbort);
+        }
+        if (bytes.length < expected) {
+          // A cancelled web stream ends early instead of failing: report
+          // the abort or timeout, not a truncated body
+          if (deadline.signal.aborted) throw this.sdkError(deadline.signal.reason, path, where, deadline, options?.signal);
+          throw new ConnectorError(
+            `Truncated response reading ${where}: ${bytes.length} of ${expected} bytes`,
+            { path, retryable: true },
+          );
+        }
+        return { bytes: bytes.length > length ? bytes.subarray(0, length) : bytes, size, etag };
+      } finally {
+        deadline.dispose();
+      }
+    }, options?.signal);
+  }
+
+  /**
+   * Translate an error of a `GetObject` call (or of reading its body) into
+   * the connector's terms.
+   *
+   * @returns The error to throw: the caller's abort reason, a timeout, an
+   *   {@link EmptyRange} marker for a range beyond the object, a
+   *   {@link SourceChangedError}, or a {@link ConnectorError} carrying the
+   *   S3 status.
+   */
+  private sdkError(
+    err: any,
+    path: string,
+    where: string,
+    deadline: Deadline,
+    callerSignal: AbortSignal | undefined,
+  ): unknown {
+    if (callerSignal?.aborted) return callerSignal.reason;
+    if (deadline.timedOut) {
+      return new ConnectorError(`Timed out after ${this.timeout} ms reading ${where}`, { path, retryable: true, cause: err });
+    }
+    if (isInvalidRange(err)) {
+      const size = Number(err?.ActualObjectSize);
+      return new EmptyRange(Number.isSafeInteger(size) && size >= 0 ? size : null);
+    }
+    if (isPreconditionFailed(err)) {
+      return new SourceChangedError(`${path} changed since it was opened`, { path, status: 412 });
+    }
+    if (err instanceof ConnectorError) return err;
+    const status: number | undefined = err?.$metadata?.httpStatusCode;
+    const retryable = Boolean(err?.$retryable) || (status === undefined
+      ? isTransientNetworkError(err)
+      : status >= 500 || status === 429 || status === 408);
+    const name = typeof err?.name === 'string' && err.name !== 'Error' ? `${err.name}: ` : '';
+    return new ConnectorError(`S3 GetObject failed for ${where}: ${name}${err?.message ?? String(err)}`, {
+      path, retryable, cause: err, ...(status !== undefined ? { status } : {}),
+    });
   }
 
   /**
@@ -474,6 +629,28 @@ function isInvalidRange(err: any): boolean {
 }
 
 /**
+ * Error codes and names of failures without an HTTP response that may
+ * succeed on retry: dropped or refused connections and timeouts (the
+ * transient errors of the SDK's own retry strategy). Errors such as a
+ * missing region or credentials are permanent.
+ */
+const TRANSIENT_NETWORK_ERRORS = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN',
+  'TimeoutError', 'RequestTimeout', 'RequestTimeoutException',
+]);
+
+/**
+ * Whether an SDK error without an HTTP status is a transient network failure.
+ *
+ * @param err - Error thrown by `S3Client.send` or while reading the body.
+ * @returns `true` if retrying may succeed.
+ */
+function isTransientNetworkError(err: any): boolean {
+  return TRANSIENT_NETWORK_ERRORS.has(err?.code) || TRANSIENT_NETWORK_ERRORS.has(err?.name) ||
+    TRANSIENT_NETWORK_ERRORS.has(err?.cause?.code);
+}
+
+/**
  * Whether an SDK error means an `IfMatch` precondition failed (HTTP 412).
  *
  * @param err - Error thrown by `S3Client.send`.
@@ -514,4 +691,55 @@ async function streamToUint8Array(body: any): Promise<Uint8Array> {
     offset += chunk.length;
   }
   return result;
+}
+
+/** Thrown internally for a range beyond the end of the object (416). */
+class EmptyRange {
+  constructor(readonly size: number | null) {}
+}
+
+/**
+ * An abort signal that fires on the caller's signal or after a timeout.
+ *
+ * `AbortSignal.any` is not available in Node.js 18, so the two are joined
+ * by hand; {@link Deadline.dispose} removes the listener and the timer.
+ */
+class Deadline {
+  private readonly controller = new AbortController();
+  private readonly timer: ReturnType<typeof setTimeout> | null;
+  private readonly onAbort: () => void;
+  /** Whether the timeout (not the caller) aborted the request. */
+  timedOut = false;
+
+  constructor(private readonly caller: AbortSignal | undefined, timeout: number | null) {
+    this.onAbort = () => this.controller.abort(caller?.reason);
+    if (caller?.aborted) this.controller.abort(caller.reason);
+    else caller?.addEventListener('abort', this.onAbort, { once: true });
+    this.timer = timeout === null ? null : setTimeout(() => {
+      this.timedOut = true;
+      this.controller.abort(new Error('timeout'));
+    }, timeout);
+  }
+
+  get signal(): AbortSignal {
+    return this.controller.signal;
+  }
+
+  dispose(): void {
+    if (this.timer !== null) clearTimeout(this.timer);
+    this.caller?.removeEventListener('abort', this.onAbort);
+  }
+}
+
+/**
+ * Stop a response body that will not be (fully) read, releasing its
+ * connection: Node.js streams are destroyed, web streams cancelled.
+ */
+function destroyBody(body: any, reason?: unknown): void {
+  try {
+    if (typeof body?.destroy === 'function') body.destroy(reason instanceof Error ? reason : undefined);
+    else if (typeof body?.cancel === 'function') void body.cancel(reason).catch(() => {});
+  } catch {
+    // Already closed
+  }
 }

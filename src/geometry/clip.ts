@@ -54,8 +54,10 @@ export function clipFeatures(
   const { minX, minY, maxX, maxY } = clipBounds;
 
   for (const feature of features) {
-    // Trivial reject: compute feature bbox for quick test
+    // Trivial reject: compute feature bbox for quick test. Features with a
+    // NaN or infinite coordinate have no bbox and are dropped.
     const fbox = featureBBox(feature.xy);
+    if (!fbox) continue;
     if (fbox.maxX < minX || fbox.minX > maxX || fbox.maxY < minY || fbox.minY > maxY) {
       continue;
     }
@@ -88,7 +90,8 @@ export function clipFeatures(
     const ringOriginMap: number[] = [];
 
     for (let ringIdx = 0; ringIdx < rings.length; ringIdx++) {
-      const ring = rings[ringIdx];
+      // Polygon rings are clipped with their closing edge
+      const ring = isPolygon ? closeRing(rings[ringIdx]) : rings[ringIdx];
       const clipped = clipRing(ring, minX, minY, maxX, maxY, isPolygon);
       for (const c of clipped) {
         if (c.length >= 4) { // at least 2 coordinate pairs
@@ -98,6 +101,7 @@ export function clipFeatures(
       }
     }
 
+    if (isPolygon) dropCoveredPolygons(clippedRings, ringOriginMap, feature.parts, clipBounds);
     if (clippedRings.length === 0) continue;
 
     // Reassemble into flat arrays
@@ -166,18 +170,93 @@ function isPointType(t: GeomType): boolean {
  * Compute the axis-aligned bounding box of a flat coordinate array.
  *
  * @param xy - Flat interleaved coordinates `[x0, y0, x1, y1, ...]`.
- * @returns The bounding box enclosing all coordinate pairs.
+ * @returns The bounding box enclosing all coordinate pairs, or `null` if a
+ *   coordinate is NaN or infinite (it would otherwise reach the tile as a
+ *   vertex at 0).
  */
-function featureBBox(xy: Float64Array): BBox {
+function featureBBox(xy: Float64Array): BBox | null {
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (let i = 0; i < xy.length; i += 2) {
     const x = xy[i], y = xy[i + 1];
+    // x - x is 0 for finite values and NaN otherwise
+    if (x - x !== 0 || y - y !== 0) return null;
     if (x < minX) minX = x;
     if (x > maxX) maxX = x;
     if (y < minY) minY = y;
     if (y > maxY) maxY = y;
   }
   return { minX, minY, maxX, maxY };
+}
+
+/**
+ * Return a polygon ring that ends on its first vertex, appending it when
+ * the stored ring leaves the closing edge implicit.
+ *
+ * @param ring - Flat interleaved ring coordinates.
+ * @returns `ring` itself when closed, otherwise a closed copy.
+ */
+function closeRing(ring: Float64Array): Float64Array {
+  const n = ring.length;
+  if (n < 4 || (ring[0] === ring[n - 2] && ring[1] === ring[n - 1])) return ring;
+  const closed = new Float64Array(n + 2);
+  closed.set(ring);
+  closed[n] = ring[0];
+  closed[n + 1] = ring[1];
+  return closed;
+}
+
+/**
+ * Remove polygons that a hole covers completely within the clip box.
+ *
+ * Clipping rings independently turns such a polygon into its exterior and
+ * a hole that are both the clip rectangle: two coincident rings of zero
+ * net area. The polygon (exterior and all its holes) is dropped instead.
+ *
+ * @param rings - Clipped rings; filtered in place.
+ * @param origins - Original ring index of each clipped ring; filtered in place.
+ * @param parts - Original ring indices of each polygon's exterior, or
+ *   `null` for a single polygon (ring 0 is the exterior).
+ * @param box - Clip bounds.
+ */
+function dropCoveredPolygons(
+  rings: Float64Array[],
+  origins: number[],
+  parts: Uint32Array | null,
+  box: BBox,
+): void {
+  const boxArea = (box.maxX - box.minX) * (box.maxY - box.minY);
+  const starts = parts ?? [0];
+  const partOf = (ring: number) => {
+    let g = 0;
+    while (g + 1 < starts.length && starts[g + 1] <= ring) g++;
+    return g;
+  };
+  let dropped: Set<number> | null = null;
+  for (let i = 0; i < rings.length; i++) {
+    const g = partOf(origins[i]);
+    if (origins[i] === starts[g]) continue; // exterior
+    if (Math.abs(ringArea(rings[i])) >= boxArea * (1 - 1e-9)) (dropped ??= new Set()).add(g);
+  }
+  if (!dropped) return;
+  let w = 0;
+  for (let i = 0; i < rings.length; i++) {
+    if (dropped.has(partOf(origins[i]))) continue;
+    rings[w] = rings[i];
+    origins[w] = origins[i];
+    w++;
+  }
+  rings.length = w;
+  origins.length = w;
+}
+
+/** Signed shoelace area of a ring (any closing vertex contributes nothing). */
+function ringArea(ring: Float64Array): number {
+  let sum = 0;
+  const n = ring.length;
+  for (let i = 0, j = n - 2; i < n; j = i, i += 2) {
+    sum += (ring[j] - ring[i]) * (ring[i + 1] + ring[j + 1]);
+  }
+  return sum / 2;
 }
 
 /**

@@ -136,6 +136,19 @@ export interface Connector {
   readonly hints?: ConnectorHints;
 
   /**
+   * Optional: identifies the storage this connector reads, so cached
+   * headers and index pages are shared only between connectors that
+   * resolve a path to the same file.
+   *
+   * Connectors with equal namespaces must map equal paths to the same
+   * resource. Without a namespace, cache entries are private to the
+   * connector instance (and a persistent cache cannot be reused by
+   * another process). The built-in connectors set `local`, `http` and
+   * `s3:<endpoint>`.
+   */
+  readonly cacheNamespace?: string;
+
+  /**
    * Release all resources held by this connector (pooled connections, open
    * file handles, SDK clients, etc.).
    *

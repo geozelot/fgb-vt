@@ -17,8 +17,7 @@
  *
  * @example
  * ```typescript
- * import { TileClient } from 'fgb-vt';
- * import { HttpConnector } from 'fgb-vt/connectors';
+ * import { TileClient, HttpConnector } from '@geozelot/fgb-vt';
  *
  * const client = new TileClient(
  *   new HttpConnector({ headers: { Authorization: 'Bearer ...' } }),
@@ -34,9 +33,10 @@
 
 import type { Connector } from './connectors/connector.js';
 import type { Source, TileOptions } from './source.js';
-import { processTile, type RequestOptions } from './pipeline.js';
-import { MemoryCache } from './cache.js';
-import { createIoContext, getSource, type IoContext, type IoOptions } from './fgb/reader.js';
+import { validateSource } from './source.js';
+import { computeTileETag, processTile, withSource, type RequestOptions } from './pipeline.js';
+import { MemoryCache, type ByteCache } from './cache.js';
+import { createIoContext, forgetHeaders, forgetSources, invalidateSource, type IoContext, type IoOptions } from './fgb/reader.js';
 import { resolveFrame } from './geometry/crs.js';
 import { featureSchema, validateSchema } from './schema.js';
 import { withPath } from './errors.js';
@@ -91,6 +91,10 @@ export class TileClient {
   private readonly options: TileOptions | undefined;
   private readonly context: IoContext;
   private readonly onTile: RequestOptions['onTile'];
+  /** The cache in use, as passed or created (before error guarding), or `null`. */
+  private readonly cache: ByteCache | null;
+  /** Whether {@link cache} was created here (and is cleared by this client). */
+  private readonly ownsCache: boolean;
 
   /**
    * Create a new tile client bound to the given connector.
@@ -100,11 +104,14 @@ export class TileClient {
    * @param options - Tile-level tiling option defaults applied to every call
    *   unless overridden by per-source options, plus I/O options (cache,
    *   prefetch, range merging, scan budget) and a default `onTile` hook.
+   * @throws {RangeError} If an I/O option is invalid.
    */
   constructor(connector: Connector, options?: TileOptions & IoOptions & Pick<RequestOptions, 'onTile'>) {
     this.connector = connector;
     this.options = options;
-    this.context = createIoContext(options, new MemoryCache());
+    this.cache = options?.cache === false ? null : (options?.cache ?? new MemoryCache());
+    this.ownsCache = options?.cache === undefined;
+    this.context = createIoContext(options, this.cache ?? new MemoryCache());
     this.onTile = options?.onTile;
   }
 
@@ -208,13 +215,70 @@ export class TileClient {
   }
 
   /**
-   * Release connector resources (pooled connections, file handles, etc.).
+   * Compute the ETag of a tile without rendering it, e.g. to answer
+   * `If-None-Match` with `304 Not Modified`. It changes whenever a source
+   * file, a setting or the library's tile encoding changes.
+   *
+   * @param z - Tile zoom level.
+   * @param x - Tile column.
+   * @param y - Tile row.
+   * @param sources - The sources (or source) the tile is rendered from.
+   * @param request - Optional abort signal.
+   * @returns A strong, quoted ETag, or `null` when a source's connector
+   *   reports no version tag (e.g. an HTTP server without `ETag` or
+   *   `Last-Modified`).
+   * @throws {FgbVtError} If a source cannot be opened (annotated with its path).
+   */
+  tileETag(
+    z: number,
+    x: number,
+    y: number,
+    sources: Source | Source[],
+    request?: Pick<RequestOptions, 'signal'>,
+  ): Promise<string | null> {
+    const list = Array.isArray(sources) ? sources : [sources];
+    return computeTileETag(
+      list.map(source => [this.connector, source]), z, x, y, this.options, this.context, request?.signal,
+    );
+  }
+
+  /**
+   * Forget what is cached about a file, so the next request re-reads its
+   * header and index, e.g. after the file was replaced at the same path.
+   * Without a path, every source is reopened from its file (the client's
+   * own cache is cleared; in a cache passed as an option, the entries are
+   * replaced as the files are read again).
+   *
+   * Files with version tags are detected as changed automatically; this is
+   * for connectors and servers that report none.
+   *
+   * @param path - Source path, or omitted for all sources.
+   * @returns Resolves when the entries are removed from the cache.
+   */
+  async invalidate(path?: string): Promise<void> {
+    if (path !== undefined) return invalidateSource(this.connector, path, this.context);
+    // A shared cache cannot be cleared, and its header entries name no
+    // client: distrust every header cached until now instead
+    forgetHeaders(this.context);
+    if (this.cache) {
+      forgetSources(this.cache);
+      if (this.ownsCache) (this.cache as MemoryCache).clear();
+    }
+  }
+
+  /**
+   * Release connector resources (pooled connections, file handles, etc.)
+   * and the client's own cache.
    *
    * After calling `close()`, this client instance must not be used again.
    *
    * @returns Resolves when the underlying connector has been closed.
    */
   async close(): Promise<void> {
+    if (this.cache && this.ownsCache) {
+      forgetSources(this.cache);
+      (this.cache as MemoryCache).clear();
+    }
     await this.connector.close();
   }
 }
@@ -234,13 +298,15 @@ export async function openSources(
   options?: OpenOptions,
 ): Promise<void> {
   const budget = options?.warmIndex === false ? 0 : (options?.warmIndex ?? DEFAULT_WARM_INDEX_BYTES);
+  for (const source of sources) validateSource(source);
   await Promise.all(sources.map(async (source) => {
     try {
-      const fgb = await getSource(connector, source.path, context, options?.signal);
-      // Fail now rather than on the first tile if the CRS or id column do not fit
-      resolveFrame(fgb.header.crs, source.crs, source.path);
-      validateSchema(featureSchema(source), fgb.header, source.path);
-      if (budget > 0) await fgb.warmIndex(budget, options?.signal);
+      await withSource(connector, source, context, options?.signal, async (fgb) => {
+        // Fail now rather than on the first tile if the CRS or id column do not fit
+        resolveFrame(fgb.header.crs, source.crs, source.path);
+        validateSchema(featureSchema(source), fgb.header, source.path);
+        if (budget > 0) await fgb.warmIndex(budget, options?.signal);
+      });
     } catch (err) {
       throw withPath(err, source.path);
     }

@@ -136,3 +136,47 @@ export class MemoryCache implements ByteCache {
     this.totalBytes = 0;
   }
 }
+
+/** Guarded wrappers, one per cache. */
+const guarded = new WeakMap<ByteCache, ByteCache>();
+
+/**
+ * Wrap a cache so its failures never fail a tile: a `get` that throws or
+ * rejects is a miss, and failed `set`/`delete` calls are ignored (e.g. a
+ * full `/tmp` or an unreachable key-value store). The built-in
+ * {@link MemoryCache} cannot fail and is returned as is.
+ *
+ * @param cache - Cache to guard.
+ * @returns The guarded cache (the same wrapper for the same cache).
+ */
+export function guardCache(cache: ByteCache): ByteCache {
+  if (cache instanceof MemoryCache) return cache;
+  let wrapper = guarded.get(cache);
+  if (!wrapper) {
+    wrapper = {
+      async get(key) {
+        try {
+          return await cache.get(key);
+        } catch {
+          return undefined;
+        }
+      },
+      async set(key, value) {
+        try {
+          await cache.set(key, value);
+        } catch {
+          // Caching is best effort
+        }
+      },
+      async delete(key) {
+        try {
+          await cache.delete(key);
+        } catch {
+          // Caching is best effort
+        }
+      },
+    };
+    guarded.set(cache, wrapper);
+  }
+  return wrapper;
+}

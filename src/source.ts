@@ -25,6 +25,28 @@
 
 import type { SourceCrs } from './geometry/crs.js';
 import type { PropertySelection } from './schema.js';
+import type { PropertyValue } from './types.js';
+
+/**
+ * A feature as seen by {@link Source.filter}.
+ */
+export interface FilterFeature {
+  /** Feature id (from the id column), or `null`. */
+  readonly id: number | bigint | null;
+  /** Geometry family as written to the tile. */
+  readonly type: 'Point' | 'LineString' | 'Polygon';
+  /**
+   * All properties of the stored feature, including columns that
+   * {@link Source.properties} leaves out of the tile and the id column.
+   */
+  readonly properties: Readonly<Record<string, PropertyValue>>;
+}
+
+/**
+ * Decides per feature and zoom whether a feature is written to the tile.
+ * Called for every feature a tile reads, so keep it cheap.
+ */
+export type FeatureFilter = (feature: FilterFeature, zoom: number) => boolean;
 
 /**
  * Per-source tiling option overrides.
@@ -33,15 +55,15 @@ import type { PropertySelection } from './schema.js';
  * and then to the built-in default via {@link resolveOptions}.
  */
 export interface SourceOptions {
-  /** Tile coordinate extent. @defaultValue 4096 */
+  /** Tile coordinate extent: an integer from 1 to 2^28. @defaultValue 4096 */
   extent?: number;
-  /** Buffer around tile in tile-coordinate pixels. @defaultValue 64 */
+  /** Buffer around tile in tile-coordinate pixels (`>= 0`). @defaultValue 64 */
   buffer?: number;
-  /** Douglas-Peucker simplification tolerance. @defaultValue 3 */
+  /** Douglas-Peucker simplification tolerance in tile units (`>= 0`). @defaultValue 3 */
   tolerance?: number;
-  /** Skip this source above this zoom level. @defaultValue 24 */
+  /** Skip this source above this zoom level (`Infinity` for no limit). @defaultValue 24 */
   maxZoom?: number;
-  /** Skip this source below this zoom level. @defaultValue 0 */
+  /** Skip this source below this zoom level (at most `maxZoom`). @defaultValue 0 */
   minZoom?: number;
   /**
    * Most features this source may contribute to one tile. Checked against
@@ -127,6 +149,28 @@ export interface Source {
    * its data (`IndexMismatchError`). @defaultValue true
    */
   useIndex?: boolean;
+  /**
+   * Write only the features for which this returns `true`, e.g. only major
+   * roads below zoom 10: `(f, z) => z >= 10 || f.properties.class === 'major'`.
+   *
+   * The filter sees every property of a feature, also those left out by
+   * {@link Source.properties}. It shrinks tiles, not reads: the features
+   * are read and decoded first, and budgets such as `maxFeatures` count
+   * them before filtering. To read less at low zooms, use an overview file
+   * (a source with the same name and a lower `maxZoom`).
+   *
+   * Tile ETags identify a filter by its source text: when its result
+   * depends on anything else (e.g. configuration it reads), change
+   * {@link Source.revision} with it.
+   */
+  filter?: FeatureFilter;
+  /**
+   * Revision of this source's settings, part of its tile ETags. Change it
+   * when the tiles change in a way the ETag cannot see: a `filter` or
+   * `crs` projection that behaves differently with the same source text,
+   * e.g. because it reads configuration. A build or deployment id works.
+   */
+  revision?: string;
 }
 
 /**
@@ -162,6 +206,18 @@ export interface TileOptions {
    */
   maxTileBytes?: number;
   /**
+   * When a tile exceeds `maxTileBytes`, encode it again with coarser
+   * detail before giving up: up to four times, each time doubling the
+   * simplification tolerance and the point grid (starting from `extent /
+   * 512` for sources without one). `LimitExceededError` is raised only if
+   * the coarsest attempt is still too large. The tile's
+   * `TileStats.reduced` reports the steps taken.
+   *
+   * Costs memory: the decoded features of every source are kept until the
+   * tile is encoded. @defaultValue false
+   */
+  reduceToFit?: boolean;
+  /**
    * Leave layers without features out of the tile. A tile without any
    * features then encodes to zero bytes, which a server can answer with
    * `204 No Content`. Applies to the whole tile. @defaultValue false
@@ -186,6 +242,7 @@ export const DEFAULT_TILE_OPTIONS: Required<TileOptions> = {
   simplifyBeforeClip: false,
   pointGrid: 0,
   maxTileBytes: Infinity,
+  reduceToFit: false,
   omitEmptyLayers: false,
 };
 
@@ -196,6 +253,7 @@ export const DEFAULT_TILE_OPTIONS: Required<TileOptions> = {
  * @param source - Per-source option overrides (highest priority).
  * @param tile - Tile-level option defaults (middle priority).
  * @returns Fully resolved options with no `undefined` fields.
+ * @throws {RangeError} If a resolved option is invalid (see {@link validateTileOptions}).
  *
  * @example
  * ```typescript
@@ -210,7 +268,7 @@ export function resolveOptions(
   source?: SourceOptions,
   tile?: TileOptions,
 ): Required<TileOptions> {
-  return {
+  return validateTileOptions({
     extent: source?.extent ?? tile?.extent ?? DEFAULT_TILE_OPTIONS.extent,
     buffer: source?.buffer ?? tile?.buffer ?? DEFAULT_TILE_OPTIONS.buffer,
     tolerance: source?.tolerance ?? tile?.tolerance ?? DEFAULT_TILE_OPTIONS.tolerance,
@@ -221,6 +279,69 @@ export function resolveOptions(
     simplifyBeforeClip: source?.simplifyBeforeClip ?? tile?.simplifyBeforeClip ?? DEFAULT_TILE_OPTIONS.simplifyBeforeClip,
     pointGrid: source?.pointGrid ?? tile?.pointGrid ?? DEFAULT_TILE_OPTIONS.pointGrid,
     maxTileBytes: tile?.maxTileBytes ?? DEFAULT_TILE_OPTIONS.maxTileBytes,
+    reduceToFit: tile?.reduceToFit ?? DEFAULT_TILE_OPTIONS.reduceToFit,
     omitEmptyLayers: tile?.omitEmptyLayers ?? DEFAULT_TILE_OPTIONS.omitEmptyLayers,
-  };
+  });
+}
+
+/** Largest tile extent: coordinates and their deltas must stay within int32. */
+const MAX_EXTENT = 2 ** 28;
+
+/**
+ * Check resolved tiling options. Invalid values would otherwise produce
+ * empty tiles, invalid MVT (e.g. `extent: 0`) or errors only after all
+ * data has been read.
+ *
+ * @param options - Resolved options.
+ * @returns `options`.
+ * @throws {RangeError} Naming the first invalid option.
+ */
+export function validateTileOptions(options: Required<TileOptions>): Required<TileOptions> {
+  const { extent, buffer, minZoom, maxZoom } = options;
+  if (!Number.isInteger(extent) || extent < 1 || extent > MAX_EXTENT) {
+    throw new RangeError(`extent must be an integer from 1 to ${MAX_EXTENT}, got ${extent}`);
+  }
+  if (!(buffer >= 0 && extent + 2 * buffer <= 2 ** 30)) {
+    throw new RangeError(`buffer must be a non-negative number (and extent + 2 * buffer at most 2^30), got ${buffer}`);
+  }
+  for (const key of ['tolerance', 'pointGrid'] as const) {
+    const v = options[key];
+    if (!(v >= 0 && v !== Infinity)) throw new RangeError(`${key} must be a non-negative finite number, got ${v}`);
+  }
+  // Any number bounds the zooms served (e.g. Infinity for no limit)
+  for (const [key, v] of [['minZoom', minZoom], ['maxZoom', maxZoom]] as const) {
+    if (typeof v !== 'number' || Number.isNaN(v)) throw new RangeError(`${key} must be a number, got ${String(v)}`);
+  }
+  if (minZoom > maxZoom) throw new RangeError(`minZoom (${minZoom}) is greater than maxZoom (${maxZoom})`);
+  for (const key of ['maxFeatures', 'maxReadBytes', 'maxTileBytes'] as const) {
+    const v = options[key];
+    if (!(v >= 0)) throw new RangeError(`${key} must be a non-negative number, got ${v}`);
+  }
+  for (const key of ['simplifyBeforeClip', 'reduceToFit', 'omitEmptyLayers'] as const) {
+    if (typeof options[key] !== 'boolean') throw new RangeError(`${key} must be a boolean, got ${String(options[key])}`);
+  }
+  return options;
+}
+
+/**
+ * Check a source descriptor's name and path, which become the layer name
+ * and the connector path.
+ *
+ * @param source - Source descriptor.
+ * @throws {TypeError} If the name or path is not a non-empty string,
+ *   `filter` is not a function, or `revision` is not a string.
+ */
+export function validateSource(source: Source): void {
+  if (typeof source?.name !== 'string' || source.name.length === 0) {
+    throw new TypeError(`Source name must be a non-empty string, got ${JSON.stringify(source?.name)}`);
+  }
+  if (typeof source.path !== 'string' || source.path.length === 0) {
+    throw new TypeError(`Source path of layer "${source.name}" must be a non-empty string`);
+  }
+  if (source.filter !== undefined && typeof source.filter !== 'function') {
+    throw new TypeError(`Source filter of layer "${source.name}" must be a function`);
+  }
+  if (source.revision !== undefined && typeof source.revision !== 'string') {
+    throw new TypeError(`Source revision of layer "${source.name}" must be a string`);
+  }
 }

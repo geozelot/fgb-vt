@@ -31,10 +31,18 @@ function createMockSdk(store: ObjectStore) {
     if (!match) throw new Error(`Invalid Range header: ${Range}`);
 
     const start = Number(match[1]);
-    const end = Number(match[2]);
+    if (start >= data.length) {
+      const err = new Error('The requested range is not satisfiable');
+      Object.assign(err, { name: 'InvalidRange', $metadata: { httpStatusCode: 416 }, ActualObjectSize: String(data.length) });
+      throw err;
+    }
+    const end = Math.min(Number(match[2]), data.length - 1);
     const slice = data.slice(start, end + 1);
 
+    // Like S3: the satisfiable part of the range, with ContentRange
     return {
+      ContentRange: `bytes ${start}-${end}/${data.length}`,
+      ContentLength: slice.length,
       Body: {
         transformToByteArray: async () => new Uint8Array(slice),
       },
@@ -269,6 +277,7 @@ describe('S3Connector', () => {
       const sdk = createMockSdk(STORE);
       // Override send to return an async iterable instead of transformToByteArray
       sdk.sendFn.mockResolvedValueOnce({
+        ContentRange: 'bytes 10-14/100',
         Body: {
           async *[Symbol.asyncIterator]() {
             yield new Uint8Array([10, 11]);

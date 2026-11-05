@@ -21,8 +21,7 @@
  *
  * @example
  * ```typescript
- * import { TileServer } from 'fgb-vt';
- * import { HttpConnector, LocalConnector } from 'fgb-vt/connectors';
+ * import { TileServer, LocalConnector } from '@geozelot/fgb-vt';
  *
  * // Single connector with multiple sources
  * const server = new TileServer({
@@ -44,17 +43,21 @@ import type { Connector } from './connectors/connector.js';
 import type { Source, TileOptions } from './source.js';
 import type { TileJSON } from './types.js';
 import {
+  computeTileETag,
+  flatten,
   processMultiConnectorTile,
+  withSource,
   type ConnectorSourceGroup,
   type RequestOptions,
 } from './pipeline.js';
-import { resolveOptions } from './source.js';
+import { resolveOptions, validateSource } from './source.js';
 import { MemoryCache } from './cache.js';
-import { createIoContext, getSource, type IoContext, type IoOptions } from './fgb/reader.js';
+import { createIoContext, forgetSources, invalidateSource, type IoContext, type IoOptions } from './fgb/reader.js';
 import { resolveFrame } from './geometry/crs.js';
 import { openSources, type OpenOptions } from './client.js';
 import { featureSchema, emittedColumns } from './schema.js';
 import { withPath } from './errors.js';
+import { MAX_ZOOM } from './tiles.js';
 
 /**
  * Options for {@link TileServer.tileJSON}.
@@ -171,6 +174,8 @@ export class TileServer {
    * @param options - Tile-level tiling option defaults applied to all sources
    *   unless overridden by per-source options, plus I/O options (cache,
    *   prefetch, range merging, scan budget) and a default `onTile` hook.
+   * @throws {TypeError} If a source has no name or path.
+   * @throws {RangeError} If an option is invalid.
    */
   constructor(
     layers: TileServerLayer | TileServerLayer[],
@@ -186,6 +191,13 @@ export class TileServer {
       connector: layer.connector,
       sources: Array.isArray(layer.sources) ? layer.sources : [layer.sources],
     }));
+    // Fail at construction, not on every tile
+    for (const group of this.groups) {
+      for (const source of group.sources) {
+        validateSource(source);
+        resolveOptions(source.options, options);
+      }
+    }
   }
 
   /**
@@ -202,8 +214,9 @@ export class TileServer {
    * @returns PBF-encoded Mapbox Vector Tile. Returns an empty tile if no
    *   features intersect the requested tile bounds.
    * @throws {RangeError} If `z/x/y` is not a valid tile.
-   * @throws {FgbVtError} If a source cannot be read (annotated with its path)
-   *   or a budget is exceeded.
+   * @throws {FgbVtError} If a source cannot be read or a budget is exceeded
+   *   (annotated with the source path); I/O failures are a
+   *   {@link ConnectorError} whose `status` maps to an HTTP status.
    */
   async tile(z: number, x: number, y: number, request?: RequestOptions): Promise<Uint8Array> {
     this.assertOpen();
@@ -214,6 +227,50 @@ export class TileServer {
       this.context,
       { onTile: this.onTile, ...request },
     );
+  }
+
+  /**
+   * Compute the ETag of a tile without rendering it, e.g. to answer
+   * `If-None-Match` with `304 Not Modified` (or to let a CDN revalidate).
+   * It changes whenever a source file, a setting or the library's tile
+   * encoding changes; sources outside their zoom range are not opened.
+   *
+   * @param z - Tile zoom level.
+   * @param x - Tile column.
+   * @param y - Tile row.
+   * @param request - Optional abort signal.
+   * @returns A strong, quoted ETag, or `null` when a source's connector
+   *   reports no version tag.
+   * @throws {FgbVtError} If a source cannot be opened (annotated with its path).
+   *
+   * @example
+   * ```typescript
+   * const etag = await server.tileETag(z, x, y);
+   * if (etag && req.headers['if-none-match'] === etag) return res.writeHead(304).end();
+   * const pbf = await server.tile(z, x, y);
+   * res.writeHead(200, { 'Content-Type': 'application/vnd.mapbox-vector-tile', ...(etag ? { ETag: etag } : {}) });
+   * ```
+   */
+  async tileETag(z: number, x: number, y: number, request?: Pick<RequestOptions, 'signal'>): Promise<string | null> {
+    this.assertOpen();
+    return computeTileETag(flatten(this.groups), z, x, y, this.options, this.context, request?.signal);
+  }
+
+  /**
+   * Forget what is cached about a file, so the next request re-reads its
+   * header and index, e.g. after the file was replaced at the same path.
+   * Without a path, every configured source is forgotten.
+   *
+   * Files with version tags (ETags, file metadata) are detected as changed
+   * automatically; this is for connectors and servers that report none.
+   *
+   * @param path - Source path, or omitted for all sources.
+   * @returns Resolves when the entries are removed from the cache.
+   */
+  async invalidate(path?: string): Promise<void> {
+    this.assertOpen();
+    const entries = flatten(this.groups).filter(([, source]) => path === undefined || source.path === path);
+    await Promise.all(entries.map(([connector, source]) => invalidateSource(connector, source.path, this.context)));
   }
 
   /**
@@ -250,7 +307,7 @@ export class TileServer {
    *   invalid, the root of its spatial index, converted to WGS 84. Without
    *   either (an unindexed file without envelope) the world is assumed.
    * - **`minzoom` / `maxzoom`**: the lowest `minZoom` and highest `maxZoom`
-   *   of the sources.
+   *   of the sources, as the zoom levels served (integers from 0 to 30).
    * - **`fields`**: the columns actually written as properties, after the
    *   source's `properties` selection and without the id column (unless
    *   kept) and binary columns.
@@ -267,10 +324,11 @@ export class TileServer {
     const sources = this.groups.flatMap(group => group.sources.map(source => ({ group, source })));
     const opened = await Promise.all(sources.map(async ({ group, source }) => {
       try {
-        const fgb = await getSource(group.connector, source.path, this.context);
-        const frame = resolveFrame(fgb.header.crs, source.crs, source.path);
-        const extent = await fgb.bounds();
-        return { header: fgb.header, bounds: extent ? frame.toWgs84BBox(extent) : null };
+        return await withSource(group.connector, source, this.context, undefined, async (fgb) => {
+          const frame = resolveFrame(fgb.header.crs, source.crs, source.path);
+          const extent = await fgb.bounds();
+          return { header: fgb.header, bounds: extent ? frame.toWgs84BBox(extent) : null };
+        });
       } catch (err) {
         throw withPath(err, source.path);
       }
@@ -278,13 +336,13 @@ export class TileServer {
 
     const vectorLayers: TileJSON['vector_layers'] = [];
     let bounds: [number, number, number, number] = [180, 90, -180, -90];
-    const defaults = resolveOptions(undefined, this.options);
+    const defaults = zoomRange(resolveOptions(undefined, this.options));
     let minzoom = sources.length > 0 ? Infinity : defaults.minZoom;
     let maxzoom = sources.length > 0 ? -Infinity : defaults.maxZoom;
 
     sources.forEach(({ source }, i) => {
       const { header, bounds: b } = opened[i];
-      const opts = resolveOptions(source.options, this.options);
+      const opts = zoomRange(resolveOptions(source.options, this.options));
 
       const fields: Record<string, string> = {};
       for (const col of emittedColumns(featureSchema(source), header)) {
@@ -353,7 +411,10 @@ export class TileServer {
    */
   async close(): Promise<void> {
     this.closed = true;
-    this.ownCache?.clear();
+    if (this.ownCache) {
+      forgetSources(this.ownCache);
+      this.ownCache.clear();
+    }
 
     // Close all unique connectors
     const connectors = new Set(this.groups.map(g => g.connector));
@@ -406,4 +467,19 @@ function columnTypeToString(type: number): string {
     case 14: return 'String';  // Binary
     default: return 'String';
   }
+}
+
+/**
+ * The zoom levels a source is served at, for TileJSON: `minZoom` and
+ * `maxZoom` may be any numbers (e.g. `Infinity` for no limit), but tiles
+ * exist only at integer zooms from 0 to {@link MAX_ZOOM}.
+ *
+ * @param opts - Resolved options.
+ * @returns The lowest and highest zoom served.
+ */
+function zoomRange(opts: { minZoom: number; maxZoom: number }): { minZoom: number; maxZoom: number } {
+  return {
+    minZoom: Math.min(MAX_ZOOM, Math.max(0, Math.ceil(opts.minZoom))),
+    maxZoom: Math.min(MAX_ZOOM, Math.max(0, Math.floor(opts.maxZoom))),
+  };
 }
