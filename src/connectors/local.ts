@@ -12,7 +12,7 @@
 import { open, stat, type FileHandle } from 'node:fs/promises';
 import type { Stats } from 'node:fs';
 import type { Connector, ConnectorHints, ReadHeadResult, ReadOptions } from './connector.js';
-import { SourceChangedError } from '../errors.js';
+import { ConnectorError, FgbVtError, SourceChangedError } from '../errors.js';
 
 /**
  * Maximum number of bytes per individual `FileHandle.read()` call.
@@ -69,7 +69,7 @@ interface PoolEntry {
  *
  * @example
  * ```typescript
- * import { LocalConnector } from 'fgb-vt';
+ * import { LocalConnector } from '@geozelot/fgb-vt';
  *
  * const connector = new LocalConnector({ maxOpenFiles: 128 });
  *
@@ -83,6 +83,8 @@ interface PoolEntry {
 export class LocalConnector implements Connector {
   /** Local reads are cheap: merge only near-adjacent ranges, read a modest prefix. */
   readonly hints: ConnectorHints = { coalesceGap: 4 * 1024, prefetch: 64 * 1024 };
+  /** Paths name files on this machine, relative ones from the working directory. */
+  readonly cacheNamespace = `local:${process.cwd()}`;
 
   private readonly maxOpenFiles: number;
   /** LRU pool: Map preserves insertion order; most recently used is moved to end */
@@ -104,16 +106,17 @@ export class LocalConnector implements Connector {
    * access). The returned `Uint8Array` may be shorter than `length` if
    * the file is smaller than `offset + length`.
    *
-   * With {@link ReadOptions.ifMatch}, the file's current version tag
-   * (inode, size and modification time) is checked first.
+   * With {@link ReadOptions.ifMatch}, the version tag (inode, size and
+   * modification time) of the file the read goes through is checked
+   * first.
    *
    * @param path - Absolute or relative filesystem path to the FGB file.
    * @param offset - Zero-based byte offset to begin reading from.
    * @param length - Number of bytes to read.
    * @param options - Optional version check and abort signal.
    * @returns The requested byte range.
-   * @throws {Error} If the file cannot be opened or read (e.g. `ENOENT`,
-   *   `EACCES`), or the read was aborted.
+   * @throws {ConnectorError} If the file cannot be opened or read (`status`
+   *   404 for `ENOENT`, 403 for `EACCES`/`EPERM`).
    * @throws {SourceChangedError} If `ifMatch` no longer matches the file.
    * @throws {RangeError} If `offset` or `length` is negative or not an integer.
    */
@@ -123,21 +126,7 @@ export class LocalConnector implements Connector {
     }
     options?.signal?.throwIfAborted();
     if (length === 0) return new Uint8Array(0);
-
-    if (options?.ifMatch !== undefined) {
-      const current = versionTag(await stat(path));
-      if (current !== options.ifMatch) {
-        this.evict(path);
-        throw new SourceChangedError(`${path} changed since it was opened`, { path });
-      }
-    }
-
-    const entry = this.acquire(path);
-    try {
-      return await readFromHandle(await entry.handle, offset, length);
-    } finally {
-      this.release(entry);
-    }
+    return (await this.readBatch(path, [{ offset, length }], options))[0];
   }
 
   /**
@@ -170,6 +159,8 @@ export class LocalConnector implements Connector {
         }
         const bytes = length === 0 ? new Uint8Array(0) : await readFromHandle(handle, 0, length);
         return { bytes, size: opened.size, etag: versionTag(opened) };
+      } catch (err) {
+        throw ioError(err, path);
       } finally {
         this.release(entry);
       }
@@ -194,19 +185,14 @@ export class LocalConnector implements Connector {
     ranges: ReadonlyArray<{ offset: number; length: number }>,
     options?: ReadOptions,
   ): Promise<Uint8Array[]> {
-    // Check the version once for the whole batch, then read in parallel
     options?.signal?.throwIfAborted();
-    if (options?.ifMatch !== undefined && ranges.length > 0) {
-      const current = versionTag(await stat(path));
-      if (current !== options.ifMatch) {
-        this.evict(path);
-        throw new SourceChangedError(`${path} changed since it was opened`, { path });
+    for (const { offset, length } of ranges) {
+      if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 0) {
+        throw new RangeError(`Invalid byte range for ${path}: offset ${offset}, length ${length}`);
       }
     }
-    const perRange = options?.signal ? { signal: options.signal } : undefined;
-    return Promise.all(
-      ranges.map(({ offset, length }) => this.read(path, offset, length, perRange)),
-    );
+    if (ranges.length === 0) return [];
+    return this.readBatch(path, ranges, options);
   }
 
   /**
@@ -222,6 +208,38 @@ export class LocalConnector implements Connector {
     const entries = [...this.pool.values()];
     this.pool.clear();
     await Promise.all(entries.map(entry => retire(entry)));
+  }
+
+  /**
+   * Read ranges through one pooled handle, after checking that handle's
+   * file against `ifMatch` (the handle may belong to a file that has since
+   * been replaced at `path`; reads through it are then refused).
+   *
+   * @param path - Filesystem path.
+   * @param ranges - Validated byte ranges.
+   * @param options - Optional version check.
+   * @returns One chunk per range.
+   */
+  private async readBatch(
+    path: string,
+    ranges: ReadonlyArray<{ offset: number; length: number }>,
+    options?: ReadOptions,
+  ): Promise<Uint8Array[]> {
+    const entry = this.acquire(path);
+    try {
+      const handle = await entry.handle;
+      if (options?.ifMatch !== undefined && versionTag(await handle.stat()) !== options.ifMatch) {
+        this.evict(path);
+        throw new SourceChangedError(`${path} changed since it was opened`, { path });
+      }
+      return await Promise.all(
+        ranges.map(({ offset, length }) => (length === 0 ? new Uint8Array(0) : readFromHandle(handle, offset, length))),
+      );
+    } catch (err) {
+      throw ioError(err, path);
+    } finally {
+      this.release(entry);
+    }
   }
 
   // == Handle pool ====================================================
@@ -329,6 +347,27 @@ async function readFromHandle(handle: FileHandle, offset: number, length: number
   }
 
   return new Uint8Array(buf.buffer, buf.byteOffset, totalRead);
+}
+
+/**
+ * Turn a filesystem error into a {@link ConnectorError} with the HTTP
+ * status it corresponds to; fgb-vt errors and aborts pass through.
+ *
+ * @param err - Thrown value.
+ * @param path - File path.
+ * @returns The error to throw.
+ */
+function ioError(err: unknown, path: string): unknown {
+  if (err instanceof FgbVtError || !(err instanceof Error)) return err;
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code === undefined || err.name === 'AbortError') return err;
+  const status = code === 'ENOENT' || code === 'ENOTDIR' ? 404
+    : code === 'EACCES' || code === 'EPERM' ? 403
+      : undefined;
+  const retryable = code === 'EMFILE' || code === 'ENFILE' || code === 'EAGAIN' || code === 'EBUSY';
+  return new ConnectorError(`Cannot read ${path}: ${err.message}`, {
+    path, retryable, cause: err, ...(status !== undefined ? { status } : {}),
+  });
 }
 
 /**

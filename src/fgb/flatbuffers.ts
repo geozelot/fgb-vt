@@ -12,8 +12,11 @@
  * FlatBuffers runtime.
  */
 
-/** Shared {@link TextDecoder} instance for UTF-8 string decoding. */
-const textDecoder = new TextDecoder();
+/**
+ * Shared {@link TextDecoder} instance for UTF-8 string decoding. A leading
+ * U+FEFF is data (part of a name or value), not a byte order mark.
+ */
+const textDecoder = new TextDecoder('utf-8', { ignoreBOM: true });
 
 /**
  * Low-level, read-only FlatBuffers decoder backed by a {@link DataView}.
@@ -158,13 +161,14 @@ export class FlatBufferReader {
    * @param offset - Byte offset of the string's length prefix, relative to
    *   the start of the view.
    * @returns The decoded string.
+   * @throws {RangeError} If the string extends beyond the view.
    */
   readString(offset: number): string {
     // Strings in FlatBuffers: uint32 length prefix, then UTF-8 bytes
     const len = this.view.getUint32(offset, true);
-    const start = this.bytes.byteOffset + (this.view.byteOffset - this.bytes.byteOffset) + offset + 4;
+    this.checkRange(offset + 4, len);
     return textDecoder.decode(
-      new Uint8Array(this.bytes.buffer, start, len),
+      new Uint8Array(this.view.buffer, this.view.byteOffset + offset + 4, len),
     );
   }
 
@@ -272,9 +276,11 @@ export class FlatBufferReader {
    * @param offset - Byte offset of the first `float64`, relative to the view.
    * @param count - Number of `float64` elements to read.
    * @returns A freshly allocated `Float64Array` of length `count`.
+   * @throws {RangeError} If the range extends beyond the view.
    */
   readFloat64Array(offset: number, count: number): Float64Array {
-    const byteOffset = this.bytes.byteOffset + (this.view.byteOffset - this.bytes.byteOffset) + offset;
+    this.checkRange(offset, count * 8);
+    const byteOffset = this.view.byteOffset + offset;
 
     // Fast path: block copy when 8-byte aligned
     if (byteOffset % 8 === 0) {
@@ -291,6 +297,28 @@ export class FlatBufferReader {
   }
 
   /**
+   * Copy a contiguous sequence of `float64` values into `out` at `outOffset`.
+   *
+   * @param offset - Byte offset of the first `float64`, relative to the view.
+   * @param count - Number of `float64` elements to copy.
+   * @param out - Destination array.
+   * @param outOffset - Element index in `out` where the values go.
+   * @throws {RangeError} If the range extends beyond the view or `out`.
+   */
+  readFloat64Into(offset: number, count: number, out: Float64Array, outOffset: number): void {
+    this.checkRange(offset, count * 8);
+    const byteOffset = this.view.byteOffset + offset;
+    if (byteOffset % 8 === 0) {
+      out.set(new Float64Array(this.view.buffer, byteOffset, count), outOffset);
+      return;
+    }
+    if (outOffset + count > out.length) throw new RangeError('Destination array too small');
+    for (let i = 0; i < count; i++) {
+      out[outOffset + i] = this.view.getFloat64(offset + i * 8, true);
+    }
+  }
+
+  /**
    * Return a `Uint8Array` view over a range of the underlying buffer.
    *
    * No data is copied; the returned array shares the same `ArrayBuffer`.
@@ -298,30 +326,31 @@ export class FlatBufferReader {
    * @param offset - Byte offset relative to the start of the view.
    * @param length - Number of bytes to include.
    * @returns A `Uint8Array` slice of the underlying buffer.
+   * @throws {RangeError} If the range extends beyond the view.
    */
   readBytes(offset: number, length: number): Uint8Array {
-    const byteOffset = this.bytes.byteOffset + (this.view.byteOffset - this.bytes.byteOffset) + offset;
-    return new Uint8Array(this.bytes.buffer, byteOffset, length);
+    this.checkRange(offset, length);
+    return new Uint8Array(this.view.buffer, this.view.byteOffset + offset, length);
   }
 
   /**
-   * Read a contiguous sequence of `uint32` values into a `Uint32Array`.
+   * Read a contiguous sequence of `uint32` values into a new `Uint32Array`.
    *
-   * When the source data is 4-byte aligned, a direct typed array view is
-   * returned (zero-copy). Otherwise, values are read individually through
-   * the `DataView` to guarantee correct decoding.
+   * Like {@link readFloat64Array}, the result owns its memory, so it does
+   * not keep the (possibly multi-megabyte) source buffer alive.
    *
    * @param offset - Byte offset of the first `uint32`, relative to the view.
    * @param count - Number of `uint32` elements to read.
-   * @returns A `Uint32Array` of length `count` — either a zero-copy view
-   *   (when aligned) or a freshly allocated copy.
+   * @returns A freshly allocated `Uint32Array` of length `count`.
+   * @throws {RangeError} If the range extends beyond the view.
    */
   readUint32Array(offset: number, count: number): Uint32Array {
-    const byteOffset = this.bytes.byteOffset + (this.view.byteOffset - this.bytes.byteOffset) + offset;
+    this.checkRange(offset, count * 4);
+    const byteOffset = this.view.byteOffset + offset;
 
-    // Fast path: direct view when 4-byte aligned
+    // Fast path: block copy when 4-byte aligned
     if (byteOffset % 4 === 0) {
-      return new Uint32Array(this.bytes.buffer, byteOffset, count);
+      return new Uint32Array(this.view.buffer, byteOffset, count).slice();
     }
 
     // Slow path: unaligned — copy element-by-element
@@ -330,5 +359,22 @@ export class FlatBufferReader {
       result[i] = this.readUint32(offset + i * 4);
     }
     return result;
+  }
+
+  /**
+   * Check that `length` bytes from `offset` lie inside the view.
+   *
+   * Typed array constructors only check against the whole `ArrayBuffer`,
+   * which may hold neighbouring features: without this check a corrupt
+   * length would read them as data.
+   *
+   * @param offset - Byte offset relative to the start of the view.
+   * @param length - Number of bytes.
+   * @throws {RangeError} If the range is negative or extends beyond the view.
+   */
+  private checkRange(offset: number, length: number): void {
+    if (!(offset >= 0 && length >= 0 && offset + length <= this.view.byteLength)) {
+      throw new RangeError(`Range ${offset}+${length} is outside the buffer (${this.view.byteLength} bytes)`);
+    }
   }
 }

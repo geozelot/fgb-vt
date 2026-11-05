@@ -24,7 +24,7 @@
  */
 
 import type { BBox, CrsInfo } from '../types.js';
-import { UnsupportedFormatError } from '../errors.js';
+import { UnsupportedFormatError, redactPath } from '../errors.js';
 import { projectX, projectY, projectToMercator } from './project.js';
 import { mercatorToWgs84BBox } from '../tiles.js';
 
@@ -185,7 +185,7 @@ export function resolveFrame(crs: CrsInfo | null, override: SourceCrs | undefine
       return WEB_MERCATOR_FRAME;
     default:
       throw new UnsupportedFormatError(
-        `${path} uses ${describeCrs(crs!)}; only WGS 84 longitude/latitude and Web Mercator (EPSG:3857) ` +
+        `${redactPath(path)} uses ${describeCrs(crs!)}; only WGS 84 longitude/latitude and Web Mercator (EPSG:3857) ` +
         'are built in. Set the source\'s crs to a projection to read it.',
         { path },
       );

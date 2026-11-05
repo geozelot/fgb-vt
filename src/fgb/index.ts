@@ -1,6 +1,6 @@
 /** @module fgb/index
  *
- * Packed Hilbert R-tree spatial index query.
+ * Packed Hilbert R-tree layout.
  *
  * The FGB v3 spatial index is a static packed R-tree where:
  * - Each node is exactly 40 bytes: 4 x `float64` for the bounding box
@@ -12,174 +12,14 @@
  * - Internal node offsets store the node index of their first child.
  * - The tree is built from features sorted by their Hilbert curve value.
  *
- * The query traverses the tree top-down using an explicit stack, following
- * child pointers stored in internal node offsets. Leaf nodes whose bboxes
- * intersect the query extent are collected, and their stored byte offsets
- * are converted to absolute file positions. Returned ranges are sorted by
- * file offset and merged to minimize the number of read operations
- * required by the I/O layer.
+ * This module computes the layout (level bounds and tree size); the
+ * search itself streams index pages in {@link FgbSource} (`fgb/reader`).
  */
 
-import type { BBox } from '../types.js';
 import { FormatError } from '../errors.js';
 
 /** Byte size of a single packed R-tree node (4 x f64 bbox + 1 x u64 offset). */
 const NODE_ITEM_SIZE = 40;
-
-/**
- * A contiguous byte range within the FGB file, expressed as an absolute
- * file offset and a byte length.
- */
-export interface ByteRange {
-  /** Absolute byte offset from the start of the file. */
-  offset: number;
-  /** Number of bytes in this range. */
-  length: number;
-}
-
-/**
- * Query the packed Hilbert R-tree to find feature byte ranges that
- * intersect the given bounding box.
- *
- * The traversal proceeds top-down from the root. Internal nodes store
- * the node index of their first child in the offset field (bytes 32–39);
- * the query reads this pointer directly to locate children, clamping to
- * the child level's upper bound. Leaf nodes that pass the intersection
- * test are collected, and their stored byte offsets (relative to the
- * feature data section) are converted to absolute file positions using
- * `featuresOffset`. Adjacent or nearby ranges are merged before returning
- * to reduce the number of discrete I/O operations.
- *
- * @param indexBytes - Raw bytes of the spatial index section of the file.
- * @param featuresCount - Total number of features (leaf-level node count).
- * @param nodeSize - Branching factor of the R-tree (max children per
- *   internal node).
- * @param featuresOffset - Absolute byte offset where feature data begins
- *   in the file; added to each relative feature offset stored in the index.
- * @param bbox - Query bounding box. Coordinate reference system must match
- *   the index (typically WGS 84).
- * @param cachedLevelBounds - Optional precomputed `[start, end)` node-index
- *   ranges per tree level, as returned by {@link computeLevelBounds} for the
- *   same `featuresCount` and `nodeSize`. Pass it to skip recomputing the
- *   level layout on every query; when omitted it is computed on demand.
- * @returns Sorted, merged array of {@link ByteRange} entries representing
- *   the file regions that contain matching features. Returns an empty array
- *   if no features intersect or if the index is empty.
- */
-export function queryIndex(
-  indexBytes: Uint8Array,
-  featuresCount: number,
-  nodeSize: number,
-  featuresOffset: number,
-  bbox: BBox,
-  cachedLevelBounds?: Array<[number, number]>,
-): ByteRange[] {
-  if (featuresCount === 0 || nodeSize === 0) return [];
-
-  const view = new DataView(indexBytes.buffer, indexBytes.byteOffset, indexBytes.byteLength);
-
-  // Use cached level bounds or compute fresh
-  const levelBounds = cachedLevelBounds ?? computeLevelBounds(featuresCount, nodeSize);
-  const numLevels = levelBounds.length;
-
-  // Leaf level bounds (level 0)
-  const leafEnd = levelBounds[0][1];
-
-  // Collect matching leaf node indices
-  const matchingLeafIndices: number[] = [];
-
-  // Stack-based top-down traversal: [nodeIndex, level]
-  const stack: number[] = [];
-
-  // Start from root level (highest level index)
-  const rootLevel = numLevels - 1;
-  const [rootStart, rootEnd] = levelBounds[rootLevel];
-
-  for (let i = rootStart; i < rootEnd; i++) {
-    stack.push(i, rootLevel);
-  }
-
-  while (stack.length > 0) {
-    const level = stack.pop()!;
-    const nodeIdx = stack.pop()!;
-
-    // Read node bbox
-    const nodeByteOff = nodeIdx * NODE_ITEM_SIZE;
-    if (nodeByteOff + NODE_ITEM_SIZE > indexBytes.length) {
-      throw new FormatError(`Corrupt FlatGeobuf index: node ${nodeIdx} lies beyond the index (${indexBytes.length} bytes)`);
-    }
-
-    const nodeMinX = view.getFloat64(nodeByteOff, true);
-    const nodeMinY = view.getFloat64(nodeByteOff + 8, true);
-    const nodeMaxX = view.getFloat64(nodeByteOff + 16, true);
-    const nodeMaxY = view.getFloat64(nodeByteOff + 24, true);
-
-    // Intersection test
-    if (nodeMaxX < bbox.minX || nodeMinX > bbox.maxX ||
-        nodeMaxY < bbox.minY || nodeMinY > bbox.maxY) {
-      continue;
-    }
-
-    if (level === 0) {
-      // Leaf node: this is a feature reference
-      matchingLeafIndices.push(nodeIdx);
-    } else {
-      // Internal node: read first-child index from offset field
-      const firstChild = readUint64AsNumber(view, nodeByteOff + 32);
-      const [childLevelStart, childLevelEnd] = levelBounds[level - 1];
-      if (firstChild < childLevelStart || firstChild >= childLevelEnd) {
-        throw new FormatError(`Corrupt FlatGeobuf index: node ${nodeIdx} points to child ${firstChild} outside its level`);
-      }
-      const childEnd = Math.min(firstChild + nodeSize, childLevelEnd);
-
-      for (let i = firstChild; i < childEnd; i++) {
-        stack.push(i, level - 1);
-      }
-    }
-  }
-
-  if (matchingLeafIndices.length === 0) return [];
-
-  // Sort by node index for sequential access and offset derivation
-  matchingLeafIndices.sort((a, b) => a - b);
-
-  // Convert leaf indices to byte ranges.
-  // Leaf nodes store byte offsets (relative to featuresOffset) in their
-  // offset field. Feature length is derived from the difference to the
-  // next leaf's offset, since features are stored contiguously in
-  // Hilbert-sorted order matching the leaf order.
-  const ranges: ByteRange[] = [];
-  for (const nodeIdx of matchingLeafIndices) {
-    const nodeByteOff = nodeIdx * NODE_ITEM_SIZE;
-    const featureByteOffset = readUint64AsNumber(view, nodeByteOff + 32);
-
-    let featureLength: number;
-    if (nodeIdx + 1 < leafEnd) {
-      const nextByteOffset = readUint64AsNumber(view, (nodeIdx + 1) * NODE_ITEM_SIZE + 32);
-      featureLength = nextByteOffset - featureByteOffset;
-    } else {
-      // Last feature: exact length unknown. Estimate from the previous
-      // leaf's size (if available), clamped to a reasonable range.
-      // This avoids the wasteful 1 MB over-fetch for small features while
-      // still covering large features via the 4x multiplier.
-      if (nodeIdx > levelBounds[0][0]) {
-        const prevByteOffset = readUint64AsNumber(view, (nodeIdx - 1) * NODE_ITEM_SIZE + 32);
-        const prevLen = featureByteOffset - prevByteOffset;
-        featureLength = Math.max(256, Math.min(prevLen * 4, 256 * 1024));
-      } else {
-        // Single feature in the file — use a moderate default
-        featureLength = 64 * 1024;
-      }
-    }
-
-    ranges.push({
-      offset: featuresOffset + featureByteOffset,
-      length: featureLength,
-    });
-  }
-
-  return mergeRanges(ranges);
-}
 
 // == Internals ==============================================================
 
@@ -271,54 +111,4 @@ export function computeLevelBounds(
   }
 
   return levelBounds;
-}
-
-/**
- * Read an unsigned 64-bit integer from a `DataView` as a JavaScript
- * `number`, reconstructed from two 32-bit halves.
- *
- * @param view - DataView to read from.
- * @param offset - Byte offset of the `uint64` within the view.
- * @returns The `uint64` value approximated as a `number`.
- */
-function readUint64AsNumber(view: DataView, offset: number): number {
-  const lo = view.getUint32(offset, true);
-  const hi = view.getUint32(offset + 4, true);
-  return hi * 0x100000000 + lo;
-}
-
-/**
- * Merge overlapping or adjacent byte ranges to minimize the number of
- * discrete read operations.
- *
- * Two ranges are merged if the start of the second falls within `gap`
- * bytes of the end of the first. This coalesces nearby reads into a
- * single larger read, trading a small amount of over-fetching for fewer
- * I/O round-trips.
- *
- * @param ranges - Byte ranges sorted in ascending order by offset.
- * @param gap - Maximum byte distance between two ranges that still
- *   triggers a merge. Defaults to `512`.
- * @returns A new array of merged byte ranges.
- */
-function mergeRanges(ranges: ByteRange[], gap: number = 512): ByteRange[] {
-  if (ranges.length <= 1) return ranges;
-
-  const merged: ByteRange[] = [{ ...ranges[0] }];
-
-  for (let i = 1; i < ranges.length; i++) {
-    const prev = merged[merged.length - 1];
-    const curr = ranges[i];
-    const prevEnd = prev.offset + prev.length;
-
-    // Merge if overlapping or within `gap` bytes of each other
-    if (curr.offset <= prevEnd + gap) {
-      const newEnd = Math.max(prevEnd, curr.offset + curr.length);
-      prev.length = newEnd - prev.offset;
-    } else {
-      merged.push({ ...curr });
-    }
-  }
-
-  return merged;
 }

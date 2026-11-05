@@ -50,34 +50,46 @@ export const handler = async (event, context) => {
   // Leave a second to answer before the function times out
   const signal = AbortSignal.timeout(context.getRemainingTimeInMillis() - 1000);
   try {
+    // Revalidation (from a CDN or browser) costs only the cached headers
+    const etag = await client.tileETag(z, x, y, sources, { signal });
+    const cacheHeaders = { 'cache-control': 'public, max-age=3600', ...(etag ? { etag } : {}) };
+    if (etag && event.headers?.['if-none-match'] === etag) return { statusCode: 304, headers: cacheHeaders };
+
     const pbf = await client.tile(z, x, y, sources, { signal });
-    if (pbf.length === 0) return { statusCode: 204 };
+    if (pbf.length === 0) return { statusCode: 204, headers: cacheHeaders };
     return {
       statusCode: 200,
       headers: {
+        ...cacheHeaders,
         'content-type': 'application/vnd.mapbox-vector-tile',
         'content-encoding': 'gzip',
-        'cache-control': 'public, max-age=3600',
       },
       isBase64Encoded: true,
       body: gzipSync(pbf).toString('base64'),
     };
   } catch (err) {
-    return { statusCode: statusFor(err) };
+    const status = statusFor(err);
+    const retryAfter = err instanceof ConnectorError && err.retryAfterMs ? Math.ceil(err.retryAfterMs / 1000) : null;
+    return { statusCode: status, ...(retryAfter ? { headers: { 'retry-after': String(retryAfter) } } : {}) };
   }
 };
 
 function statusFor(err: unknown): number {
   if (err instanceof RangeError) return 400;                  // invalid z/x/y
   if (err instanceof LimitExceededError) return 422;           // tile too large for the budgets
-  if (err instanceof ConnectorError) return err.retryable ? 503 : 502;
+  if (err instanceof ConnectorError) {
+    if (err.status === 404) return 404;                        // the file is gone
+    return err.retryable ? 503 : 502;                          // throttled or down: retry later
+  }
   if (err instanceof FormatError) return 500;                  // broken file: log it
   if ((err as Error)?.name === 'TimeoutError') return 504;
   return 500;
 }
 ```
 
-Responses through API Gateway or function URLs are base64-encoded, which adds a third: a 6 MB response limit leaves about 4.5 MB of (gzipped) tile, hence `maxTileBytes` above.
+Messages of fgb-vt errors show URLs without their query, so presigned URLs do not leak into logs through `err.message`; `err.path` holds the path as given.
+
+Responses through API Gateway or function URLs are base64-encoded, which adds a third: a 6 MB response limit leaves about 4.5 MB of (gzipped) tile, hence `maxTileBytes` above. With `reduceToFit: true`, a tile over the limit is encoded again with coarser simplification and point thinning before it fails; `TileStats.reduced` counts how often that happens, a sign that the zoom range needs an overview file.
 
 ## Budgets
 
@@ -119,4 +131,8 @@ Rising `indexBytes` on warm containers means the cache is too small for the traf
 
 ## Files that change
 
-Every read carries the version tag (S3 `ETag`) of the file as it was opened. If a file is replaced, the next tile notices the mismatch, drops the cached header and index pages, and reopens the file. Replacing files in place is therefore safe; for atomic switches of several files, write new keys and change the source paths instead.
+Every response is checked against the version tag (S3 `ETag`) of the file as it was opened. If a file is replaced, the next tile notices the mismatch, drops the cached header and index pages, and reopens the file. Replacing files in place is therefore safe; for atomic switches of several files, write new keys and change the source paths instead. Tile ETags change with the files, so CDNs revalidate replaced tiles.
+
+Connectors and HTTP servers that report no version tag (neither `ETag` nor `Last-Modified`) cannot detect a replacement before the data stops matching the cached index; call `client.invalidate(path)` after replacing such a file. Check new files with `npx @geozelot/fgb-vt check` before uploading them.
+
+A custom `ByteCache` backed by `/tmp` or a key-value store may fail (a full disk, an unreachable store): failed reads count as misses and failed writes are skipped, so tiles still render.

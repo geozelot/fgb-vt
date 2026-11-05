@@ -56,7 +56,7 @@ ogr2ogr -f FlatGeobuf poi-overview.fgb poi.fgb -dialect sqlite -sql "SELECT * FR
 
 ## Other writers
 
-The flatgeobuf JavaScript and Rust libraries also store features in index order.
+The flatgeobuf Rust library also stores features in index order. The JavaScript library (`flatgeobuf` on npm, tested with 4.6) writes no spatial index at all, and every number as a `Double` column (so there is no integer id column for feature ids): fine for small files, otherwise rewrite them with GDAL.
 
 **gogama/flatgeobuf (Go), v1.0.0:** do not use `FileWriter.IndexData`. Its index does not match the data it writes:
 
@@ -64,7 +64,7 @@ The flatgeobuf JavaScript and Rust libraries also store features in index order.
 - features are written in input order, while the index is in Hilbert order;
 - feature boxes ignore geometry `parts`, so multipolygons and collections stored as parts get empty boxes and can never be found.
 
-fgb-vt detects such files and raises `IndexMismatchError` (`useIndex: false` scans them instead, within `maxScanBytes`). To write valid files with gogama, build the index yourself and write it with `FileWriter.Index`, then the features in the same order with `FileWriter.Data`:
+fgb-vt detects such files and raises `IndexMismatchError` (`useIndex: false` scans them instead, within `maxScanBytes`), and `fgb-vt check` reports every affected index entry. To write valid files with gogama, build the index yourself and write it with `FileWriter.Index`, then the features in the same order with `FileWriter.Data`:
 
 1. compute each feature's box over all its coordinates, including those in `parts`;
 2. sort the features with `packedrtree.HilbertSort`;
@@ -75,4 +75,10 @@ fgb-vt detects such files and raises `IndexMismatchError` (`useIndex: false` sca
 
 ## Checking a file
 
-Tile it at a few zooms with fgb-vt. A file that reads without `IndexMismatchError` or `FormatError` has an index that matches its data in the areas read; `useIndex: false` against the indexed result is a quick cross-check for small files.
+```sh
+npx @geozelot/fgb-vt check out.fgb
+```
+
+It reads the whole file once: the header and CRS, every spatial index node (valid boxes, parents containing their children, leaf offsets in increasing order), and every feature (decoded, at the offset its index entry says, inside the entry's box). Tiling reads only what tiles need, so these defects otherwise show only when a tile reaches them. The exit code is 1 if the file has errors; `--json` prints a machine-readable report, e.g. for a check in the pipeline that writes the files. In code, `checkFile(connector, path)` returns the same report.
+
+The report also gives the **node overlap**: the total area of the index nodes above the leaves relative to the dataset extent. Values near 1 mean compact, spatially sorted nodes; large values mean tiles read many features they do not need.

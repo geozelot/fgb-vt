@@ -13,6 +13,10 @@ Usage: python3 test/fixtures/generate.py
 The gogama-*.fgb fixtures come from a second, independent writer
 (github.com/gogama/flatgeobuf); regenerate them with Go:
     cd test/fixtures/writers/gogama && go run . ../..
+
+The flatgeobuf-js-*.fgb fixtures come from the flatgeobuf JavaScript
+library; regenerate them with Node.js:
+    cd test/fixtures/writers/flatgeobuf-js && npm ci && node generate.mjs ../..
 """
 
 import json

@@ -50,8 +50,11 @@ const MAX_GEOMETRY_DEPTH = 4;
 /** Shared empty coordinate array for absent `xy` vectors. */
 const EMPTY_XY = new Float64Array(0);
 
-/** Shared {@link TextDecoder} instance for UTF-8 property string decoding. */
-const textDecoder = new TextDecoder();
+/**
+ * Shared {@link TextDecoder} instance for UTF-8 property string decoding. A
+ * leading U+FEFF is part of the value, not a byte order mark.
+ */
+const textDecoder = new TextDecoder('utf-8', { ignoreBOM: true });
 
 /**
  * Shared mutable result object for {@link readPropertyValue}, avoiding a
@@ -90,6 +93,37 @@ interface DecodeContext {
   headerMask: Uint8Array | null;
   /** Id column within the header schema, or `-1`. */
   headerId: number;
+}
+
+/**
+ * Work allowed for one feature's geometry, derived from its size.
+ *
+ * Every vector element of a well-formed feature occupies its own bytes, so
+ * the doubles and part entries visited can never exceed what the feature's
+ * bytes can hold. FlatBuffers offsets may alias, though: N `parts` entries
+ * pointing at one child table, nested four deep, would make a feature of a
+ * few kilobytes decode to N^4 parts. The budget turns that into an error.
+ */
+class GeometryBudget {
+  private doubles: number;
+  private parts: number;
+
+  constructor(featureBytes: number) {
+    this.doubles = Math.floor(featureBytes / 8);
+    this.parts = Math.floor(featureBytes / 4);
+  }
+
+  /** Account for reading `n` coordinate values. */
+  takeDoubles(n: number): void {
+    this.doubles -= n;
+    if (this.doubles < 0) throw new RangeError('geometry references more coordinates than the feature holds');
+  }
+
+  /** Account for visiting `n` geometry parts. */
+  takeParts(n: number): void {
+    this.parts -= n;
+    if (this.parts < 0) throw new RangeError('geometry references more parts than the feature holds');
+  }
 }
 
 /**
@@ -263,12 +297,13 @@ function decodeSingleFeature(
 
   const geomTableOffset = fb.indirect(geomFieldOff);
   const type = geometryType(fb, geomTableOffset, header.geometryType);
+  const budget = new GeometryBudget(bytes.length);
   let geoms: DecodedGeometry[];
   if (type >= GeomType.Point && type <= GeomType.MultiPolygon) {
-    const geom = decodeGeometry(fb, geomTableOffset, type);
+    const geom = decodeGeometry(fb, geomTableOffset, type, budget);
     geoms = geom ? [geom] : [];
   } else {
-    const collector = new Collector(ctx.curveTolerance);
+    const collector = new Collector(ctx.curveTolerance, budget);
     collect(fb, geomTableOffset, type, 0, collector);
     geoms = collector.result();
   }
@@ -342,11 +377,12 @@ interface DecodedGeometry {
 
 /**
  * Read a Geometry table's type (field 6), falling back to `fallback` when
- * the field is absent.
+ * the field is absent or `Unknown` (0, the schema default, which writers
+ * that store defaults explicitly write for every geometry).
  */
 function geometryType(fb: FlatBufferReader, tablePos: number, fallback: GeomType): GeomType {
   const typeFieldOff = fb.fieldOffset(tablePos, 6);
-  return typeFieldOff ? fb.readUint8(typeFieldOff) : fallback;
+  return (typeFieldOff ? fb.readUint8(typeFieldOff) : 0) || fallback;
 }
 
 /**
@@ -359,78 +395,80 @@ function geometryType(fb: FlatBufferReader, tablePos: number, fallback: GeomType
  * When the flat `xy` field is absent, the decoder falls back to the
  * nested `parts` vector (field 7), which is used by some writers (e.g.
  * GDAL) for multi-geometry types. In that case, coordinate arrays from
- * all parts are flattened into a single `xy` array with cumulative
+ * all parts are copied once into a single `xy` array with cumulative
  * `ends` indices.
  *
  * @param fb - FlatBuffer reader over the feature bytes.
  * @param tablePos - Absolute byte offset of the Geometry table.
  * @param type - Geometry type of this table (a part's own type field is
  *   not consulted: parts of a basic multi-geometry are its single variant).
+ * @param budget - Work allowed for this feature.
  * @param depth - Current recursion depth for nested parts decoding.
  *   Capped at {@link MAX_GEOMETRY_DEPTH} to guard against malicious nesting.
- * @returns Decoded geometry, or `null` if neither `xy` nor `parts` can
- *   provide coordinate data, or if the recursion depth limit is exceeded.
+ * @returns Decoded geometry, or `null` if neither `xy` nor `parts` provide
+ *   coordinates, or if the recursion depth limit is exceeded.
+ * @throws {RangeError} If `xy` or `ends` are inconsistent, or the budget
+ *   is exceeded (reported as a corrupt feature).
  */
 function decodeGeometry(
   fb: FlatBufferReader,
   tablePos: number,
   type: GeomType,
+  budget: GeometryBudget,
   depth: number = 0,
 ): DecodedGeometry | null {
   if (depth > MAX_GEOMETRY_DEPTH) return null;
 
   // xy (field 1) — vector of doubles (flat representation)
-  const xy = readXy(fb, tablePos);
-  if (xy === null) return null;
-  if (xy.length > 0) {
-    const ends = readEnds(fb, tablePos, xy.length / 2);
-    if (ends === undefined) return null;
-    return { type, xy, ends, parts: null };
+  const span = xySpan(fb, tablePos, budget);
+  if (span.count > 0) {
+    const ends = readEnds(fb, tablePos, span.count / 2);
+    return { type, xy: fb.readFloat64Array(span.start, span.count), ends, parts: null };
   }
 
   // Fallback: parts (field 7) — vector of nested Geometry tables.
   // Used by GDAL and other writers for multi-geometry features.
-  // Flatten all parts into a single xy array with cumulative ends.
-  const partOffsets = readParts(fb, tablePos);
+  const partOffsets = readParts(fb, tablePos, budget);
   if (partOffsets.length === 0) return null;
 
-  // Collect coordinates and ring ends from all parts, tracking which
-  // `allEnds` index starts each polygon part (for MultiPolygon exterior
-  // ring identification).
-  const allXy: Float64Array[] = [];
+  // First pass: locate each part's coordinates (nested parts, which basic
+  // types do not use, are decoded recursively)
+  const pieces: Array<{ span: XySpan | null; xy: Float64Array | null; ends: Uint32Array | null }> = [];
+  let total = 0;
+  for (const partOffset of partOffsets) {
+    const partSpan = xySpan(fb, partOffset, budget);
+    if (partSpan.count > 0) {
+      pieces.push({ span: partSpan, xy: null, ends: readEnds(fb, partOffset, partSpan.count / 2) });
+      total += partSpan.count;
+    } else {
+      const nested = decodeGeometry(fb, partOffset, type, budget, depth + 1);
+      if (!nested) continue;
+      pieces.push({ span: null, xy: nested.xy, ends: nested.ends });
+      total += nested.xy.length;
+    }
+  }
+  if (pieces.length === 0) return null;
+
+  // Second pass: copy all coordinates into one array, tracking which
+  // `allEnds` index starts each polygon part (its exterior ring; the rings
+  // up to the next start are its holes)
+  const xy = new Float64Array(total);
   const allEnds: number[] = [];
   const partStarts: number[] = [];
-  let coordPairCount = 0;
-
-  for (const partOffset of partOffsets) {
-    const partGeom = decodeGeometry(fb, partOffset, type, depth + 1);
-    if (!partGeom || partGeom.xy.length === 0) continue;
-
-    // Record the current allEnds index as the start of this polygon part.
-    // The ring at this index is the exterior ring; subsequent rings until
-    // the next partStart are holes of this polygon.
+  let pos = 0;
+  for (const piece of pieces) {
     partStarts.push(allEnds.length);
-
-    allXy.push(partGeom.xy);
-    const partPairs = partGeom.xy.length / 2;
-
-    if (partGeom.ends) {
-      // Part has multiple rings — accumulate with global offset
-      for (let j = 0; j < partGeom.ends.length; j++) {
-        allEnds.push(partGeom.ends[j] + coordPairCount);
-      }
+    const length = piece.span ? piece.span.count : piece.xy!.length;
+    if (piece.span) fb.readFloat64Into(piece.span.start, piece.span.count, xy, pos);
+    else xy.set(piece.xy!, pos);
+    const firstPair = pos / 2;
+    if (piece.ends) {
+      for (let j = 0; j < piece.ends.length; j++) allEnds.push(piece.ends[j] + firstPair);
     } else {
-      // Single-ring part
-      allEnds.push(coordPairCount + partPairs);
+      allEnds.push(firstPair + length / 2);
     }
-
-    coordPairCount += partPairs;
+    pos += length;
   }
-
-  if (allXy.length === 0) return null;
-
-  const xyAll = concatFloat64(allXy);
-  const ends = allEnds.length > 0 ? new Uint32Array(allEnds) : null;
 
   // For MultiPolygon with more than one polygon part, record the part
   // boundary indices so downstream stages can distinguish exterior rings
@@ -440,53 +478,76 @@ function decodeGeometry(
     ? new Uint32Array(partStarts)
     : null;
 
-  return { type, xy: xyAll, ends, parts };
+  return { type, xy, ends: allEnds.length > 0 ? new Uint32Array(allEnds) : null, parts };
+}
+
+/** Location of an `xy` vector's values within the feature buffer. */
+interface XySpan {
+  /** Byte offset of the first value. */
+  start: number;
+  /** Number of values (twice the number of coordinate pairs); `0` if absent. */
+  count: number;
+}
+
+/**
+ * Locate the `xy` vector (field 1) and charge it to the budget.
+ *
+ * @returns The span; `count` is `0` when the field is absent or empty.
+ * @throws {RangeError} If the vector holds an odd number of values.
+ */
+function xySpan(fb: FlatBufferReader, tablePos: number, budget: GeometryBudget): XySpan {
+  const xyFieldOff = fb.fieldOffset(tablePos, 1);
+  if (!xyFieldOff) return { start: 0, count: 0 };
+  const xyVecOffset = fb.indirect(xyFieldOff);
+  const count = fb.vectorLen(xyVecOffset);
+  // Coordinates come in (x, y) pairs
+  if (count % 2 !== 0) throw new RangeError(`xy holds an odd number of values (${count})`);
+  budget.takeDoubles(count);
+  return { start: fb.vectorStart(xyVecOffset), count };
 }
 
 /**
  * Read the `xy` vector (field 1).
  *
- * @returns The coordinates; an empty array when the field is absent or
- *   empty; `null` when it holds an odd number of values (corrupt).
+ * @returns The coordinates; an empty array when the field is absent or empty.
+ * @throws {RangeError} If the vector holds an odd number of values.
  */
-function readXy(fb: FlatBufferReader, tablePos: number): Float64Array | null {
-  const xyFieldOff = fb.fieldOffset(tablePos, 1);
-  if (!xyFieldOff) return EMPTY_XY;
-  const xyVecOffset = fb.indirect(xyFieldOff);
-  const xyLen = fb.vectorLen(xyVecOffset);
-  if (xyLen === 0) return EMPTY_XY;
-  // Coordinates come in (x, y) pairs
-  if (xyLen % 2 !== 0) return null;
-  return fb.readFloat64Array(fb.vectorStart(xyVecOffset), xyLen);
+function readXy(fb: FlatBufferReader, tablePos: number, budget: GeometryBudget): Float64Array {
+  const span = xySpan(fb, tablePos, budget);
+  return span.count === 0 ? EMPTY_XY : fb.readFloat64Array(span.start, span.count);
 }
 
 /**
  * Read the `ends` vector (field 0) and check it against the number of
  * coordinate pairs.
  *
- * @returns The ring/part ends, `null` when absent or empty, or `undefined`
- *   when inconsistent with `pairCount` (corrupt).
+ * @returns The ring/part ends, or `null` when absent or empty.
+ * @throws {RangeError} If the ends are inconsistent with `pairCount`.
  */
-function readEnds(fb: FlatBufferReader, tablePos: number, pairCount: number): Uint32Array | null | undefined {
+function readEnds(fb: FlatBufferReader, tablePos: number, pairCount: number): Uint32Array | null {
   const endsFieldOff = fb.fieldOffset(tablePos, 0);
   if (!endsFieldOff) return null;
   const endsVecOffset = fb.indirect(endsFieldOff);
   const endsLen = fb.vectorLen(endsVecOffset);
   if (endsLen === 0) return null;
   const ends = fb.readUint32Array(fb.vectorStart(endsVecOffset), endsLen);
-  return validEnds(ends, pairCount) ? ends : undefined;
+  if (!validEnds(ends, pairCount)) {
+    throw new RangeError(`ring ends do not match the ${pairCount} coordinate pairs`);
+  }
+  return ends;
 }
 
 /**
- * Read the `parts` vector (field 7).
+ * Read the `parts` vector (field 7) and charge it to the budget.
  *
  * @returns Absolute offsets of the nested Geometry tables (empty if absent).
  */
-function readParts(fb: FlatBufferReader, tablePos: number): number[] {
+function readParts(fb: FlatBufferReader, tablePos: number, budget: GeometryBudget): number[] {
   const partsFieldOff = fb.fieldOffset(tablePos, 7);
   if (!partsFieldOff) return [];
   const partsVecOffset = fb.indirect(partsFieldOff);
   const partsLen = fb.vectorLen(partsVecOffset);
+  budget.takeParts(partsLen);
   const partsDataStart = fb.vectorStart(partsVecOffset);
   const offsets: number[] = new Array(partsLen);
   for (let i = 0; i < partsLen; i++) {
@@ -529,7 +590,7 @@ class Collector {
   /** Polygons as lists of rings, exterior first. */
   readonly polygons: Float64Array[][] = [];
 
-  constructor(readonly curveTolerance: number) {}
+  constructor(readonly curveTolerance: number, readonly budget: GeometryBudget) {}
 
   /**
    * Assemble the collected primitives into basic geometries: polygons,
@@ -602,8 +663,9 @@ class Collector {
  */
 function collect(fb: FlatBufferReader, tablePos: number, type: GeomType, depth: number, c: Collector): void {
   if (depth > MAX_GEOMETRY_DEPTH) return;
+  const { budget } = c;
   const parts = (fallback: GeomType) => {
-    for (const part of readParts(fb, tablePos)) {
+    for (const part of readParts(fb, tablePos, budget)) {
       collect(fb, part, geometryType(fb, part, fallback), depth + 1, c);
     }
   };
@@ -611,9 +673,9 @@ function collect(fb: FlatBufferReader, tablePos: number, type: GeomType, depth: 
   switch (type) {
     case GeomType.Point:
     case GeomType.MultiPoint: {
-      const xy = readXy(fb, tablePos);
-      if (xy && xy.length > 0) c.points.push(xy);
-      else if (xy) parts(GeomType.Point);
+      const xy = readXy(fb, tablePos, budget);
+      if (xy.length > 0) c.points.push(xy);
+      else parts(GeomType.Point);
       return;
     }
     case GeomType.LineString:
@@ -625,10 +687,10 @@ function collect(fb: FlatBufferReader, tablePos: number, type: GeomType, depth: 
     }
     case GeomType.MultiLineString:
     case GeomType.MultiCurve: {
-      const xy = readXy(fb, tablePos);
-      if (xy && xy.length > 0) {
+      const xy = readXy(fb, tablePos, budget);
+      if (xy.length > 0) {
         for (const line of splitRings(fb, tablePos, xy)) c.lines.push(line);
-      } else if (xy) {
+      } else {
         parts(GeomType.LineString);
       }
       return;
@@ -641,10 +703,10 @@ function collect(fb: FlatBufferReader, tablePos: number, type: GeomType, depth: 
       return;
     }
     case GeomType.TIN: {
-      const xy = readXy(fb, tablePos);
-      if (xy && xy.length > 0) {
+      const xy = readXy(fb, tablePos, budget);
+      if (xy.length > 0) {
         for (const triangle of splitRings(fb, tablePos, xy)) c.polygons.push([triangle]);
-      } else if (xy) {
+      } else {
         parts(GeomType.Triangle);
       }
       return;
@@ -652,12 +714,11 @@ function collect(fb: FlatBufferReader, tablePos: number, type: GeomType, depth: 
     case GeomType.MultiPolygon:
     case GeomType.MultiSurface:
     case GeomType.PolyhedralSurface: {
-      const xy = readXy(fb, tablePos);
-      if (xy && xy.length > 0) {
+      const xy = readXy(fb, tablePos, budget);
+      if (xy.length > 0) {
         // Flat storage: a single polygon
-        const rings = splitRings(fb, tablePos, xy);
-        if (rings.length > 0) c.polygons.push(rings);
-      } else if (xy) {
+        c.polygons.push(splitRings(fb, tablePos, xy));
+      } else {
         parts(GeomType.Polygon);
       }
       return;
@@ -687,18 +748,18 @@ function readCurve(
   if (depth > MAX_GEOMETRY_DEPTH) return null;
   switch (type) {
     case GeomType.LineString: {
-      const xy = readXy(fb, tablePos);
-      return xy && xy.length > 0 ? xy : null;
+      const xy = readXy(fb, tablePos, c.budget);
+      return xy.length > 0 ? xy : null;
     }
     case GeomType.CircularString: {
-      const xy = readXy(fb, tablePos);
-      return xy && xy.length > 0 ? linearizeArcs(xy, c.curveTolerance) : null;
+      const xy = readXy(fb, tablePos, c.budget);
+      return xy.length > 0 ? linearizeArcs(xy, c.curveTolerance) : null;
     }
     case GeomType.CompoundCurve: {
       // Segments are joined end to start; drop each shared joint vertex
       const segments: Float64Array[] = [];
       let lastX = NaN, lastY = NaN;
-      for (const part of readParts(fb, tablePos)) {
+      for (const part of readParts(fb, tablePos, c.budget)) {
         const seg = readCurve(fb, part, geometryType(fb, part, GeomType.LineString), depth + 1, c);
         if (!seg) continue;
         const joined = seg[0] === lastX && seg[1] === lastY ? seg.subarray(2) : seg;
@@ -720,13 +781,12 @@ function readCurve(
  * @returns The rings, or an empty array if the exterior ring is missing.
  */
 function readSurface(fb: FlatBufferReader, tablePos: number, depth: number, c: Collector): Float64Array[] {
-  const xy = readXy(fb, tablePos);
-  if (xy === null) return [];
+  const xy = readXy(fb, tablePos, c.budget);
   if (xy.length > 0) return splitRings(fb, tablePos, xy);
 
   // CurvePolygon: one curve per ring
   const rings: Float64Array[] = [];
-  for (const part of readParts(fb, tablePos)) {
+  for (const part of readParts(fb, tablePos, c.budget)) {
     const ring = readCurve(fb, part, geometryType(fb, part, GeomType.LineString), depth + 1, c);
     if (ring) rings.push(ring);
     else if (rings.length === 0) return []; // no exterior ring
@@ -738,11 +798,11 @@ function readSurface(fb: FlatBufferReader, tablePos: number, depth: number, c: C
  * Split flat coordinates into rings (or line strings) using the table's
  * `ends` vector.
  *
- * @returns One array per ring; empty if `ends` is inconsistent with `xy`.
+ * @returns One array per ring.
+ * @throws {RangeError} If `ends` is inconsistent with `xy`.
  */
 function splitRings(fb: FlatBufferReader, tablePos: number, xy: Float64Array): Float64Array[] {
   const ends = readEnds(fb, tablePos, xy.length / 2);
-  if (ends === undefined) return [];
   if (ends === null) return [xy];
   const rings: Float64Array[] = [];
   let start = 0;
@@ -842,12 +902,14 @@ function decodeProperties(
 
   let offset = 0;
   while (offset < propsLen) {
-    if (offset + 2 > propsLen) break;
+    if (offset + 2 > propsLen) throw new RangeError('properties end inside a column index');
 
     const colIdx = view.getUint16(offset, true);
     offset += 2;
 
-    if (colIdx >= columns.length) break;
+    if (colIdx >= columns.length) {
+      throw new RangeError(`property column ${colIdx} does not exist (${columns.length} columns)`);
+    }
     const col = columns[colIdx];
 
     const wanted = mask === null || mask[colIdx] === 1;
@@ -949,25 +1011,24 @@ function readPropertyValue(
     case ColumnType.String:
     case ColumnType.Json:
     case ColumnType.DateTime: {
-      if (offset + 4 > bytes.length) { propResult.value = null; propResult.bytesRead = 0; return; }
       const strLen = view.getUint32(offset, true);
-      if (offset + 4 + strLen > bytes.length) { propResult.value = null; propResult.bytesRead = 0; return; }
+      if (offset + 4 + strLen > bytes.length) throw new RangeError('a string property extends beyond the properties');
       propResult.value = decode ? textDecoder.decode(bytes.subarray(offset + 4, offset + 4 + strLen)) : null;
       propResult.bytesRead = 4 + strLen;
       return;
     }
 
     case ColumnType.Binary: {
-      if (offset + 4 > bytes.length) { propResult.value = null; propResult.bytesRead = 0; return; }
       const binLen = view.getUint32(offset, true);
-      if (offset + 4 + binLen > bytes.length) { propResult.value = null; propResult.bytesRead = 0; return; }
-      propResult.value = new Uint8Array(bytes.buffer, bytes.byteOffset + offset + 4, binLen);
+      if (offset + 4 + binLen > bytes.length) throw new RangeError('a binary property extends beyond the properties');
+      // Copied, so the value does not keep the whole read buffer alive
+      propResult.value = decode ? bytes.slice(offset + 4, offset + 4 + binLen) : null;
       propResult.bytesRead = 4 + binLen;
       return;
     }
 
     default:
-      propResult.value = null;
-      propResult.bytesRead = 0;
+      // Unknown column types are rejected when the schema is parsed
+      throw new RangeError(`unknown column type ${type as number}`);
   }
 }

@@ -16,7 +16,7 @@
  * @example
  * ```html
  * <script type="module">
- *   import { tile, HttpConnector } from 'fgb-vt';
+ *   import { tile, HttpConnector } from '@geozelot/fgb-vt';
  *
  *   const connector = new HttpConnector();
  *   const source = { name: 'buildings', path: 'https://data.example.com/buildings.fgb' };
@@ -29,7 +29,7 @@
 
 export { TileServer } from './server.js';
 export { TileClient } from './client.js';
-export { tile } from './tile.js';
+export { tile, tileETag, clearTileCache } from './tile.js';
 
 // == Browser-compatible Connector ===========================================
 
@@ -39,10 +39,10 @@ export { HttpConnector } from './connectors/http.js';
 
 export type { Connector, ReadOptions, ReadHeadResult, ConnectorHints } from './connectors/connector.js';
 export type { HttpConnectorOptions } from './connectors/http.js';
-export type { Source, SourceOptions, TileOptions } from './source.js';
+export type { Source, SourceOptions, TileOptions, FeatureFilter, FilterFeature } from './source.js';
 export type { Projection, SourceCrs } from './geometry/crs.js';
 export type { TileServerLayer, TileJSONOptions } from './server.js';
-export type { TileJSON, BBox } from './types.js';
+export type { TileJSON, BBox, PropertyValue } from './types.js';
 export type { ByteCache, MemoryCacheOptions } from './cache.js';
 export type { IoOptions } from './fgb/reader.js';
 export type { OpenOptions } from './client.js';

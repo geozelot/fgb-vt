@@ -66,8 +66,6 @@ export function validateTile(z: number, x: number, y: number): void {
  *
  * @example
  * ```typescript
- * import { tileBBox } from 'fgb-vt/tiles';
- *
  * const bbox = tileBBox(1, 0, 0);
  * // bbox.minX === -180, bbox.maxX === 0
  * // bbox.minY ≈ 0,     bbox.maxY ≈ 85.051
@@ -119,8 +117,6 @@ function tileLatDeg(y: number, n: number): number {
  *
  * @example
  * ```typescript
- * import { tileClipBounds } from 'fgb-vt/tiles';
- *
  * // Tile 0/0/0 with 64px buffer at 4096 extent
  * const clip = tileClipBounds(0, 0, 0, 64, 4096);
  * // clip.minX ≈ -0.0156, clip.minY ≈ -0.0156

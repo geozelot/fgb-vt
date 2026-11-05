@@ -65,9 +65,13 @@ export function simplify(
 
   dpMark(xy, importance, 0, n / 2 - 1);
 
-  // Filter: emit only points with importance > sqTolerance
-  // Pre-allocate at input size (worst case: all points kept), then subarray
-  const out = new Float64Array(n);
+  // Filter: emit only points with importance > sqTolerance, into a
+  // buffer of exactly the kept size
+  let kept = 0;
+  for (let i = 0; i < n / 2; i++) {
+    if (importance[i] > sqTolerance) kept++;
+  }
+  const out = new Float64Array(kept * 2);
   let outLen = 0;
   for (let i = 0; i < n / 2; i++) {
     if (importance[i] > sqTolerance) {
@@ -76,7 +80,7 @@ export function simplify(
     }
   }
 
-  return out.subarray(0, outLen);
+  return out;
 }
 
 /**

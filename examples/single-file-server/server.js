@@ -38,21 +38,33 @@ class MockS3Client {
     const match = Range.match(/bytes=(\d+)-(\d+)/);
     if (!match) throw new Error(`Invalid Range: ${Range}`);
 
-    const start = Number(match[1]);
-    const end   = Number(match[2]);
-    const len   = end - start + 1;
+    const fh = await open(filePath);
+    try {
+      const { size } = await fh.stat();
+      const start = Number(match[1]);
+      if (start >= size) {
+        // Like S3: a range beyond the object is "not satisfiable"
+        const err = new Error('The requested range is not satisfiable');
+        err.name = 'InvalidRange';
+        err.$metadata = { httpStatusCode: 416 };
+        throw err;
+      }
+      const end = Math.min(Number(match[2]), size - 1);
+      const buf = Buffer.alloc(end - start + 1);
+      await fh.read(buf, 0, buf.length, start);
 
-    const fh  = await open(filePath);
-    const buf = Buffer.alloc(len);
-    await fh.read(buf, 0, len, start);
-    await fh.close();
-
-    return {
-      Body: {
-        transformToByteArray: async () =>
-          new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength),
-      },
-    };
+      return {
+        ContentRange: `bytes ${start}-${end}/${size}`,
+        ContentLength: buf.length,
+        ETag: `"${size}"`,
+        Body: {
+          transformToByteArray: async () =>
+            new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength),
+        },
+      };
+    } finally {
+      await fh.close();
+    }
   }
   destroy() {}
 }

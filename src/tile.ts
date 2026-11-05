@@ -17,8 +17,7 @@
  *
  * @example
  * ```typescript
- * import { tile } from 'fgb-vt';
- * import { HttpConnector } from 'fgb-vt/connectors';
+ * import { tile, HttpConnector } from '@geozelot/fgb-vt';
  *
  * const connector = new HttpConnector();
  * const source = { name: 'buildings', path: 'https://cdn.example.com/buildings.fgb' };
@@ -34,9 +33,9 @@
 
 import type { Connector } from './connectors/connector.js';
 import type { Source, TileOptions } from './source.js';
-import { processTile, type RequestOptions } from './pipeline.js';
+import { computeTileETag, processTile, type RequestOptions } from './pipeline.js';
 import { MemoryCache } from './cache.js';
-import { createIoContext, type IoOptions } from './fgb/reader.js';
+import { createIoContext, forgetSources, invalidateSource, type IoOptions } from './fgb/reader.js';
 
 /** Module-level header and index cache shared by all `tile()` calls. */
 const sharedCache = new MemoryCache({ maxBytes: 64 * 1024 * 1024 });
@@ -128,4 +127,53 @@ export async function tile(
     createIoContext(options, sharedCache),
     options,
   );
+}
+
+/**
+ * Compute the ETag of a tile without rendering it (see
+ * {@link TileServer.tileETag}), using the same cache as {@link tile}.
+ *
+ * @param connector - Byte-range reader for accessing FGB files.
+ * @param z - Tile zoom level.
+ * @param x - Tile column.
+ * @param y - Tile row.
+ * @param sources - The sources (or source) the tile is rendered from.
+ * @param options - The tiling and I/O options the tile is rendered with,
+ *   and an optional abort `signal`.
+ * @returns A strong, quoted ETag, or `null` when a source's connector
+ *   reports no version tag.
+ */
+export function tileETag(
+  connector: Connector,
+  z: number,
+  x: number,
+  y: number,
+  sources: Source | Source[],
+  options?: TileOptions & IoOptions & Pick<RequestOptions, 'signal'>,
+): Promise<string | null> {
+  const list = Array.isArray(sources) ? sources : [sources];
+  return computeTileETag(
+    list.map(source => [connector, source]), z, x, y, options, createIoContext(options, sharedCache), options?.signal,
+  );
+}
+
+/**
+ * Forget what the module-level cache of {@link tile} holds: the header
+ * and index of one file read through `connector`, or (without arguments)
+ * everything.
+ *
+ * Files with version tags are detected as changed automatically; this is
+ * for connectors and servers that report none.
+ *
+ * @param connector - Connector the file is read through (with `path`).
+ * @param path - Source path.
+ * @returns Resolves when the entries are removed.
+ */
+export async function clearTileCache(connector?: Connector, path?: string): Promise<void> {
+  if (connector && path !== undefined) {
+    await invalidateSource(connector, path, createIoContext(undefined, sharedCache));
+    return;
+  }
+  forgetSources(sharedCache);
+  sharedCache.clear();
 }

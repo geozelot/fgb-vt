@@ -77,74 +77,9 @@ export function buildMvtLayer(
   toMercator: (xy: Float64Array) => void = projectToMercator,
   options: LayerOptions = {},
 ): MvtLayer {
-  const keys: string[] = [];
-  const keyIndex = new Map<string, number>();
-  const values: MvtValue[] = [];
-  const valueIndex = new Map<string, number>();
-  const mvtFeatures: MvtFeature[] = [];
-
-  const sqTol = tolerance > 0 ? sqToleranceForZoom(tolerance, z, extent) : 0;
-  const before = options.simplifyBeforeClip === true && sqTol > 0;
-  const grid = options.pointGrid !== undefined && options.pointGrid > 0 ? options.pointGrid : 0;
-  const occupied = grid > 0 ? new Set<number>() : null;
-
-  // Project all features to mercator in-place
-  for (const f of features) {
-    toMercator(f.xy);
-  }
-
-  // Simplify whole features before clipping (same result in every tile),
-  // or the clipped parts after
-  let input = features;
-  if (before) {
-    input = [];
-    for (const f of features) {
-      const simplified = simplifyFeature(f, sqTol);
-      if (simplified) input.push(simplified);
-    }
-  }
-  const clipped = clipFeatures(input, clipBounds);
-
-  for (const clippedFeature of clipped) {
-    const feature = before || sqTol === 0 ? clippedFeature : simplifyFeature(clippedFeature, sqTol);
-    if (!feature || feature.xy.length === 0) continue;
-
-    // Transform to tile coordinates
-    let tileCoords = transformToTile(feature.xy, z, x, y, extent);
-
-    // Thin points: at most one per grid cell, the first in file order
-    if (occupied && (feature.type === GeomType.Point || feature.type === GeomType.MultiPoint)) {
-      tileCoords = thinPoints(tileCoords, grid, occupied);
-      if (tileCoords.length === 0) continue;
-    }
-
-    // Correct polygon winding order (parts tracks which rings are exterior
-    // for MultiPolygon geometries with multiple polygon parts)
-    correctWinding(tileCoords, feature.ends, feature.type, feature.parts);
-
-    // Encode geometry commands
-    const mvtType = toMvtGeomType(feature.type);
-    const geometry = encodeGeometry(tileCoords, feature.ends, mvtType);
-    if (geometry.length === 0) continue;
-
-    // Build tags
-    const tags = buildTags(feature.properties, keys, keyIndex, values, valueIndex);
-
-    mvtFeatures.push({
-      id: feature.id,
-      type: mvtType,
-      geometry,
-      tags,
-    });
-  }
-
-  return {
-    name,
-    extent,
-    features: mvtFeatures,
-    keys,
-    values,
-  };
+  const builder = new LayerBuilder(name, z, x, y, clipBounds, extent, tolerance, toMercator, options);
+  builder.add(features);
+  return builder.finish();
 }
 
 /**
@@ -165,6 +100,134 @@ export interface LayerOptions {
   pointGrid?: number;
 }
 
+/**
+ * Builds an {@link MvtLayer} from features added in batches, so a source
+ * can be encoded while it is read: each batch is clipped, simplified and
+ * encoded at once, and its decoded features can be released.
+ *
+ * Adding features in several batches yields the same layer as adding them
+ * all at once (point thinning keeps the first point per cell across
+ * batches).
+ */
+export class LayerBuilder {
+  private readonly keys: string[] = [];
+  private readonly keyIndex = new Map<string, number>();
+  private readonly values: MvtValue[] = [];
+  private readonly valueIndex = new Map<string, number>();
+  private readonly features: MvtFeature[] = [];
+  private readonly sqTol: number;
+  private readonly before: boolean;
+  private readonly grid: number;
+  private readonly occupied: Set<number> | null;
+
+  /**
+   * @param name - Layer name.
+   * @param z - Tile zoom level.
+   * @param x - Tile column.
+   * @param y - Tile row.
+   * @param clipBounds - Clip box in mercator [0, 1] space (with buffer).
+   * @param extent - Tile coordinate extent.
+   * @param tolerance - Simplification tolerance in tile units (`0`: none).
+   * @param toMercator - Converts added coordinates to mercator space in place.
+   * @param options - Simplification mode and point thinning.
+   */
+  constructor(
+    readonly name: string,
+    private readonly z: number,
+    private readonly x: number,
+    private readonly y: number,
+    private readonly clipBounds: BBox,
+    readonly extent: number,
+    tolerance: number,
+    private readonly toMercator: (xy: Float64Array) => void = projectToMercator,
+    options: LayerOptions = {},
+  ) {
+    this.sqTol = tolerance > 0 ? sqToleranceForZoom(tolerance, z, extent) : 0;
+    this.before = options.simplifyBeforeClip === true && this.sqTol > 0;
+    this.grid = options.pointGrid !== undefined && options.pointGrid > 0 ? options.pointGrid : 0;
+    this.occupied = this.grid > 0 ? new Set<number>() : null;
+  }
+
+  /** Number of features written so far. */
+  get size(): number {
+    return this.features.length;
+  }
+
+  /**
+   * Clip, simplify and encode a batch of features into the layer.
+   *
+   * **Side effect:** the features' `xy` arrays are converted to mercator
+   * space in place.
+   *
+   * @param features - Decoded features, in file order.
+   */
+  add(features: RawFeature[]): void {
+    const { sqTol, before, grid, occupied, z, x, y, extent } = this;
+
+    // Project all features to mercator in-place
+    for (const f of features) {
+      this.toMercator(f.xy);
+    }
+
+    // Simplify whole features before clipping (same result in every tile),
+    // or the clipped parts after
+    let input = features;
+    if (before) {
+      input = [];
+      for (const f of features) {
+        const simplified = simplifyFeature(f, sqTol);
+        if (simplified) input.push(simplified);
+      }
+    }
+    const clipped = clipFeatures(input, this.clipBounds);
+
+    for (const clippedFeature of clipped) {
+      const feature = before || sqTol === 0 ? clippedFeature : simplifyFeature(clippedFeature, sqTol);
+      if (!feature || feature.xy.length === 0) continue;
+
+      // Transform to tile coordinates
+      let tileCoords = transformToTile(feature.xy, z, x, y, extent);
+
+      // Thin points: at most one per grid cell, the first in file order
+      if (occupied && (feature.type === GeomType.Point || feature.type === GeomType.MultiPoint)) {
+        tileCoords = thinPoints(tileCoords, grid, occupied);
+        if (tileCoords.length === 0) continue;
+      }
+
+      // Correct polygon winding order (parts tracks which rings are exterior
+      // for MultiPolygon geometries with multiple polygon parts)
+      correctWinding(tileCoords, feature.ends, feature.type, feature.parts);
+
+      // Encode geometry commands
+      const mvtType = toMvtGeomType(feature.type);
+      const geometry = encodeGeometry(tileCoords, feature.ends, mvtType);
+      if (geometry.length === 0) continue;
+
+      // Build tags
+      const tags = buildTags(feature.properties, this.keys, this.keyIndex, this.values, this.valueIndex);
+
+      this.features.push({
+        id: feature.id,
+        type: mvtType,
+        geometry,
+        tags,
+      });
+    }
+  }
+
+  /** The layer with every feature added so far. */
+  finish(): MvtLayer {
+    return {
+      name: this.name,
+      extent: this.extent,
+      features: this.features,
+      keys: this.keys,
+      values: this.values,
+    };
+  }
+}
+
+
 // == Simplification =========================================================
 
 /**
@@ -179,8 +242,12 @@ export interface LayerOptions {
 function simplifyFeature(feature: RawFeature, sqTol: number): RawFeature | null {
   if (feature.type === GeomType.Point || feature.type === GeomType.MultiPoint) return feature;
   const { xy, ends, parts } = feature;
+  // Only polygon rings are dropped for their size: a line part along a
+  // meridian or parallel has a zero-area bounding box but is not small
+  const polygon = feature.type === GeomType.Polygon || feature.type === GeomType.MultiPolygon;
 
   if (!ends || ends.length <= 1) {
+    if (polygon && ringTooSmall(xy, 0, xy.length, sqTol)) return null;
     const simplified = simplify(xy, sqTol);
     if (simplified.length < 4) return null; // degenerate
     // A single ring/part needs no ends; any existing ends indexed the
@@ -188,7 +255,7 @@ function simplifyFeature(feature: RawFeature, sqTol: number): RawFeature | null 
     return { ...feature, xy: simplified, ends: null };
   }
 
-  // Multi-ring: simplify each ring independently, dropping small rings.
+  // Multi-ring: simplify each ring independently, dropping small polygon rings.
   // Track which original ring index each surviving ring came from so we
   // can rebuild `parts` (MultiPolygon exterior ring tracking).
   const simplifiedRings: Float64Array[] = [];
@@ -201,8 +268,8 @@ function simplifyFeature(feature: RawFeature, sqTol: number): RawFeature | null 
     const ringXy = xy.subarray(start, end);
     start = end;
 
-    // Drop small rings
-    if (ringTooSmall(ringXy, 0, ringXy.length, sqTol)) continue;
+    // Drop small polygon rings
+    if (polygon && ringTooSmall(ringXy, 0, ringXy.length, sqTol)) continue;
 
     const simplified = simplify(ringXy, sqTol);
     if (simplified.length >= 4) { // at least 2 points
@@ -361,8 +428,8 @@ function appendLayer(a: MvtLayer, b: MvtLayer): MvtLayer {
  * and indexed in `valueIndex`. The returned array contains alternating
  * key-index / value-index pairs: `[kIdx, vIdx, kIdx, vIdx, ...]`.
  *
- * Properties with `null`, `undefined`, or `Uint8Array` (binary) values are
- * silently skipped since MVT has no binary value type.
+ * Properties with `null`, `undefined`, `Uint8Array` (binary: MVT has no
+ * binary value type), NaN or infinite values are skipped.
  *
  * @param properties - Feature property map from the decoded FGB feature.
  * @param keys - Shared mutable array of deduplicated key strings (layer-wide).
@@ -384,6 +451,8 @@ function buildTags(
   for (const [key, value] of properties) {
     if (value === null || value === undefined) continue;
     if (value instanceof Uint8Array) continue; // skip binary properties
+    // NaN and infinities have no JSON form; style expressions cannot use them
+    if (typeof value === 'number' && value - value !== 0) continue;
 
     // Key index
     let kIdx = keyIndex.get(key);

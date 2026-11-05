@@ -51,6 +51,7 @@ describe('resolveOptions', () => {
       simplifyBeforeClip: false,
       pointGrid: 0,
       maxTileBytes: Infinity,
+      reduceToFit: false,
       omitEmptyLayers: false,
     });
   });

@@ -55,7 +55,8 @@
 
 export { TileServer } from './server.js';
 export { TileClient } from './client.js';
-export { tile } from './tile.js';
+export { tile, tileETag, clearTileCache } from './tile.js';
+export { checkFile } from './check.js';
 
 // == Connectors =============================================================
 
@@ -69,15 +70,16 @@ export type { Connector, ReadOptions, ReadHeadResult, ConnectorHints } from './c
 export type { LocalConnectorOptions } from './connectors/local.js';
 export type { HttpConnectorOptions } from './connectors/http.js';
 export type { S3ConnectorOptions, S3ClientLike, S3SdkModule } from './connectors/s3.js';
-export type { Source, SourceOptions, TileOptions } from './source.js';
+export type { Source, SourceOptions, TileOptions, FeatureFilter, FilterFeature } from './source.js';
 export type { Projection, SourceCrs } from './geometry/crs.js';
 export type { TileServerLayer, TileJSONOptions } from './server.js';
-export type { TileJSON, BBox } from './types.js';
+export type { TileJSON, BBox, PropertyValue } from './types.js';
 export type { ByteCache, MemoryCacheOptions } from './cache.js';
 export type { IoOptions } from './fgb/reader.js';
 export type { OpenOptions } from './client.js';
 export type { RequestOptions, TileStats, SourceStats } from './pipeline.js';
 export type { PropertySelection } from './schema.js';
+export type { CheckReport, CheckOptions, CheckProblem } from './check.js';
 export type { LimitKind } from './errors.js';
 
 // == Caching & errors =======================================================

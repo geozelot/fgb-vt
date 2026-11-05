@@ -54,7 +54,8 @@ const CMD_CLOSE_PATH = 7;
  * ```
  */
 export function zigzag(n: number): number {
-  return (n << 1) ^ (n >> 31);
+  // Unsigned result: deltas of 2^30 or more would otherwise turn negative
+  return ((n << 1) ^ (n >> 31)) >>> 0;
 }
 
 /**
