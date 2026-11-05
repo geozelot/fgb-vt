@@ -4,7 +4,7 @@ import type { MvtLayer, MvtFeature, MvtValue } from '../../src/types.js';
 import { MvtGeomType } from '../../src/types.js';
 
 // We'll use @mapbox/vector-tile + pbf to decode and verify our output
-import Pbf from 'pbf';
+import { PbfReader } from 'pbf';
 import { VectorTile } from '@mapbox/vector-tile';
 
 describe('encodePbf', () => {
@@ -29,7 +29,7 @@ describe('encodePbf', () => {
     // Decode with @mapbox/vector-tile
     // Note: @mapbox/vector-tile may or may not include empty layers
     // (layers with 0 features). We verify the PBF is valid.
-    const tile = new VectorTile(new Pbf(result));
+    const tile = new VectorTile(new PbfReader(result));
     if (tile.layers.test) {
       expect(tile.layers.test.length).toBe(0);
       expect(tile.layers.test.name).toBe('test');
@@ -61,7 +61,7 @@ describe('encodePbf', () => {
     const result = encodePbf([layer]);
 
     // Decode with @mapbox/vector-tile
-    const tile = new VectorTile(new Pbf(result));
+    const tile = new VectorTile(new PbfReader(result));
     const decoded = tile.layers.points;
     expect(decoded).toBeDefined();
     expect(decoded.length).toBe(1);
@@ -102,7 +102,7 @@ describe('encodePbf', () => {
 
     const result = encodePbf([layer1, layer2]);
 
-    const tile = new VectorTile(new Pbf(result));
+    const tile = new VectorTile(new PbfReader(result));
     expect(tile.layers.buildings).toBeDefined();
     expect(tile.layers.roads).toBeDefined();
     expect(tile.layers.buildings.length).toBe(1);
@@ -133,7 +133,7 @@ describe('encodePbf', () => {
     };
 
     const result = encodePbf([layer]);
-    const tile = new VectorTile(new Pbf(result));
+    const tile = new VectorTile(new PbfReader(result));
     const f = tile.layers.test.feature(0);
 
     expect(f.properties.str).toBe('world');
@@ -159,7 +159,7 @@ describe('encodePbf', () => {
     };
 
     const result = encodePbf([layer]);
-    const tile = new VectorTile(new Pbf(result));
+    const tile = new VectorTile(new PbfReader(result));
     const f = tile.layers.test.feature(0);
 
     // ID should be undefined or 0 (no ID field written)

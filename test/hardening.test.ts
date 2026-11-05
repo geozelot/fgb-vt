@@ -7,7 +7,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { VectorTile } from '@mapbox/vector-tile';
-import Protobuf from 'pbf';
+import { PbfReader } from 'pbf';
 import { FlatBufferReader } from '../src/fgb/flatbuffers.js';
 import { decodeFeatureChunk } from '../src/fgb/feature.js';
 import { parseHeader } from '../src/fgb/header.js';
@@ -228,7 +228,7 @@ describe('index reads', () => {
 function layerOf(features: RawFeature[], tolerance = 3) {
   const clip = tileClipBounds(5, 16, 16, 64, 4096);
   const layer = buildMvtLayer(features, 'l', 5, 16, 16, clip, 4096, tolerance);
-  return { layer, tile: new VectorTile(new Protobuf(encodePbf([layer]))) };
+  return { layer, tile: new VectorTile(new PbfReader(encodePbf([layer]))) };
 }
 
 function feature(type: GeomType, xy: number[], ends: number[] | null = null, properties = new Map<string, PropertyValue>()): RawFeature {

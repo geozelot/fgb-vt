@@ -7,7 +7,7 @@ import type { BBox } from '../../src/types.js';
 import { tileClipBounds, tileBBox } from '../../src/tiles.js';
 
 // Use @mapbox/vector-tile + pbf for roundtrip validation
-import Pbf from 'pbf';
+import { PbfReader } from 'pbf';
 import { VectorTile } from '@mapbox/vector-tile';
 
 describe('Full pipeline: RawFeature → MVT → PBF → decode', () => {
@@ -56,7 +56,7 @@ describe('Full pipeline: RawFeature → MVT → PBF → decode', () => {
     expect(pbf.length).toBeGreaterThan(0);
 
     // Decode with @mapbox/vector-tile
-    const tile = new VectorTile(new Pbf(pbf));
+    const tile = new VectorTile(new PbfReader(pbf));
     const decodedLayer = tile.layers.cities;
     expect(decodedLayer).toBeDefined();
     expect(decodedLayer.length).toBe(1);
@@ -105,7 +105,7 @@ describe('Full pipeline: RawFeature → MVT → PBF → decode', () => {
     expect(layer.features.length).toBe(1);
 
     const pbf = encodePbf([layer]);
-    const tile = new VectorTile(new Pbf(pbf));
+    const tile = new VectorTile(new PbfReader(pbf));
 
     expect(tile.layers.zones).toBeDefined();
     expect(tile.layers.zones.length).toBe(1);
@@ -155,7 +155,7 @@ describe('Full pipeline: RawFeature → MVT → PBF → decode', () => {
 
     if (layer.features.length > 0) {
       const pbf = encodePbf([layer]);
-      const tile = new VectorTile(new Pbf(pbf));
+      const tile = new VectorTile(new PbfReader(pbf));
       const f = tile.layers.routes.feature(0);
       expect(f.type).toBe(2); // LINESTRING
       expect(f.properties.name).toBe('London-Paris');
@@ -211,7 +211,7 @@ describe('Full pipeline: RawFeature → MVT → PBF → decode', () => {
 
     // Encode both layers
     const pbf = encodePbf([layer1, layer2]);
-    const tile = new VectorTile(new Pbf(pbf));
+    const tile = new VectorTile(new PbfReader(pbf));
 
     expect(tile.layers.pois).toBeDefined();
     expect(tile.layers.buildings).toBeDefined();

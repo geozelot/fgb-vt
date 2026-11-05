@@ -4,7 +4,7 @@ import { encodePbf } from '../../src/pbf/encode.js';
 import { tileClipBounds, tileBBox } from '../../src/tiles.js';
 import type { RawFeature } from '../../src/types.js';
 import { GeomType } from '../../src/types.js';
-import Pbf from 'pbf';
+import { PbfReader } from 'pbf';
 import { VectorTile } from '@mapbox/vector-tile';
 
 const extent = 4096;
@@ -28,7 +28,7 @@ describe('Pipeline edge cases', () => {
     const pbf = buildAndEncode([], 'empty', 5, 16, 16);
     expect(pbf).toBeInstanceOf(Uint8Array);
     // Valid PBF, even if empty
-    expect(() => new VectorTile(new Pbf(pbf))).not.toThrow();
+    expect(() => new VectorTile(new PbfReader(pbf))).not.toThrow();
   });
 
   it('should produce an empty tile when all features are outside the tile', () => {
@@ -117,7 +117,7 @@ describe('Pipeline edge cases', () => {
     }];
 
     const pbf = buildAndEncode(features, 'props', z, x, y);
-    const tile = new VectorTile(new Pbf(pbf));
+    const tile = new VectorTile(new PbfReader(pbf));
     if (tile.layers.props) {
       const f = tile.layers.props.feature(0);
       expect(f.properties.key_0).toBe('value_0');
@@ -148,7 +148,7 @@ describe('Pipeline edge cases', () => {
     }];
 
     const pbf = buildAndEncode(features, 'nulls', z, x, y);
-    const tile = new VectorTile(new Pbf(pbf));
+    const tile = new VectorTile(new PbfReader(pbf));
     if (tile.layers.nulls) {
       const f = tile.layers.nulls.feature(0);
       expect(f.properties.name).toBe('test');
@@ -172,7 +172,7 @@ describe('Pipeline edge cases', () => {
     }];
 
     const pbf = buildAndEncode(features, 'noid', z, x, y);
-    const tile = new VectorTile(new Pbf(pbf));
+    const tile = new VectorTile(new PbfReader(pbf));
     if (tile.layers.noid) {
       expect(tile.layers.noid.length).toBe(1);
     }
@@ -197,7 +197,7 @@ describe('Pipeline edge cases', () => {
     }
 
     const pbf = buildAndEncode(features, 'many', z, x, y);
-    const tile = new VectorTile(new Pbf(pbf));
+    const tile = new VectorTile(new PbfReader(pbf));
     expect(tile.layers.many).toBeDefined();
     expect(tile.layers.many.length).toBe(500);
   });
@@ -258,7 +258,7 @@ describe('Pipeline edge cases', () => {
     }];
 
     const pbf = buildAndEncode(features, 'holes', z, x, y);
-    const tile = new VectorTile(new Pbf(pbf));
+    const tile = new VectorTile(new PbfReader(pbf));
     if (tile.layers.holes) {
       expect(tile.layers.holes.length).toBe(1);
       expect(tile.layers.holes.feature(0).type).toBe(3); // POLYGON
@@ -278,7 +278,7 @@ describe('Pipeline edge cases', () => {
 
     const pbf = encodePbf(layers);
     expect(pbf).toBeInstanceOf(Uint8Array);
-    expect(() => new VectorTile(new Pbf(pbf))).not.toThrow();
+    expect(() => new VectorTile(new PbfReader(pbf))).not.toThrow();
   });
 
   // == Properties deduplication =========================================

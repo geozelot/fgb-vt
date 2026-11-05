@@ -4,7 +4,7 @@
  */
 import { fileURLToPath } from 'node:url';
 import { VectorTile, type VectorTileLayer } from '@mapbox/vector-tile';
-import Pbf from 'pbf';
+import { PbfReader } from 'pbf';
 
 /** Absolute path of a golden fixture in `test/fixtures`. */
 export function fixture(name: string): string {
@@ -13,7 +13,7 @@ export function fixture(name: string): string {
 
 /** Decode a PBF tile and return the named layer (undefined when empty). */
 export function decodeLayer(pbf: Uint8Array, name: string): VectorTileLayer | undefined {
-  return new VectorTile(new Pbf(pbf)).layers[name];
+  return new VectorTile(new PbfReader(pbf)).layers[name];
 }
 
 /** All features of a layer, in order. */

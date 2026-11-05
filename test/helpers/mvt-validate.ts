@@ -15,7 +15,7 @@
  *   (positive surveyor's area in tile coordinates);
  * - coordinates within a plausible window around the tile.
  */
-import Pbf from 'pbf';
+import { PbfReader } from 'pbf';
 
 /** One problem found in a tile. */
 export interface MvtIssue {
@@ -48,7 +48,7 @@ interface Feature {
 export function validateMvt(bytes: Uint8Array): MvtIssue[] {
   const issues: MvtIssue[] = [];
   const layers: Layer[] = [];
-  const pbf = new Pbf(bytes);
+  const pbf = new PbfReader(bytes);
   pbf.readFields((tag, _, p) => {
     if (tag === 3) layers.push(readLayer(p!));
   }, null);
@@ -80,7 +80,7 @@ export function validateMvt(bytes: Uint8Array): MvtIssue[] {
   return issues;
 }
 
-function readLayer(pbf: Pbf): Layer {
+function readLayer(pbf: PbfReader): Layer {
   const layer: Layer = { version: 1, name: '', extent: 4096, keys: [], values: [], features: [] };
   const end = pbf.readVarint() + pbf.pos;
   pbf.readFields((tag, l, p) => {
@@ -94,7 +94,7 @@ function readLayer(pbf: Pbf): Layer {
   return layer;
 }
 
-function readFeature(pbf: Pbf): Feature {
+function readFeature(pbf: PbfReader): Feature {
   const feature: Feature = { type: 0, tags: [], geometry: [] };
   const end = pbf.readVarint() + pbf.pos;
   pbf.readFields((tag, f, p) => {
@@ -106,7 +106,7 @@ function readFeature(pbf: Pbf): Feature {
 }
 
 /** A value's identity (`type:value`), or `'invalid'` unless exactly one field is set. */
-function readValue(pbf: Pbf): string {
+function readValue(pbf: PbfReader): string {
   const end = pbf.readVarint() + pbf.pos;
   const fields: string[] = [];
   pbf.readFields((tag, out, p) => {

@@ -17,3 +17,13 @@ updates:
       dev-dependencies:
         dependency-type: development
         update-types: [minor, patch]
+    ignore:
+      # The Node.js types match the oldest Node.js the tests run on (22), so
+      # code using APIs of newer versions fails the type check. Raise them
+      # by hand with the supported versions.
+      - dependency-name: '@types/node'
+        update-types: [version-update:semver-major]
+      # TypeScript 7 (the native compiler) has no compiler API for TypeDoc
+      # yet; drop this once TypeDoc's typescript peer range includes 7.
+      - dependency-name: typescript
+        versions: ['>=7']
