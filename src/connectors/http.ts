@@ -16,6 +16,7 @@
 import type { Connector, ConnectorHints, ReadHeadResult, ReadOptions } from './connector.js';
 import { ConnectorError, RangeNotSupportedError, SourceChangedError, redactPath } from '../errors.js';
 import { RequestLimiter, readAll } from './limiter.js';
+import { concatBytes, hash53 } from '../util.js';
 
 /** Longest backoff between two attempts, in milliseconds. */
 const MAX_BACKOFF_MS = 30_000;
@@ -102,6 +103,15 @@ export interface HttpConnectorOptions {
    * @defaultValue 65536 (64 KiB)
    */
   coalesceGap?: number;
+  /**
+   * Cache namespace (see {@link Connector.cacheNamespace}). Defaults to
+   * `http`, or, with `headers`, to `http:` plus a hash of them: headers
+   * such as `Authorization` may select different content at the same URL,
+   * so connectors with different headers do not share cache entries. Set
+   * it to share entries anyway, e.g. across rotating tokens for the same
+   * files.
+   */
+  cacheNamespace?: string;
 }
 
 /**
@@ -135,8 +145,8 @@ export interface HttpConnectorOptions {
  */
 export class HttpConnector implements Connector {
   readonly hints: ConnectorHints;
-  /** URLs identify resources globally. */
-  readonly cacheNamespace = 'http';
+  /** URLs identify resources globally, given the same request headers. */
+  readonly cacheNamespace: string;
 
   private readonly headers: Record<string, string>;
   /** Per-attempt timeout in milliseconds, or `null` for none. */
@@ -169,6 +179,7 @@ export class HttpConnector implements Connector {
     this.retryAttempts = attempts;
     this.retryBackoff = backoff;
     this.conditional = options?.conditionalRequests ?? false;
+    this.cacheNamespace = options?.cacheNamespace ?? headerNamespace(this.headers);
     this.hints = {
       prefetch: options?.prefetch ?? (isNode() ? 256 * 1024 : 16 * 1024),
       coalesceGap: options?.coalesceGap ?? 64 * 1024,
@@ -346,7 +357,7 @@ export class HttpConnector implements Connector {
       const { status } = response;
       const etag = versionTag(response.headers);
 
-      if ((status === 206 || status === 200) && expected !== undefined && etag !== null && !sameVersion(etag, expected)) {
+      if ((status === 206 || status === 200) && expected !== undefined && etag !== null && versionChanged(etag, expected)) {
         await discard(response);
         throw new SourceChangedError(`${redactPath(path)} changed since it was opened`, { path, status });
       }
@@ -428,7 +439,7 @@ export class HttpConnector implements Connector {
       return await this.withRetry(`${redactPath(path)} [HEAD]`, signal, async (attemptSignal) => {
         const response = await fetch(path, { method: 'HEAD', headers: this.headers, signal: attemptSignal });
         const tag = versionTag(response.headers);
-        if (!response.ok || (etag !== null && tag !== null && !sameVersion(tag, etag))) return null;
+        if (!response.ok || (etag !== null && tag !== null && versionChanged(tag, etag))) return null;
         const length = Number(response.headers.get('content-length') ?? NaN);
         return Number.isSafeInteger(length) && length >= 0 ? length : null;
       });
@@ -517,12 +528,32 @@ export class HttpConnector implements Connector {
  * @throws {TypeError} If `path` is not a valid URL.
  */
 function checkUrl(path: string): void {
-  const base = (globalThis as { location?: { href?: string } }).location?.href;
+  let base: string | undefined;
+  try {
+    base = (globalThis as { location?: { href?: string } }).location?.href;
+  } catch {
+    // Deno throws on access to location unless run with --location
+  }
   try {
     new URL(path, base);
   } catch {
     throw new TypeError(`Invalid URL: ${redactPath(path)}`);
   }
+}
+
+/**
+ * Default cache namespace for requests with `headers`: `http`, or `http:`
+ * plus a hash of the headers (names case-insensitive, in any order). The
+ * hash keeps header values such as tokens out of cache keys.
+ *
+ * @param headers - Request headers.
+ * @returns The namespace.
+ */
+function headerNamespace(headers: Record<string, string>): string {
+  const entries = Object.entries(headers).map(([k, v]) => `${k.toLowerCase()}:${v}`).sort();
+  if (entries.length === 0) return 'http';
+  const text = entries.join('\n');
+  return `http:${hash53(text, 1).toString(36)}${hash53(text, 2).toString(36)}`;
 }
 
 /**
@@ -540,11 +571,14 @@ function versionTag(headers: Headers): string | null {
 }
 
 /**
- * Whether two version tags denote the same version. ETags are compared
- * weakly (ignoring `W/`), as CDNs may weaken an origin's strong ETag.
+ * Whether two version tags show a change. ETags are compared weakly
+ * (ignoring `W/`), as CDNs may weaken an origin's strong ETag. An ETag and
+ * a `Last-Modified` tag cannot be compared (some responses of a server or
+ * CDN may lack the ETag), so they never show a change.
  */
-function sameVersion(a: string, b: string): boolean {
-  return (a.startsWith('W/') ? a.slice(2) : a) === (b.startsWith('W/') ? b.slice(2) : b);
+function versionChanged(a: string, b: string): boolean {
+  if (a.startsWith(LAST_MODIFIED_TAG) !== b.startsWith(LAST_MODIFIED_TAG)) return false;
+  return (a.startsWith('W/') ? a.slice(2) : a) !== (b.startsWith('W/') ? b.slice(2) : b);
 }
 
 /**
@@ -599,13 +633,6 @@ async function readBody(response: Response, max: number): Promise<Uint8Array> {
     pos += n;
     if (pos === out.length) break;
   }
-  return out;
-}
-
-function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
-  const out = new Uint8Array(a.length + b.length);
-  out.set(a);
-  out.set(b, a.length);
   return out;
 }
 

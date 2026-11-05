@@ -50,6 +50,8 @@ export interface LocalConnectorOptions {
 interface PoolEntry {
   /** Resolves to the open handle; shared by concurrent first readers. */
   handle: Promise<FileHandle>;
+  /** The file the handle reads (device and inode never change), once known. */
+  file: Promise<Stats> | null;
   /** Number of reads currently using the handle. */
   refs: number;
   /** Set once the entry has left the pool; the last release closes it. */
@@ -107,8 +109,8 @@ export class LocalConnector implements Connector {
    * the file is smaller than `offset + length`.
    *
    * With {@link ReadOptions.ifMatch}, the version tag (inode, size and
-   * modification time) of the file the read goes through is checked
-   * first.
+   * modification time) is checked first, both of the file the read goes
+   * through and of the file now at `path`.
    *
    * @param path - Absolute or relative filesystem path to the FGB file.
    * @param offset - Zero-based byte offset to begin reading from.
@@ -153,7 +155,8 @@ export class LocalConnector implements Connector {
       try {
         const handle = await entry.handle;
         const [opened, current] = await Promise.all([handle.stat(), stat(path)]);
-        if ((opened.ino !== current.ino || opened.dev !== current.dev) && attempt === 0) {
+        entry.file ??= Promise.resolve(opened);
+        if (!sameFile(opened, current) && attempt === 0) {
           this.evict(path); // pooled handle belongs to a replaced file
           continue;
         }
@@ -211,9 +214,10 @@ export class LocalConnector implements Connector {
   }
 
   /**
-   * Read ranges through one pooled handle, after checking that handle's
-   * file against `ifMatch` (the handle may belong to a file that has since
-   * been replaced at `path`; reads through it are then refused).
+   * Read ranges through one pooled handle, after checking `ifMatch` against
+   * the file now at `path` (catching edits in place and a file replaced at
+   * `path`, e.g. renamed over it), and that the handle reads that file
+   * (not one pooled before a replacement).
    *
    * @param path - Filesystem path.
    * @param ranges - Validated byte ranges.
@@ -228,9 +232,17 @@ export class LocalConnector implements Connector {
     const entry = this.acquire(path);
     try {
       const handle = await entry.handle;
-      if (options?.ifMatch !== undefined && versionTag(await handle.stat()) !== options.ifMatch) {
-        this.evict(path);
-        throw new SourceChangedError(`${path} changed since it was opened`, { path });
+      if (options?.ifMatch !== undefined) {
+        if (!entry.file) {
+          const file = handle.stat();
+          entry.file = file;
+          file.catch(() => { if (entry.file === file) entry.file = null; }); // retried by the next read
+        }
+        const [opened, current] = await Promise.all([entry.file, stat(path)]);
+        if (versionTag(current) !== options.ifMatch || !sameFile(opened, current)) {
+          this.evict(path);
+          throw new SourceChangedError(`${path} changed since it was opened`, { path });
+        }
       }
       return await Promise.all(
         ranges.map(({ offset, length }) => (length === 0 ? new Uint8Array(0) : readFromHandle(handle, offset, length))),
@@ -265,7 +277,7 @@ export class LocalConnector implements Connector {
       return existing;
     }
 
-    const entry: PoolEntry = { handle: open(path, 'r'), refs: 1, retired: false };
+    const entry: PoolEntry = { handle: open(path, 'r'), file: null, refs: 1, retired: false };
     // A failed open must not stay cached; the error reaches the caller via `await`.
     entry.handle.catch(() => {
       entry.retired = true;
@@ -347,6 +359,11 @@ async function readFromHandle(handle: FileHandle, offset: number, length: number
   }
 
   return new Uint8Array(buf.buffer, buf.byteOffset, totalRead);
+}
+
+/** Whether two stats describe the same file (device and inode). */
+function sameFile(a: Stats, b: Stats): boolean {
+  return a.ino === b.ino && a.dev === b.dev;
 }
 
 /**

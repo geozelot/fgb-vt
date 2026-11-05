@@ -497,6 +497,9 @@ export class S3Connector implements Connector {
           deadline.signal.removeEventListener('abort', onAbort);
         }
         if (bytes.length < expected) {
+          // A cancelled web stream ends early instead of failing: report
+          // the abort or timeout, not a truncated body
+          if (deadline.signal.aborted) throw this.sdkError(deadline.signal.reason, path, where, deadline, options?.signal);
           throw new ConnectorError(
             `Truncated response reading ${where}: ${bytes.length} of ${expected} bytes`,
             { path, retryable: true },
@@ -538,7 +541,9 @@ export class S3Connector implements Connector {
     }
     if (err instanceof ConnectorError) return err;
     const status: number | undefined = err?.$metadata?.httpStatusCode;
-    const retryable = Boolean(err?.$retryable) || status === undefined || status >= 500 || status === 429 || status === 408;
+    const retryable = Boolean(err?.$retryable) || (status === undefined
+      ? isTransientNetworkError(err)
+      : status >= 500 || status === 429 || status === 408);
     const name = typeof err?.name === 'string' && err.name !== 'Error' ? `${err.name}: ` : '';
     return new ConnectorError(`S3 GetObject failed for ${where}: ${name}${err?.message ?? String(err)}`, {
       path, retryable, cause: err, ...(status !== undefined ? { status } : {}),
@@ -621,6 +626,28 @@ export class S3Connector implements Connector {
 function isInvalidRange(err: any): boolean {
   return err?.name === 'InvalidRange' || err?.Code === 'InvalidRange' ||
     err?.$metadata?.httpStatusCode === 416;
+}
+
+/**
+ * Error codes and names of failures without an HTTP response that may
+ * succeed on retry: dropped or refused connections and timeouts (the
+ * transient errors of the SDK's own retry strategy). Errors such as a
+ * missing region or credentials are permanent.
+ */
+const TRANSIENT_NETWORK_ERRORS = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN',
+  'TimeoutError', 'RequestTimeout', 'RequestTimeoutException',
+]);
+
+/**
+ * Whether an SDK error without an HTTP status is a transient network failure.
+ *
+ * @param err - Error thrown by `S3Client.send` or while reading the body.
+ * @returns `true` if retrying may succeed.
+ */
+function isTransientNetworkError(err: any): boolean {
+  return TRANSIENT_NETWORK_ERRORS.has(err?.code) || TRANSIENT_NETWORK_ERRORS.has(err?.name) ||
+    TRANSIENT_NETWORK_ERRORS.has(err?.cause?.code);
 }
 
 /**

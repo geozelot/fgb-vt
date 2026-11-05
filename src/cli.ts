@@ -19,12 +19,13 @@ const USAGE = `Usage: fgb-vt check [options] <file|url|s3://bucket/key>...
 
 Verify FlatGeobuf files completely: header, every spatial index node, and
 every feature (offsets and boxes against the index). Exits with 1 if any
-file has errors.
+file has errors or cannot be read.
 
 Options:
   --quick           check the header and the spatial index only
   --max-bytes <n>   read at most n bytes of features per file
-  --json            print the reports as JSON
+  --json            print the reports as JSON (a file that cannot be read
+                    as { path, ok: false, error })
   -h, --help        show this help
 `;
 
@@ -115,7 +116,8 @@ async function main(argv: string[]): Promise<number> {
   }
 
   const connectors = new Map<string, Connector>();
-  const reports: CheckReport[] = [];
+  // Files that could not be read are listed too, with the error
+  const reports: Array<CheckReport | { path: string; ok: false; error: string }> = [];
   let failed = false;
   try {
     for (const path of args.paths) {
@@ -126,7 +128,9 @@ async function main(argv: string[]): Promise<number> {
         if (!args.json) process.stdout.write(`${formatReport(report)}\n\n`);
       } catch (err) {
         failed = true;
-        process.stderr.write(`${path}: ${(err as Error).message}\n\n`);
+        const error = (err as Error)?.message ?? String(err);
+        reports.push({ path, ok: false, error });
+        process.stderr.write(`${path}: ${error}\n\n`);
       }
     }
   } finally {

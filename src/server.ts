@@ -57,6 +57,7 @@ import { resolveFrame } from './geometry/crs.js';
 import { openSources, type OpenOptions } from './client.js';
 import { featureSchema, emittedColumns } from './schema.js';
 import { withPath } from './errors.js';
+import { MAX_ZOOM } from './tiles.js';
 
 /**
  * Options for {@link TileServer.tileJSON}.
@@ -306,7 +307,7 @@ export class TileServer {
    *   invalid, the root of its spatial index, converted to WGS 84. Without
    *   either (an unindexed file without envelope) the world is assumed.
    * - **`minzoom` / `maxzoom`**: the lowest `minZoom` and highest `maxZoom`
-   *   of the sources.
+   *   of the sources, as the zoom levels served (integers from 0 to 30).
    * - **`fields`**: the columns actually written as properties, after the
    *   source's `properties` selection and without the id column (unless
    *   kept) and binary columns.
@@ -335,13 +336,13 @@ export class TileServer {
 
     const vectorLayers: TileJSON['vector_layers'] = [];
     let bounds: [number, number, number, number] = [180, 90, -180, -90];
-    const defaults = resolveOptions(undefined, this.options);
+    const defaults = zoomRange(resolveOptions(undefined, this.options));
     let minzoom = sources.length > 0 ? Infinity : defaults.minZoom;
     let maxzoom = sources.length > 0 ? -Infinity : defaults.maxZoom;
 
     sources.forEach(({ source }, i) => {
       const { header, bounds: b } = opened[i];
-      const opts = resolveOptions(source.options, this.options);
+      const opts = zoomRange(resolveOptions(source.options, this.options));
 
       const fields: Record<string, string> = {};
       for (const col of emittedColumns(featureSchema(source), header)) {
@@ -466,4 +467,19 @@ function columnTypeToString(type: number): string {
     case 14: return 'String';  // Binary
     default: return 'String';
   }
+}
+
+/**
+ * The zoom levels a source is served at, for TileJSON: `minZoom` and
+ * `maxZoom` may be any numbers (e.g. `Infinity` for no limit), but tiles
+ * exist only at integer zooms from 0 to {@link MAX_ZOOM}.
+ *
+ * @param opts - Resolved options.
+ * @returns The lowest and highest zoom served.
+ */
+function zoomRange(opts: { minZoom: number; maxZoom: number }): { minZoom: number; maxZoom: number } {
+  return {
+    minZoom: Math.min(MAX_ZOOM, Math.max(0, Math.ceil(opts.minZoom))),
+    maxZoom: Math.min(MAX_ZOOM, Math.max(0, Math.floor(opts.maxZoom))),
+  };
 }

@@ -61,9 +61,9 @@ export interface SourceOptions {
   buffer?: number;
   /** Douglas-Peucker simplification tolerance in tile units (`>= 0`). @defaultValue 3 */
   tolerance?: number;
-  /** Skip this source above this zoom level (an integer from 0 to 30). @defaultValue 24 */
+  /** Skip this source above this zoom level (`Infinity` for no limit). @defaultValue 24 */
   maxZoom?: number;
-  /** Skip this source below this zoom level (an integer from 0 to 30, at most `maxZoom`). @defaultValue 0 */
+  /** Skip this source below this zoom level (at most `maxZoom`). @defaultValue 0 */
   minZoom?: number;
   /**
    * Most features this source may contribute to one tile. Checked against
@@ -158,8 +158,19 @@ export interface Source {
    * are read and decoded first, and budgets such as `maxFeatures` count
    * them before filtering. To read less at low zooms, use an overview file
    * (a source with the same name and a lower `maxZoom`).
+   *
+   * Tile ETags identify a filter by its source text: when its result
+   * depends on anything else (e.g. configuration it reads), change
+   * {@link Source.revision} with it.
    */
   filter?: FeatureFilter;
+  /**
+   * Revision of this source's settings, part of its tile ETags. Change it
+   * when the tiles change in a way the ETag cannot see: a `filter` or
+   * `crs` projection that behaves differently with the same source text,
+   * e.g. because it reads configuration. A build or deployment id works.
+   */
+  revision?: string;
 }
 
 /**
@@ -297,8 +308,9 @@ export function validateTileOptions(options: Required<TileOptions>): Required<Ti
     const v = options[key];
     if (!(v >= 0 && v !== Infinity)) throw new RangeError(`${key} must be a non-negative finite number, got ${v}`);
   }
+  // Any number bounds the zooms served (e.g. Infinity for no limit)
   for (const [key, v] of [['minZoom', minZoom], ['maxZoom', maxZoom]] as const) {
-    if (!Number.isInteger(v) || v < 0 || v > 30) throw new RangeError(`${key} must be an integer from 0 to 30, got ${v}`);
+    if (typeof v !== 'number' || Number.isNaN(v)) throw new RangeError(`${key} must be a number, got ${String(v)}`);
   }
   if (minZoom > maxZoom) throw new RangeError(`minZoom (${minZoom}) is greater than maxZoom (${maxZoom})`);
   for (const key of ['maxFeatures', 'maxReadBytes', 'maxTileBytes'] as const) {
@@ -316,8 +328,8 @@ export function validateTileOptions(options: Required<TileOptions>): Required<Ti
  * and the connector path.
  *
  * @param source - Source descriptor.
- * @throws {TypeError} If the name or path is not a non-empty string, or
- *   `filter` is not a function.
+ * @throws {TypeError} If the name or path is not a non-empty string,
+ *   `filter` is not a function, or `revision` is not a string.
  */
 export function validateSource(source: Source): void {
   if (typeof source?.name !== 'string' || source.name.length === 0) {
@@ -328,5 +340,8 @@ export function validateSource(source: Source): void {
   }
   if (source.filter !== undefined && typeof source.filter !== 'function') {
     throw new TypeError(`Source filter of layer "${source.name}" must be a function`);
+  }
+  if (source.revision !== undefined && typeof source.revision !== 'string') {
+    throw new TypeError(`Source revision of layer "${source.name}" must be a string`);
   }
 }

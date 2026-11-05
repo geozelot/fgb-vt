@@ -36,7 +36,7 @@ import type { Source, TileOptions } from './source.js';
 import { validateSource } from './source.js';
 import { computeTileETag, processTile, withSource, type RequestOptions } from './pipeline.js';
 import { MemoryCache, type ByteCache } from './cache.js';
-import { createIoContext, forgetSources, invalidateSource, type IoContext, type IoOptions } from './fgb/reader.js';
+import { createIoContext, forgetHeaders, forgetSources, invalidateSource, type IoContext, type IoOptions } from './fgb/reader.js';
 import { resolveFrame } from './geometry/crs.js';
 import { featureSchema, validateSchema } from './schema.js';
 import { withPath } from './errors.js';
@@ -245,8 +245,9 @@ export class TileClient {
   /**
    * Forget what is cached about a file, so the next request re-reads its
    * header and index, e.g. after the file was replaced at the same path.
-   * Without a path, every opened source is forgotten (and the client's own
-   * cache cleared).
+   * Without a path, every source is reopened from its file (the client's
+   * own cache is cleared; in a cache passed as an option, the entries are
+   * replaced as the files are read again).
    *
    * Files with version tags are detected as changed automatically; this is
    * for connectors and servers that report none.
@@ -256,6 +257,9 @@ export class TileClient {
    */
   async invalidate(path?: string): Promise<void> {
     if (path !== undefined) return invalidateSource(this.connector, path, this.context);
+    // A shared cache cannot be cleared, and its header entries name no
+    // client: distrust every header cached until now instead
+    forgetHeaders(this.context);
     if (this.cache) {
       forgetSources(this.cache);
       if (this.ownsCache) (this.cache as MemoryCache).clear();

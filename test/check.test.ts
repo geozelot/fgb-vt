@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { checkFile } from '../src/check.js';
 import { LocalConnector } from '../src/connectors/local.js';
 import type { Connector } from '../src/connectors/connector.js';
+import { RangeNotSupportedError } from '../src/errors.js';
 import { parseHeader } from '../src/fgb/header.js';
 import { fixture } from './helpers/tiles.js';
 
@@ -90,6 +91,21 @@ describe('checkFile', () => {
   });
 });
 
+describe('read failures', () => {
+  it('are thrown, not reported as problems of the file', async () => {
+    const bytes = readFileSync(fixture('points.fgb'));
+    const noRanges: Connector = {
+      read: async (_path, offset, length) => {
+        if (offset > 0) throw new RangeNotSupportedError('Server does not support byte-range requests');
+        return new Uint8Array(bytes.subarray(0, length));
+      },
+      readRanges: async () => { throw new Error('unused'); },
+      close: async () => {},
+    };
+    await expect(checkFile(noRanges, 'points.fgb')).rejects.toThrow(RangeNotSupportedError);
+  });
+});
+
 describe('fgb-vt check', () => {
   const cli = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
   const loader = pathToFileURL(fileURLToPath(new URL('../node_modules/tsx/dist/loader.mjs', import.meta.url))).href;
@@ -110,5 +126,14 @@ describe('fgb-vt check', () => {
   it('prints JSON reports', async () => {
     const { stdout } = await run('check', '--json', fixture('single.fgb'));
     expect(JSON.parse(stdout)[0]).toMatchObject({ ok: true, header: { geometryType: 'Polygon', featuresCount: 1 } });
+  }, 30_000);
+
+  it('lists files that cannot be read in the JSON output', async () => {
+    const { code, stdout } = await run('check', '--json', fixture('single.fgb'), '/nonexistent/x.fgb');
+    expect(code).toBe(1);
+    const reports = JSON.parse(stdout);
+    expect(reports).toHaveLength(2);
+    expect(reports[1]).toMatchObject({ path: '/nonexistent/x.fgb', ok: false });
+    expect(reports[1].error).toMatch(/nonexistent/);
   }, 30_000);
 });

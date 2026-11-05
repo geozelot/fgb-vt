@@ -38,6 +38,7 @@ import { computeLevelBounds } from './index.js';
 import { decodeFeatureChunk } from './feature.js';
 import type { FeatureSchema } from '../schema.js';
 import { FormatError, IndexMismatchError, LimitExceededError, redactPath } from '../errors.js';
+import { concatBytes } from '../util.js';
 
 /** Byte size of one packed R-tree node (4 x f64 bbox + u64 offset). */
 const NODE_BYTES = 40;
@@ -66,6 +67,12 @@ const LAST_FEATURE_GUESS = 64 * 1024;
 /** Index page size bounds, in nodes. */
 const MIN_PAGE_NODES = 64;
 const MAX_PAGE_NODES = 1024;
+
+/**
+ * How long a confirmed file version is trusted by {@link FgbSource.revalidate}
+ * before the file is asked again, in milliseconds.
+ */
+const REVALIDATE_MS = 1000;
 
 /** Version of the cache entry layout; part of every key. */
 const CACHE_PREFIX = 'fgb-vt:2';
@@ -128,6 +135,11 @@ export interface IoContext {
   cache: ByteCache | null;
   /** Memo of opened sources, or `null` to open per request. */
   registry: SourceRegistry | null;
+  /**
+   * Cached headers written at or before this time (`Date.now()`) are not
+   * used: the header is read from the file again (see {@link forgetHeaders}).
+   */
+  headersStaleUntil: number;
   prefetch?: number;
   coalesceGap?: number;
   maxScanBytes?: number;
@@ -214,6 +226,10 @@ export class FgbSource {
   private readonly seed = new Map<number, Uint8Array>();
   /** Page reads in progress, shared by concurrent queries. */
   private readonly inflight = new Map<number, Promise<Uint8Array>>();
+  /** When the file last confirmed {@link etag} (`Date.now()`), or 0. */
+  private checkedAt = 0;
+  /** Version check in progress, shared by concurrent callers. */
+  private checking: Promise<void> | null = null;
 
   private constructor(
     connector: Connector,
@@ -261,7 +277,7 @@ export class FgbSource {
 
     if (cache) {
       const cached = decodeHeaderEntry(await cache.get(headerKey));
-      if (cached) {
+      if (cached && cached.time > context.headersStaleUntil) {
         return new FgbSource(
           connector, path, parseHeader(cached.headerBytes), cached.size, cached.etag, cached.token, context,
         );
@@ -281,7 +297,7 @@ export class FgbSource {
         ...readOptions,
         ...(head.etag !== null ? { ifMatch: head.etag } : {}),
       });
-      bytes = concat(bytes, rest);
+      bytes = concatBytes(bytes, rest);
     }
 
     const header = parseHeader(bytes);
@@ -294,11 +310,46 @@ export class FgbSource {
 
     const token = randomToken();
     const source = new FgbSource(connector, path, header, head.size, head.etag, token, context);
+    source.checkedAt = Date.now();
     if (cache) {
-      await cache.set(headerKey, encodeHeaderEntry(head.size, head.etag, token, bytes.subarray(0, headerSize)));
+      await cache.set(headerKey, encodeHeaderEntry(head.size, head.etag, token, Date.now(), bytes.subarray(0, headerSize)));
     }
     await source.seedPages(bytes);
     return source;
+  }
+
+  /**
+   * Confirm that the file still has the version this source was opened
+   * with, by reading its first byte with {@link ReadOptions.ifMatch}.
+   *
+   * Reads of the index and features check the version anyway; this is for
+   * callers that rely on {@link etag} without reading, such as tile ETags.
+   * A version confirmed less than a second ago is trusted, and concurrent
+   * callers share one check.
+   *
+   * @param signal - Optional abort signal.
+   * @throws {SourceChangedError} If the file changed since it was opened.
+   */
+  async revalidate(signal?: AbortSignal): Promise<void> {
+    if (this.etag === null) return;
+    signal?.throwIfAborted();
+    if (Date.now() - this.checkedAt < REVALIDATE_MS) return;
+    if (!this.checking) {
+      const check = this.connector.read(this.path, 0, 1, { ifMatch: this.etag }).then(() => {
+        this.checkedAt = Date.now();
+      });
+      this.checking = check;
+      const done = () => { if (this.checking === check) this.checking = null; };
+      check.then(done, done);
+    }
+    const check = this.checking;
+    if (!signal) return check;
+    // The shared check runs on; only this caller stops waiting
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = () => reject(signal.reason);
+      signal.addEventListener('abort', onAbort, { once: true });
+      check.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+    });
   }
 
   /** Whether the file has a spatial index. */
@@ -1067,6 +1118,7 @@ export function createIoContext(io: IoOptions | undefined, defaultCache: ByteCac
     // Cache failures (a full disk, an unreachable store) are misses
     cache: cache ? guardCache(cache) : null,
     registry,
+    headersStaleUntil: -Infinity,
     prefetch: io?.prefetch,
     coalesceGap: io?.coalesceGap,
     maxScanBytes: io?.maxScanBytes,
@@ -1094,6 +1146,18 @@ export async function invalidateSource(connector: Connector, path: string, conte
  */
 export function forgetSources(cache: ByteCache): void {
   registries.get(cache)?.clear();
+}
+
+/**
+ * Stop using the headers `context` finds in its cache now: each source
+ * opened through `context` re-reads its header (and, without a version
+ * tag, its index) from the file. Entries stay in the cache for other
+ * users until they are overwritten by the fresh reads.
+ *
+ * @param context - The I/O context whose cached headers to distrust.
+ */
+export function forgetHeaders(context: IoContext): void {
+  context.headersStaleUntil = Date.now();
 }
 
 // == Helpers =================================================================
@@ -1214,8 +1278,14 @@ function deferred<T>(): Deferred<T> {
 /**
  * Serialize a header cache entry: `[u32 metaLength][meta JSON][header bytes]`.
  */
-function encodeHeaderEntry(size: number | null, etag: string | null, token: string, headerBytes: Uint8Array): Uint8Array {
-  const meta = textEncoder.encode(JSON.stringify({ size, etag, token }));
+function encodeHeaderEntry(
+  size: number | null,
+  etag: string | null,
+  token: string,
+  time: number,
+  headerBytes: Uint8Array,
+): Uint8Array {
+  const meta = textEncoder.encode(JSON.stringify({ size, etag, token, time }));
   const out = new Uint8Array(4 + meta.length + headerBytes.length);
   new DataView(out.buffer).setUint32(0, meta.length, true);
   out.set(meta, 4);
@@ -1228,7 +1298,7 @@ function encodeHeaderEntry(size: number | null, etag: string | null, token: stri
  */
 function decodeHeaderEntry(
   entry: Uint8Array | undefined,
-): { size: number | null; etag: string | null; token: string; headerBytes: Uint8Array } | null {
+): { size: number | null; etag: string | null; token: string; time: number; headerBytes: Uint8Array } | null {
   if (!entry || entry.length < 4) return null;
   try {
     const metaLength = new DataView(entry.buffer, entry.byteOffset, 4).getUint32(0, true);
@@ -1239,6 +1309,7 @@ function decodeHeaderEntry(
       size: typeof meta.size === 'number' ? meta.size : null,
       etag: typeof meta.etag === 'string' ? meta.etag : null,
       token: meta.token,
+      time: typeof meta.time === 'number' ? meta.time : 0,
       headerBytes: entry.subarray(4 + metaLength),
     };
   } catch {
@@ -1249,13 +1320,6 @@ function decodeHeaderEntry(
 /** A random token identifying one read of a file's header. */
 function randomToken(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
-}
-
-function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
-  const out = new Uint8Array(a.length + b.length);
-  out.set(a);
-  out.set(b, a.length);
-  return out;
 }
 
 /**

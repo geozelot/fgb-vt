@@ -3,8 +3,8 @@
  * of sibling sources, feature filters, coarsening to fit maxTileBytes,
  * tile ETags, invalidation, and recovery of sources without version tags.
  */
-import { describe, it, expect, afterAll } from 'vitest';
-import { copyFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { describe, it, expect, afterAll, vi } from 'vitest';
+import { copyFileSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { tile, tileETag, clearTileCache } from '../src/tile.js';
@@ -14,7 +14,10 @@ import { LocalConnector } from '../src/connectors/local.js';
 import { ConnectorError, LimitExceededError } from '../src/errors.js';
 import type { Connector, ReadOptions } from '../src/connectors/connector.js';
 import type { TileStats } from '../src/pipeline.js';
+import { MemoryCache } from '../src/cache.js';
+import { GeomType } from '../src/types.js';
 import { fixture, decodeLayer, features, tileAt } from './helpers/tiles.js';
+import { writeFgb, prop } from './helpers/fgb-writer.js';
 
 const connector = new LocalConnector();
 afterAll(() => connector.close());
@@ -47,7 +50,7 @@ describe('option validation', () => {
     [{ tolerance: -3 }, /tolerance/],
     [{ pointGrid: Infinity }, /pointGrid/],
     [{ minZoom: 10, maxZoom: 2 }, /minZoom/],
-    [{ maxZoom: 31 }, /maxZoom/],
+    [{ maxZoom: NaN }, /maxZoom/],
     [{ maxFeatures: NaN }, /maxFeatures/],
   ])('rejects %j before reading', async (options, message) => {
     const counting = new Untagged();
@@ -60,6 +63,20 @@ describe('option validation', () => {
     await expect(tile(connector, 0, 0, 0, { name: 'p', path: '' })).rejects.toThrow(TypeError);
     await expect(tile(connector, 0, 0, 0, source, { prefetch: -1 })).rejects.toThrow(/prefetch/);
     expect(() => new TileServer({ connector, sources: { name: 'p', path: POINTS, options: { extent: 0 } } })).toThrow(RangeError);
+  });
+
+  it('accepts any zoom limit, as 1.0.5 did, and lists the zooms served in TileJSON', async () => {
+    const local = new LocalConnector();
+    const server = new TileServer({
+      connector: local,
+      sources: { name: 'p', path: POINTS, options: { minZoom: 2.5, maxZoom: Infinity } },
+    });
+    expect(features(decodeLayer(await server.tile(2, 0, 0), 'p'))).toHaveLength(0);
+    const tj = await server.tileJSON();
+    expect([tj.minzoom, tj.maxzoom]).toEqual([3, 30]);
+    expect(tj.vector_layers[0]).toMatchObject({ minzoom: 3, maxzoom: 30 });
+    expect(() => new TileServer({ connector: local, sources: { name: 'p', path: POINTS, options: { maxZoom: 32 } } })).not.toThrow();
+    await server.close();
   });
 });
 
@@ -124,6 +141,29 @@ describe('filter', () => {
     expect(features(layer).every(f => Object.keys(f.properties).length === 0)).toBe(true);
   });
 
+  it('filters the world copies of a scanned file on all properties', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fgbvt-filter-'));
+    try {
+      const path = join(dir, 'am.fgb');
+      writeFileSync(path, writeFgb({
+        geometryType: GeomType.Point,
+        columns: [{ name: 'class', type: 11 }, { name: 'name', type: 11 }],
+        features: [
+          { geometry: { xy: [179.9, 10] }, properties: prop.concat(prop.string(0, 'major'), prop.string(1, 'east')) },
+          { geometry: { xy: [-179.9, 10] }, properties: prop.concat(prop.string(0, 'major'), prop.string(1, 'west')) },
+        ],
+      }));
+      const { y } = tileAt(0, 10, 2);
+      // West edge tile: the point at 179.9° is a world copy in the buffer
+      const layer = decodeLayer(await tile(connector, 2, 0, y, {
+        name: 'l', path, properties: ['name'], filter: f => f.properties.class === 'major',
+      }), 'l');
+      expect(features(layer).map(f => f.properties.name).sort()).toEqual(['east', 'west']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('reports filtered features in the stats', async () => {
     let stats: TileStats | undefined;
     await tile(connector, 0, 0, 0, { name: 'p', path: POINTS, filter: f => f.id === 7 }, { onTile: s => { stats = s; } });
@@ -161,6 +201,7 @@ describe('tile ETags', () => {
     expect(await tileETag(connector, 3, 2, 3, source)).not.toBe(a);
     expect(await tileETag(connector, 3, 1, 3, { ...source, options: { tolerance: 1 } })).not.toBe(a);
     expect(await tileETag(connector, 3, 1, 3, { ...source, filter: () => true })).not.toBe(a);
+    expect(await tileETag(connector, 3, 1, 3, { ...source, revision: 'deploy-2' })).not.toBe(a);
     expect(await tileETag(connector, 3, 1, 3, source, { omitEmptyLayers: true })).not.toBe(a);
   });
 
@@ -177,6 +218,32 @@ describe('tile ETags', () => {
       await server.invalidate(path);
       expect(await server.tileETag(0, 0, 0)).not.toBe(before);
       await server.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('changes when the file is replaced, without rendering or invalidating', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fgbvt-etag-'));
+    try {
+      const path = join(dir, 'data.fgb');
+      copyFileSync(POINTS, path);
+      const server = new TileServer({ connector: new LocalConnector(), sources: { name: 'p', path } });
+      const before = await server.tileETag(0, 0, 0);
+      copyFileSync(fixture('grid-5k.fgb'), join(dir, 'next.fgb'));
+      renameSync(join(dir, 'next.fgb'), path);
+      // Versions confirmed within the last second are trusted
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        vi.setSystemTime(Date.now() + 1500);
+        expect(await server.tileETag(0, 0, 0)).not.toBe(before);
+      } finally {
+        vi.useRealTimers();
+      }
+      // Tiles come from the new file, although its old handle was pooled
+      const fresh = new TileServer({ connector: new LocalConnector(), sources: { name: 'p', path } });
+      expect(Buffer.from(await server.tile(0, 0, 0)).equals(Buffer.from(await fresh.tile(0, 0, 0)))).toBe(true);
+      await Promise.all([server.close(), fresh.close()]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -223,6 +290,24 @@ describe('sources without version tags', () => {
     await client.tile(0, 0, 0, source);
     expect(offsets).not.toContain(0); // header and index from the cache
     await client.invalidate('f');
+    await client.tile(0, 0, 0, source);
+    expect(offsets).toContain(0);
+  });
+
+  it('re-read their headers after invalidate() without a path, also from a cache passed in', async () => {
+    const untagged = new Untagged();
+    const offsets: number[] = [];
+    const read = untagged.read.bind(untagged);
+    untagged.read = async (path, offset, length) => {
+      offsets.push(offset);
+      return read(path, offset, length);
+    };
+    untagged.files.set('f', new Uint8Array(readFileSync(POINTS)));
+    const client = new TileClient(untagged, { cache: new MemoryCache() });
+    const source = { name: 'p', path: 'f' };
+    await client.tile(0, 0, 0, source);
+    offsets.length = 0;
+    await client.invalidate();
     await client.tile(0, 0, 0, source);
     expect(offsets).toContain(0);
   });

@@ -194,6 +194,7 @@ new HttpConnector({
   maxConcurrency: 32,
   retry: { attempts: 3, backoff: 200 },  // exponential with jitter; honours Retry-After
   conditionalRequests: false,            // true: also send If-Match (bypasses HTTP caches)
+  cacheNamespace: undefined,             // default: per set of headers (see Changing files)
 });
 
 new S3Connector({
@@ -227,7 +228,7 @@ Options cascade: **source** `options` override **tile-level** options (construct
 | `extent` | `4096` | Tile coordinate extent |
 | `buffer` | `64` | Buffer around the tile, in tile units |
 | `tolerance` | `3` | Douglas-Peucker simplification tolerance, in tile units (`0` = off) |
-| `minZoom` / `maxZoom` | `0` / `24` | Zoom range in which the source contributes |
+| `minZoom` / `maxZoom` | `0` / `24` | Zoom range in which the source contributes (`maxZoom: Infinity` for no limit) |
 | `simplifyBeforeClip` | `false` | Simplify whole features before clipping, so adjacent tiles match exactly along their edges (costs simplifying every feature in full) |
 | `pointGrid` | `0` | Keep at most one point per cell of this size in tile units (`0` = off); use a divisor of `extent` |
 | `maxFeatures` | `Infinity` | Most features a source may contribute to one tile |
@@ -275,6 +276,7 @@ sources: [
 | `keepIdProperty` | `false` | Also write the id column as a property |
 | `useIndex` | `true` | `false` ignores the spatial index and scans the file (within `maxScanBytes`), e.g. for files whose index is broken |
 | `filter` | | `(feature, zoom) => boolean`: write only some features. Sees every property (also those left out by `properties`), the id and the geometry family |
+| `revision` | | Part of the source's [tile ETags](#io-and-caching): change it when a `filter` or projection behaves differently with the same source text, e.g. because it reads configuration |
 
 ```typescript
 {
@@ -375,9 +377,9 @@ const server = new TileServer(layers, {
 });
 ```
 
-**Changing files** — cache entries are keyed by connector, path and version tag (ETag or `Last-Modified` over HTTP, ETag in S3, inode, size and modification time locally). Every response is checked against the version tag; when a file is replaced, its source is reopened automatically. Without version tags, a replaced file is detected when its data no longer matches the cached index, and `invalidate(path)` (or `clearTileCache()` for `tile()`) forgets it explicitly.
+**Changing files** — cache entries are keyed by connector, path and version tag (ETag or `Last-Modified` over HTTP, ETag in S3, inode, size and modification time locally). Every response is checked against the version tag; when a file is changed or replaced (also by renaming a new file over it), its source is reopened automatically. Without version tags, a replaced file is detected when its data no longer matches the cached index, and `invalidate(path)` (or `clearTileCache()` for `tile()`) forgets it explicitly; `invalidate()` without a path re-reads every file. Cache entries are shared between connectors of the same kind (`local`, `s3:<endpoint>`); `HttpConnector`s share them only with the same `headers`, which may select different content at the same URL, unless their `cacheNamespace` says otherwise.
 
-**Tile ETags** — `tileETag(z, x, y)` (on `TileServer`, `TileClient`, and as a function next to `tile()`) returns a strong ETag computed from the files' version tags, the tile coordinates and every setting that affects the tile, without rendering it: answer `If-None-Match` with `304`, and let CDNs revalidate cheaply. It is `null` when a connector reports no version tag.
+**Tile ETags** — `tileETag(z, x, y)` (on `TileServer`, `TileClient`, and as a function next to `tile()`) returns a strong ETag computed from the files' version tags, the tile coordinates and every setting that affects the tile, without rendering it: answer `If-None-Match` with `304`, and let CDNs revalidate cheaply. Each file's version is confirmed with a one-byte read (at most once a second per file), so the ETag changes as soon as a file does. It is `null` when a connector reports no version tag. A `filter` or projection counts by its source text; set the source's `revision` when its behaviour changes otherwise.
 
 **Cache failures** — a failing `ByteCache` (a full `/tmp`, an unreachable key-value store) never fails a tile: failed reads are misses, failed writes are skipped.
 

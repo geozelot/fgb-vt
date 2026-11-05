@@ -27,7 +27,8 @@ import { headerByteSize, isValidBBox, parseHeader } from './fgb/header.js';
 import { computeLevelBounds } from './fgb/index.js';
 import { decodeFeatureChunk } from './fgb/feature.js';
 import { classifyCrs, crsIdentifier } from './geometry/crs.js';
-import { FgbVtError } from './errors.js';
+import { ConnectorError, FgbVtError } from './errors.js';
+import { concatBytes } from './util.js';
 
 /** A problem found by {@link checkFile}. */
 export interface CheckProblem {
@@ -140,7 +141,8 @@ const COLUMN_TYPES = [
  * @param path - Connector-specific path of the file.
  * @param options - Scope and limits of the check.
  * @returns The report; `ok` is `false` if any error was found.
- * @throws {ConnectorError} If the file cannot be read at all.
+ * @throws {ConnectorError} If the file cannot be read (missing, no range
+ *   support, changed while being checked).
  *
  * @example
  * ```typescript
@@ -171,11 +173,11 @@ export async function checkFile(connector: Connector, path: string, options: Che
     let bytes = head.bytes;
     if (bytes.length >= 8) report.version = `${bytes[3]}.0.${bytes[7]}`;
     const headerSize = headerByteSize(bytes);
-    if (headerSize > bytes.length) bytes = concat(bytes, await read(bytes.length, headerSize - bytes.length));
+    if (headerSize > bytes.length) bytes = concatBytes(bytes, await read(bytes.length, headerSize - bytes.length));
     header = parseHeader(bytes);
   } catch (err) {
-    if (!(err instanceof FgbVtError) || err.code === 'FGB_IO') throw err;
-    problems.add('error', 'header', err.message, (err as { offset?: number }).offset);
+    if (!isFileProblem(err)) throw err;
+    problems.add('error', 'header', err.message, err.offset);
     return finish(report, problems);
   }
   summarizeHeader(report, header, problems);
@@ -193,10 +195,19 @@ export async function checkFile(connector: Connector, path: string, options: Che
     }
     await leaves?.finish();
   } catch (err) {
-    if (!(err instanceof FgbVtError) || err.code === 'FGB_IO' || err.code === 'FGB_SOURCE_CHANGED') throw err;
-    problems.add('error', 'fatal', err.message, (err as { offset?: number }).offset);
+    if (!isFileProblem(err)) throw err;
+    problems.add('error', 'fatal', err.message, err.offset);
   }
   return finish(report, problems);
+}
+
+/**
+ * Whether an error is a defect of the file, reported as a problem, rather
+ * than a failure to read it (connector errors: missing file, server
+ * without range support, file changed while checked), which is thrown.
+ */
+function isFileProblem(err: unknown): err is FgbVtError & { offset?: number } {
+  return err instanceof FgbVtError && !(err instanceof ConnectorError);
 }
 
 // == Header ==================================================================
@@ -573,11 +584,4 @@ function union(a: BBox | null, b: BBox): BBox {
     minX: Math.min(a.minX, b.minX), minY: Math.min(a.minY, b.minY),
     maxX: Math.max(a.maxX, b.maxX), maxY: Math.max(a.maxY, b.maxY),
   };
-}
-
-function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
-  const out = new Uint8Array(a.length + b.length);
-  out.set(a);
-  out.set(b, a.length);
-  return out;
 }

@@ -48,6 +48,7 @@ import { tileClipBounds, validateTile } from './tiles.js';
 import { resolveFrame, type CoordinateFrame } from './geometry/crs.js';
 import { featureSchema, validateSchema, type FeatureSchema } from './schema.js';
 import { FormatError, LimitExceededError, SourceChangedError, withPath } from './errors.js';
+import { hash53 } from './util.js';
 
 /**
  * Per-request options for tile generation.
@@ -441,24 +442,27 @@ function featureFilter(source: Source, z: number): (features: RawFeature[]) => R
   const test = source.filter!;
   const { keep } = featureSchema(source);
   return (features) => {
-    // Decide for all features first: the parts of a GeometryCollection
-    // share one property map, which is trimmed only afterwards
     const accepted = features.filter((f) => test({
       id: f.id,
       type: geometryFamily(f.type),
       properties: Object.fromEntries(f.properties) as Record<string, PropertyValue>,
     }, z));
-    if (keep) {
-      const trimmed = new Set<Map<string, PropertyValue>>();
-      for (const f of accepted) {
-        if (trimmed.has(f.properties)) continue;
-        trimmed.add(f.properties);
-        for (const key of [...f.properties.keys()]) {
-          if (!keep(key)) f.properties.delete(key);
+    if (!keep) return accepted;
+    // Trim copies: decoded features may be filtered again (the world copies
+    // of a scanned file). The parts of a GeometryCollection share one map,
+    // so they share its copy too.
+    const trimmed = new Map<Map<string, PropertyValue>, Map<string, PropertyValue>>();
+    return accepted.map((f) => {
+      let properties = trimmed.get(f.properties);
+      if (!properties) {
+        properties = new Map();
+        for (const [key, value] of f.properties) {
+          if (keep(key)) properties.set(key, value);
         }
+        trimmed.set(f.properties, properties);
       }
-    }
-    return accepted;
+      return { ...f, properties };
+    });
   };
 }
 
@@ -602,8 +606,11 @@ const TILE_ENCODING_VERSION = 2;
  * sources' file versions (their connector version tags), the tile
  * coordinates, and every setting that affects the tile's bytes.
  *
- * Sources outside their zoom range are not opened. Functions (a `filter`
- * or a `Projection`) are identified by their source text.
+ * Each file's version is confirmed with the file (see
+ * {@link FgbSource.revalidate}), so the ETag changes as soon as a file
+ * does. Sources outside their zoom range are not opened. Functions (a
+ * `filter` or a `Projection`) are identified by their source text, and a
+ * source's `revision` covers what that text does not show.
  *
  * @param entries - Connector and source per layer, in layer order.
  * @param z - Tile zoom level.
@@ -631,8 +638,11 @@ export async function computeTileETag(
   const tags = await allOrCancel(entries.map(([connector, source]) => async (sibling: AbortSignal | undefined) => {
     const opts = resolveOptions(source.options, tileOptions);
     if (z < opts.minZoom || z > opts.maxZoom) return `${source.name}:skipped`;
-    const fgb = await withSource(connector, source, context, sibling, async (opened) => opened)
-      .catch((err: unknown) => { throw withPath(err, source.path); });
+    // The cached version tag may predate a change: confirm it with the file
+    const fgb = await withSource(connector, source, context, sibling, async (opened) => {
+      await opened.revalidate(sibling);
+      return opened;
+    }).catch((err: unknown) => { throw withPath(err, source.path); });
     if (fgb.etag === null) return null;
     return [
       source.name, connector.cacheNamespace ?? '', source.path, fgb.etag, stableJson(opts), describeSource(source),
@@ -656,6 +666,7 @@ function describeSource(source: Source): string {
     keepIdProperty: source.keepIdProperty ?? false,
     useIndex: source.useIndex ?? true,
     filter: source.filter ? String(source.filter) : null,
+    revision: source.revision ?? null,
   });
 }
 
@@ -668,22 +679,6 @@ function stableJson(value: unknown): string {
     }
     return v;
   });
-}
-
-/** A 53-bit string hash (cyrb53). */
-function hash53(text: string, seed: number): number {
-  let h1 = 0xdeadbeef ^ seed;
-  let h2 = 0x41c6ce57 ^ seed;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text.charCodeAt(i);
-    h1 = Math.imul(h1 ^ ch, 2654435761);
-    h2 = Math.imul(h2 ^ ch, 1597334677);
-  }
-  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
-  h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
-  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
-  h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
-  return 4294967296 * (2097151 & h2) + (h1 >>> 0);
 }
 
 // == Helpers ================================================================

@@ -105,6 +105,27 @@ describe('HttpConnector options', () => {
     await expect(new HttpConnector().read('not a url', 0, 10)).rejects.toThrow(TypeError);
     expect(Date.now() - started).toBeLessThan(100);
   });
+
+  it('works where reading globalThis.location throws (Deno without --location)', async () => {
+    Object.defineProperty(globalThis, 'location', {
+      configurable: true,
+      get() { throw new ReferenceError('Access to "location", run again with --location <href>'); },
+    });
+    try {
+      expect((await fast().read(url(), 0, 10)).length).toBe(10);
+    } finally {
+      delete (globalThis as { location?: unknown }).location;
+    }
+  });
+
+  it('scopes cache entries by request headers, without their values', () => {
+    expect(new HttpConnector().cacheNamespace).toBe('http');
+    const a = new HttpConnector({ headers: { Authorization: 'Bearer a' } }).cacheNamespace;
+    expect(a).toMatch(/^http:[0-9a-z]+$/);
+    expect(new HttpConnector({ headers: { authorization: 'Bearer a' } }).cacheNamespace).toBe(a);
+    expect(new HttpConnector({ headers: { Authorization: 'Bearer b' } }).cacheNamespace).not.toBe(a);
+    expect(new HttpConnector({ headers: { Authorization: 'Bearer b' }, cacheNamespace: 'cdn' }).cacheNamespace).toBe('cdn');
+  });
 });
 
 describe('HttpConnector responses', () => {
@@ -159,6 +180,14 @@ describe('HttpConnector responses', () => {
     // CDNs may weaken the ETag
     behaviour.etag = 'W/"v1"';
     expect((await connector.read(url(), 0, 10, { ifMatch: '"v1"' })).length).toBe(10);
+  });
+
+  it('does not take a response without ETag for a change of a file with one', async () => {
+    const connector = fast();
+    const head = await connector.readHead(url(), 100);
+    behaviour.etag = null;
+    behaviour.lastModified = 'Wed, 04 Nov 2026 10:00:00 GMT';
+    expect((await connector.read(url(), 0, 10, { ifMatch: head.etag! })).length).toBe(10);
   });
 
   it('sends If-Match only with conditionalRequests', async () => {
@@ -265,6 +294,29 @@ describe('S3Connector', () => {
       throw Object.assign(new Error('Slow Down'), { name: 'SlowDown', $metadata: { httpStatusCode: 503 } });
     });
     expect(await new S3Connector({ sdk: throttled }).read('s3://b/k.fgb', 0, 10).catch(e => e.retryable)).toBe(true);
+
+    // Without an HTTP response: only network failures are worth a retry
+    const unconfigured = mockSdk(() => { throw new Error('Region is missing'); });
+    expect(await new S3Connector({ sdk: unconfigured }).read('s3://b/k.fgb', 0, 10).catch(e => e.retryable)).toBe(false);
+    const reset = mockSdk(() => { throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }); });
+    expect(await new S3Connector({ sdk: reset }).read('s3://b/k.fgb', 0, 10).catch(e => e.retryable)).toBe(true);
+  });
+
+  it('reports an abort while reading a web stream body as the abort, not as truncation', async () => {
+    const sdk = mockSdk(() => {
+      let finish!: (bytes: Uint8Array) => void;
+      const body = new Promise<Uint8Array>((resolve) => { finish = resolve; });
+      return {
+        ContentRange: `bytes 0-9/${BODY.length}`,
+        // A cancelled web stream ends early instead of failing
+        Body: { transformToByteArray: () => body, cancel: async () => finish(BODY.subarray(0, 3)) },
+      };
+    });
+    await expect(new S3Connector({ sdk, timeout: 20 }).read('s3://b/k.fgb', 0, 10)).rejects.toThrow(/Timed out/);
+    const controller = new AbortController();
+    const reason = new Error('client went away');
+    setTimeout(() => controller.abort(reason), 20);
+    await expect(new S3Connector({ sdk }).read('s3://b/k.fgb', 0, 10, { signal: controller.signal })).rejects.toBe(reason);
   });
 
   it('times out a stalled body and frees its slot', async () => {
@@ -324,7 +376,26 @@ describe('LocalConnector', () => {
     expect(err).toMatchObject({ status: 404, retryable: false, path: '/nonexistent/file.fgb' });
   });
 
-  it('checks the version of the file its pooled handle reads, not the path', async () => {
+  it('detects a file replaced at its path while its old handle stays pooled', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fgbvt-'));
+    try {
+      const path = join(dir, 'f.fgb');
+      copyFileSync(fixture('points.fgb'), path);
+      const connector = new LocalConnector();
+      const head = await connector.readHead(path, 10); // pools a handle on the original file
+      copyFileSync(fixture('lines.fgb'), join(dir, 'next.fgb'));
+      renameSync(join(dir, 'next.fgb'), path);
+      await expect(connector.read(path, 0, 10, { ifMatch: head.etag! })).rejects.toThrow(SourceChangedError);
+      const fresh = await connector.readHead(path, 10);
+      expect(fresh.etag).not.toBe(head.etag);
+      expect((await connector.read(path, 0, 10, { ifMatch: fresh.etag! })).length).toBe(10);
+      await connector.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('checks the version of the file its pooled handle reads, not only the path', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'fgbvt-'));
     try {
       const path = join(dir, 'f.fgb');

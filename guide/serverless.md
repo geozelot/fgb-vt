@@ -131,7 +131,7 @@ Rising `indexBytes` on warm containers means the cache is too small for the traf
 
 ## Files that change
 
-Every response is checked against the version tag (S3 `ETag`) of the file as it was opened. If a file is replaced, the next tile notices the mismatch, drops the cached header and index pages, and reopens the file. Replacing files in place is therefore safe; for atomic switches of several files, write new keys and change the source paths instead. Tile ETags change with the files, so CDNs revalidate replaced tiles.
+Every response is checked against the version tag (S3 `ETag`) of the file as it was opened. If a file is replaced, the next tile notices the mismatch, drops the cached header and index pages, and reopens the file. Replacing files in place is therefore safe; for atomic switches of several files, write new keys and change the source paths instead. Tile ETags change with the files, so CDNs revalidate replaced tiles: `tileETag` confirms each file's version with a one-byte read, at most once a second per file and container. If a `filter` reads configuration, set the source's `revision` (e.g. to the deployment id) so that tile ETags change when the configuration does.
 
 Connectors and HTTP servers that report no version tag (neither `ETag` nor `Last-Modified`) cannot detect a replacement before the data stops matching the cached index; call `client.invalidate(path)` after replacing such a file. Check new files with `npx @geozelot/fgb-vt check` before uploading them.
 
